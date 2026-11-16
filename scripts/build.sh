@@ -2,9 +2,12 @@
 # Build a Codex package directory from a prepared source tree.
 #
 # Usage: scripts/build.sh --source <dir> --out <package-dir> [--release --target <triple>]
+#                         [--prebuilt <dir>]
 #
 # Default (local) mode builds the host target with the dev profile, without
 # --target, so it shares CARGO_TARGET_DIR with ordinary `cargo build` runs.
+# With --prebuilt, it skips cargo and packages codex, codex-code-mode-host,
+# codex-exec-server (and bwrap on Linux) already built in <dir>.
 #
 # Release mode (CI) follows upstream's release workflow: on Linux, bwrap is
 # built and stripped first and its SHA-256 is embedded in Codex through
@@ -24,16 +27,19 @@ source_dir=""
 out=""
 target=""
 release=false
+prebuilt=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --source) source_dir="${2:?}"; shift 2 ;;
     --out) out="${2:?}"; shift 2 ;;
     --target) target="${2:?}"; shift 2 ;;
     --release) release=true; shift ;;
+    --prebuilt) prebuilt="${2:?}"; shift 2 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
-[[ -n "$source_dir" && -n "$out" ]] || die "usage: $0 --source <dir> --out <package-dir> [--release --target <triple>]"
+[[ -n "$source_dir" && -n "$out" ]] || die "usage: $0 --source <dir> --out <package-dir> [--release --target <triple>] [--prebuilt <dir>]"
+[[ -z "$prebuilt" || "$release" == false ]] || die "--prebuilt is for local builds only"
 source_dir="$(cd "$source_dir" && pwd)"
 codex_rs="${source_dir}/codex-rs"
 [[ -f "${codex_rs}/Cargo.toml" ]] || die "not a Codex source tree: $source_dir"
@@ -67,12 +73,17 @@ if [[ "$release" == true ]]; then
 else
   host="$(cd "$codex_rs" && host_target)"
   [[ -z "$target" || "$target" == "$host" ]] || die "local builds only support the host target ($host)"
-  ensure_v8 "$source_dir" "$host"
-  debug_dir="${target_dir}/debug"
-  bins=(--bin codex --bin codex-code-mode-host --bin codex-exec-server)
-  [[ "$host" == *-linux-* ]] && bins+=(--bin bwrap)
-  log "Building Codex for ${host} (dev profile)"
-  (cd "$codex_rs" && cargo build "${bins[@]}")
+  if [[ -n "$prebuilt" ]]; then
+    debug_dir="$(cd "$prebuilt" && pwd)"
+    log "Packaging binaries from ${debug_dir}"
+  else
+    ensure_v8 "$source_dir" "$host"
+    debug_dir="${target_dir}/debug"
+    bins=(--bin codex --bin codex-code-mode-host --bin codex-exec-server)
+    [[ "$host" == *-linux-* ]] && bins+=(--bin bwrap)
+    log "Building Codex for ${host} (dev profile)"
+    (cd "$codex_rs" && cargo build "${bins[@]}")
+  fi
   args=(
     --target "$host"
     --cargo-profile dev

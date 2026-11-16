@@ -81,9 +81,7 @@ cp "${PATCHES_DIR}/series" "${package}/patches/series"
       sed -n 's|^diff --git a/\(.*\) b/.*|\1|p' "$patch" | LC_ALL=C sort -u | sed 's/^/  - /'
     done < <(extension_patches "$extension")
   done
-  if git -C "$source_dir" diff --quiet "refs/tags/${upstream_tag}" HEAD -- codex-rs/Cargo.lock; then
-    :
-  else
+  if ! git -C "$source_dir" diff --quiet "refs/tags/${upstream_tag}" HEAD -- codex-rs/Cargo.lock; then
     echo
     echo "## Build"
     echo
