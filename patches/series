@@ -5,3 +5,5 @@
 # Blank lines and text after # are ignored.
 channels
 channels-tests
+mcp-session-env
+status-line-file
