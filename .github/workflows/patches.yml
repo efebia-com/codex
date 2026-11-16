@@ -1,0 +1,61 @@
+# Checks the patch series when they change: they must apply on the upstream tag
+# they were generated against (patches/base) and on the newest stable upstream
+# release, and the extension tests must pass on the base tag.
+
+name: patches
+
+on:
+  pull_request:
+    paths: ["patches/**", "scripts/**", ".github/workflows/patches.yml"]
+  push:
+    branches: [main]
+    paths: ["patches/**", "scripts/**", ".github/workflows/patches.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  SOURCE_DIR: ${{ github.workspace }}/.work/src
+
+jobs:
+  apply-latest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Apply the patches on the newest stable upstream release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/prepare-source.sh --skip-lock "$(scripts/upstream-latest.sh)" "$SOURCE_DIR"
+
+  test-base:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Read the base tag
+        id: base
+        run: echo "tag=$(sed -e 's/#.*//' patches/base | awk 'NF { print; exit }')" >>"$GITHUB_OUTPUT"
+      - uses: ./.github/actions/free-disk-space
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcap-dev libasound2-dev bubblewrap
+      - uses: ./.github/actions/setup-rust
+        with:
+          upstream-tag: ${{ steps.base.outputs.tag }}
+      - name: Prepare source
+        run: scripts/prepare-source.sh "${{ steps.base.outputs.tag }}" "$SOURCE_DIR"
+      - name: Fetch the Codex-built V8 (checksums verified)
+        run: scripts/fetch-v8.sh --source "$SOURCE_DIR" --target x86_64-unknown-linux-gnu --cache "${RUNNER_TEMP}/rusty_v8" >>"$GITHUB_ENV"
+      - name: Run extension tests
+        run: scripts/test-extensions.sh --source "$SOURCE_DIR"

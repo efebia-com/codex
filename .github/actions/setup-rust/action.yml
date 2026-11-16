@@ -1,0 +1,25 @@
+name: setup-rust
+description: Install the Rust toolchain pinned by an upstream tag, with an optional target.
+inputs:
+  upstream-tag:
+    description: Upstream tag whose codex-rs/rust-toolchain.toml pins the toolchain.
+    required: true
+  target:
+    description: Rust target triple to add.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        TAG: ${{ inputs.upstream-tag }}
+        TARGET: ${{ inputs.target }}
+      run: |
+        set -euo pipefail
+        url="https://raw.githubusercontent.com/openai/codex/${TAG}/codex-rs/rust-toolchain.toml"
+        channel="$(curl -fsSL --retry 3 "$url" | sed -n 's/^channel = "\(.*\)"$/\1/p')"
+        [[ -n "$channel" ]] || { echo "::error::no toolchain channel in $url"; exit 1; }
+        args=(--profile minimal)
+        if [[ -n "$TARGET" ]]; then args+=(--target "$TARGET"); fi
+        rustup toolchain install "$channel" "${args[@]}"

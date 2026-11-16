@@ -1,0 +1,3 @@
+# Upstream tag the patch series were generated against. Fetched next to the
+# release tag so that `git am --3way` can merge patches whose context moved.
+rust-v0.169.0

@@ -1,0 +1,20 @@
+# Extension tests, run from codex-rs/ after every series is applied.
+#
+# Format: <extension>: <arguments for cargo test>
+# An extension may have several lines; each line is one cargo test command.
+# Only extensions listed in patches/series are run; a command listed under two
+# extensions runs once.
+
+mcp-session-env: -p codex-config mcp_codex_env
+mcp-session-env: -p codex-rmcp-client codex_source
+mcp-session-env: -p codex-mcp session_env
+mcp-session-env: -p codex-core --test all mcp_session_env
+# Both series change the generated config schema.
+mcp-session-env: -p codex-core --lib config::schema_tests
+
+channels: -p codex-rmcp-client --lib custom_notifications
+channels: -p codex-mcp --lib channel
+channels: -p codex-channels-extension
+channels: -p codex-core --lib config::schema_tests
+
+channels-tests: -p codex-app-server --test all mcp_channels
