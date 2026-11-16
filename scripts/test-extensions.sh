@@ -6,7 +6,8 @@
 # Each line of patches/tests is `<extension>: <cargo test arguments>` and runs
 # as one `cargo test --no-fail-fast` from codex-rs/. Lines of extensions that are not in
 # patches/series are skipped, and a command listed twice runs once. Every
-# command runs even after a failure; the summary lists the failures.
+# command runs even after a failure; the summary lists the failures. A command
+# that runs no test at all (a filter matching nothing) counts as a failure.
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 require cargo
@@ -28,6 +29,8 @@ in_series() {
 
 passed=()
 failed=()
+output="$(mktemp)"
+trap 'rm -f "$output"' EXIT
 declare -A seen=()
 # fd 3: cargo test must not consume the list from stdin.
 while IFS= read -r line <&3; do
@@ -45,8 +48,14 @@ while IFS= read -r line <&3; do
   fi
   seen["$command"]=1
   log "${extension}: ${command}"
-  if (cd "$codex_rs" && cargo test --no-fail-fast "${args[@]}"); then
-    passed+=("${extension}: ${command}")
+  if (cd "$codex_rs" && cargo test --no-fail-fast "${args[@]}") 2>&1 | tee "$output"; then
+    # A filter that matches nothing passes silently: count what ran.
+    ran="$(awk '/^test result:/ { n += $4 + $6 } END { print n + 0 }' "$output")"
+    if ((ran > 0)); then
+      passed+=("${extension}: ${command}")
+    else
+      failed+=("${extension}: ${command} (no test matched)")
+    fi
   else
     failed+=("${extension}: ${command}")
   fi

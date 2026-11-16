@@ -10,14 +10,14 @@ mcp-session-env: -p codex-rmcp-client --lib codex_source
 mcp-session-env: -p codex-mcp --lib session_env
 mcp-session-env: -p codex-core --test all mcp_session_env
 # Both series change the generated config schema.
-mcp-session-env: -p codex-core --lib config::schema_tests
+mcp-session-env: -p codex-core --lib config::schema::tests
 
 channels: -p codex-rmcp-client --lib custom_notifications
 channels: -p codex-mcp --lib channel
 channels: -p codex-channels-extension
-channels: -p codex-core --lib config::schema_tests
+channels: -p codex-core --lib config::schema::tests
 
 channels-tests: -p codex-app-server --test all mcp_channels
 
 status-line-file: -p codex-tui status_line
-status-line-file: -p codex-core --lib config::schema_tests
+status-line-file: -p codex-core --lib config::schema::tests
