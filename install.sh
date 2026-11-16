@@ -209,7 +209,10 @@ ls -1t "$PREFIX/releases" | awk -v keep="$KEEP" -v cur="$release_name" '$0 != cu
   done
 
 say "Installed Codex ${VERSION} in ${PREFIX}"
-"$PREFIX/bin/codex" --version || die "the installed binary does not run"
+# A scratch CODEX_HOME: even --version sets up helper links under CODEX_HOME, and
+# the installer writes nothing outside the prefix.
+mkdir "$tmp/codex-home"
+CODEX_HOME="$tmp/codex-home" "$PREFIX/bin/codex" --version || die "the installed binary does not run"
 case ":${PATH}:" in
   *":${PREFIX}/bin:"*) ;;
   *) say "Add it to your PATH, for example: export PATH=\"${PREFIX}/bin:\$PATH\"" ;;

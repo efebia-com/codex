@@ -41,7 +41,9 @@ for version in "${versions[@]}"; do
   for target in "${targets[@]}"; do
     pkg="${work}/build/codex-${version}-${target}"
     mkdir -p "${pkg}/bin"
-    printf '#!/bin/sh\necho "codex-cli fake %s"\n' "$version" >"${pkg}/bin/codex"
+    # Like the real one, it writes under CODEX_HOME whenever it runs.
+    # shellcheck disable=SC2016 # expanded by the fake binary
+    printf '#!/bin/sh\nmkdir -p "${CODEX_HOME:-$HOME/.codex}/tmp"\necho "codex-cli fake %s"\n' "$version" >"${pkg}/bin/codex"
     chmod 0755 "${pkg}/bin/codex"
     printf 'version=%s\ntarget=%s\n' "$version" "$target" >"${pkg}/DISTRIBUTION"
     cp "$installer" "${pkg}/install.sh"
@@ -68,7 +70,7 @@ output_has() { grep -q -- "$1" "${work}/out"; }
 fails() { ! "$@"; }
 run_update() { "${prefix}/bin/codex-update" "$@" >"${work}/out" 2>&1; }
 release_count() { find "${prefix}/releases" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' '; }
-installed() { "${prefix}/bin/codex" | grep -q "fake $1"; }
+installed() { CODEX_HOME="${work}/codex-home" "${prefix}/bin/codex" | grep -q "fake $1"; }
 
 check "installs a given version" run_install --version 1.0.0-ext.1
 check "installed binary runs from <prefix>/bin" installed 1.0.0-ext.1
