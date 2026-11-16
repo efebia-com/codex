@@ -217,3 +217,5 @@ case ":${PATH}:" in
   *":${PREFIX}/bin:"*) ;;
   *) say "Add it to your PATH, for example: export PATH=\"${PREFIX}/bin:\$PATH\"" ;;
 esac
+say "If you use the TUI's background server, pin it to this release (it restarts it):"
+say "  ${PREFIX}/bin/codex app-server daemon update --from-cli --yes"

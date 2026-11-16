@@ -68,6 +68,31 @@ hide the notice, set `check_for_update_on_startup = false` in
 `~/.codex/config.toml`; note that this file is shared with any other Codex
 installation.
 
+### Background server (daemon)
+
+The TUI normally runs on a shared background server, the daemon
+(`codex app-server daemon`). The daemon keeps its own copy of a Codex release in
+`$CODEX_HOME/packages/app-server-daemon/`. When this distribution's `codex`
+starts it for the first time, it copies the installed release but marks the
+copy to follow upstream updates: at the next upstream release the daemon would
+replace it with upstream Codex, which has none of the extensions.
+
+Pin the daemon to the installed release once after installing, and again after
+every `codex-update`:
+
+```sh
+<prefix>/bin/codex app-server daemon update --from-cli --yes
+<prefix>/bin/codex app-server daemon version    # what the daemon runs now
+```
+
+`--from-cli` copies the release of the `codex` you run it with and turns the
+upstream updates off; it restarts the daemon, so it may interrupt running work.
+`codex app-server daemon update`, without `--from-cli`, goes back to upstream
+updates. The daemon belongs to `$CODEX_HOME`, so every Codex installation that
+uses the same `$CODEX_HOME` shares it.
+
+To avoid the daemon altogether, start the TUI with `codex --no-daemon`.
+
 ### macOS
 
 The binaries are not signed with a Developer ID nor notarized. Files downloaded
