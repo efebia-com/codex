@@ -1,0 +1,544 @@
+From c72d65ebdff6a89c9a7216d157cb3ea9b2880f13 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Mon, 16 Nov 2026 14:38:11 +0100
+Subject: [PATCH 3/4] codex-mcp: forward channel notifications of opted-in
+ servers to their thread
+
+For a server with channel = true, declare the claude/channel experimental
+capability in initialize and, when the server declares it too over a
+session with an initialize handshake, forward its notifications/claude/channel
+notifications to a bounded per-thread queue that a host can take.
+---
+ codex-rs/codex-mcp/src/channel.rs         | 174 ++++++++++++++++++
+ codex-rs/codex-mcp/src/channel_tests.rs   | 210 ++++++++++++++++++++++
+ codex-rs/codex-mcp/src/elicitation.rs     |  15 ++
+ codex-rs/codex-mcp/src/lib.rs             |   7 +
+ codex-rs/codex-mcp/src/resource_client.rs |   8 +
+ codex-rs/codex-mcp/src/rmcp_client.rs     |   9 +
+ codex-rs/codex-mcp/src/runtime.rs         |   8 +
+ 7 files changed, 431 insertions(+)
+ create mode 100644 codex-rs/codex-mcp/src/channel.rs
+ create mode 100644 codex-rs/codex-mcp/src/channel_tests.rs
+
+diff --git a/codex-rs/codex-mcp/src/channel.rs b/codex-rs/codex-mcp/src/channel.rs
+new file mode 100644
+index 0000000000..2d32eb1c7e
+--- /dev/null
++++ b/codex-rs/codex-mcp/src/channel.rs
+@@ -0,0 +1,174 @@
++//! Opt-in delivery of a server's `notifications/claude/channel` notifications to its thread.
++//!
++//! A server takes part when the layered config sets `mcp_servers.<name>.channel = true`. Codex
++//! then declares the `claude/channel` experimental capability in its own `initialize` to that
++//! server, and once the server declares it too over a session with an `initialize` handshake,
++//! forwards each notification with the server's name to the thread's [`ChannelHub`]. Whoever
++//! takes the hub's receiver decides how notifications reach the model. Queues are bounded: a
++//! notification that finds one full is dropped.
++
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::sync::PoisonError;
++
++use codex_config::ConfigLayerStack;
++use codex_config::TomlValue;
++use codex_rmcp_client::RmcpClient;
++use rmcp::model::CustomNotification;
++use rmcp::model::InitializeRequestParams;
++use rmcp::model::ServerCapabilities;
++use rmcp::model::ServerPeerInfo;
++use serde_json::Value;
++use tokio::sync::mpsc;
++use tokio::sync::mpsc::error::TrySendError;
++use tracing::info;
++use tracing::warn;
++
++/// Experimental capability declared by both sides of a channel.
++pub const CHANNEL_CAPABILITY: &str = "claude/channel";
++/// Notification a channel server sends for each event.
++pub const CHANNEL_NOTIFICATION_METHOD: &str = "notifications/claude/channel";
++/// Notifications held per server, and per thread, before new ones are dropped.
++pub const CHANNEL_QUEUE_CAPACITY: usize = 64;
++
++/// One channel notification, as the server sent it.
++#[derive(Clone, Debug, PartialEq)]
++pub struct ChannelNotification {
++    /// Name of the server in the MCP configuration.
++    pub server: String,
++    /// The notification's `params`, unvalidated.
++    pub params: Option<Value>,
++}
++
++/// Whether the layered config enables channel delivery for `server`.
++pub fn channel_enabled(config_layer_stack: &ConfigLayerStack, server: &str) -> bool {
++    config_layer_stack
++        .effective_config()
++        .get("mcp_servers")
++        .and_then(|servers| servers.get(server))
++        .and_then(|server| server.get("channel"))
++        .and_then(TomlValue::as_bool)
++        .unwrap_or(false)
++}
++
++/// Names of the servers for which the layered config enables channel delivery, sorted.
++pub fn channel_servers(config_layer_stack: &ConfigLayerStack) -> Vec<String> {
++    let config = config_layer_stack.effective_config();
++    let Some(servers) = config.get("mcp_servers").and_then(TomlValue::as_table) else {
++        return Vec::new();
++    };
++    let mut names: Vec<String> = servers
++        .iter()
++        .filter(|(_, server)| {
++            server
++                .get("channel")
++                .and_then(TomlValue::as_bool)
++                .unwrap_or(false)
++        })
++        .map(|(name, _)| name.clone())
++        .collect();
++    names.sort();
++    names
++}
++
++/// The channel notifications of one thread, from all of its servers, in arrival order.
++#[derive(Clone)]
++pub(crate) struct ChannelHub {
++    sender: mpsc::Sender<ChannelNotification>,
++    receiver: Arc<Mutex<Option<mpsc::Receiver<ChannelNotification>>>>,
++}
++
++impl Default for ChannelHub {
++    fn default() -> Self {
++        let (sender, receiver) = mpsc::channel(CHANNEL_QUEUE_CAPACITY);
++        Self {
++            sender,
++            receiver: Arc::new(Mutex::new(Some(receiver))),
++        }
++    }
++}
++
++impl ChannelHub {
++    /// The receiver, to the first caller only.
++    pub(crate) fn take_receiver(&self) -> Option<mpsc::Receiver<ChannelNotification>> {
++        self.receiver
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .take()
++    }
++}
++
++/// A server's notifications, subscribed before `initialize`, waiting for its capabilities.
++pub(crate) struct ChannelSubscription {
++    hub: ChannelHub,
++    notifications: mpsc::Receiver<CustomNotification>,
++}
++
++impl ChannelSubscription {
++    /// Declares the capability in `params` and subscribes, when `hub` is given.
++    pub(crate) fn prepare(
++        hub: Option<ChannelHub>,
++        client: &RmcpClient,
++        params: &mut InitializeRequestParams,
++    ) -> Option<Self> {
++        let hub = hub?;
++        params
++            .capabilities
++            .experimental
++            .get_or_insert_default()
++            .insert(CHANNEL_CAPABILITY.to_string(), Default::default());
++        let notifications = client
++            .subscribe_custom_notifications(CHANNEL_NOTIFICATION_METHOD, CHANNEL_QUEUE_CAPACITY);
++        Some(Self { hub, notifications })
++    }
++
++    /// Forwards the server's notifications to the hub until its connection ends, if the
++    /// server declared the capability over a session with an `initialize` handshake.
++    pub(crate) fn connect(self, server: String, initialize_result: &ServerPeerInfo) {
++        if !initialize_result.protocol_version.has_initialize() {
++            info!(
++                server = %server,
++                "MCP channel disabled: the server uses a protocol version without sessions"
++            );
++            return;
++        }
++        if !declares_channel(&initialize_result.capabilities) {
++            info!(
++                server = %server,
++                "MCP channel disabled: the server does not declare {CHANNEL_CAPABILITY}"
++            );
++            return;
++        }
++        let Self {
++            hub,
++            mut notifications,
++        } = self;
++        tokio::spawn(async move {
++            while let Some(notification) = notifications.recv().await {
++                let notification = ChannelNotification {
++                    server: server.clone(),
++                    params: notification.params,
++                };
++                match hub.sender.try_send(notification) {
++                    Ok(()) => {}
++                    Err(TrySendError::Full(_)) => warn!(
++                        server = %server,
++                        "dropping MCP channel notification: the thread's queue is full"
++                    ),
++                    Err(TrySendError::Closed(_)) => return,
++                }
++            }
++        });
++    }
++}
++
++fn declares_channel(capabilities: &ServerCapabilities) -> bool {
++    capabilities
++        .experimental
++        .as_ref()
++        .is_some_and(|experimental| experimental.contains_key(CHANNEL_CAPABILITY))
++}
++
++#[cfg(test)]
++#[path = "channel_tests.rs"]
++mod tests;
+diff --git a/codex-rs/codex-mcp/src/channel_tests.rs b/codex-rs/codex-mcp/src/channel_tests.rs
+new file mode 100644
+index 0000000000..8107e7a3f7
+--- /dev/null
++++ b/codex-rs/codex-mcp/src/channel_tests.rs
+@@ -0,0 +1,210 @@
++use std::sync::Arc;
++use std::time::Duration;
++
++use codex_config::ConfigLayerEntry;
++use codex_config::ConfigLayerSource;
++use codex_config::ConfigLayerStack;
++use codex_config::TomlValue;
++use codex_rmcp_client::InProcessTransportFactory;
++use futures::FutureExt;
++use futures::future::BoxFuture;
++use pretty_assertions::assert_eq;
++use rmcp::ServiceExt;
++use rmcp::model::ClientCapabilities;
++use rmcp::model::Implementation;
++use rmcp::model::ServerNotification;
++use serde_json::json;
++use tokio::sync::mpsc;
++use tokio::time::timeout;
++
++use super::*;
++
++const WAIT: Duration = Duration::from_secs(5);
++
++fn stack(layers: Vec<serde_json::Value>) -> ConfigLayerStack {
++    let layers = layers
++        .into_iter()
++        .map(|layer| {
++            let config: TomlValue = serde_json::from_value(layer).expect("TOML layer");
++            ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, config)
++        })
++        .collect();
++    ConfigLayerStack::new(layers, Default::default(), Default::default()).expect("layer stack")
++}
++
++#[test]
++fn channel_is_enabled_only_by_an_explicit_true() {
++    let stack = stack(vec![json!({
++        "mcp_servers": {
++            "on": { "command": "server", "channel": true },
++            "off": { "command": "server", "channel": false },
++            "unset": { "command": "server" },
++            "wrong.type": { "command": "server", "channel": "true" },
++        }
++    })]);
++
++    assert!(channel_enabled(&stack, "on"));
++    assert!(!channel_enabled(&stack, "off"));
++    assert!(!channel_enabled(&stack, "unset"));
++    assert!(!channel_enabled(&stack, "wrong.type"));
++    assert!(!channel_enabled(&stack, "missing"));
++    assert_eq!(channel_servers(&stack), vec!["on".to_string()]);
++}
++
++#[test]
++fn a_later_layer_overrides_the_channel_setting() {
++    let stack = stack(vec![
++        json!({ "mcp_servers": { "srv": { "command": "server" } } }),
++        json!({ "mcp_servers": { "srv": { "channel": true } } }),
++    ]);
++
++    assert!(channel_enabled(&stack, "srv"));
++}
++
++#[derive(Clone)]
++struct ChannelServer {
++    declares_channel: bool,
++    client_capabilities: mpsc::Sender<serde_json::Value>,
++}
++
++impl rmcp::ServerHandler for ChannelServer {
++    fn get_info(&self) -> rmcp::model::ServerConfig {
++        let mut capabilities = rmcp::model::ServerCapabilities::default();
++        if self.declares_channel {
++            capabilities.experimental =
++                Some([(CHANNEL_CAPABILITY.to_string(), Default::default())].into());
++        }
++        rmcp::model::ServerConfig::new(capabilities)
++    }
++
++    async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::RoleServer>) {
++        let capabilities = context
++            .peer
++            .peer_info()
++            .map(|info| json!(info.capabilities))
++            .unwrap_or_default();
++        self.client_capabilities
++            .send(capabilities)
++            .await
++            .expect("record client capabilities");
++        for n in [1, 2] {
++            context
++                .peer
++                .send_notification(ServerNotification::CustomNotification(
++                    CustomNotification::new(
++                        CHANNEL_NOTIFICATION_METHOD,
++                        Some(json!({ "content": format!("event {n}") })),
++                    ),
++                ))
++                .await
++                .expect("send channel notification");
++        }
++    }
++}
++
++impl InProcessTransportFactory for ChannelServer {
++    fn open(&self) -> BoxFuture<'static, std::io::Result<tokio::io::DuplexStream>> {
++        let server = self.clone();
++        async move {
++            let (client, transport) = tokio::io::duplex(/*max_buf_size*/ 4096);
++            tokio::spawn(async move {
++                let service = server.serve(transport).await.expect("serve");
++                let _ = service.waiting().await;
++            });
++            Ok(client)
++        }
++        .boxed()
++    }
++}
++
++/// Starts a client to a server that sends two channel notifications once initialized, and
++/// returns the client capabilities the server saw and the hub's receiver.
++async fn run(
++    declares_channel: bool,
++    hub: Option<ChannelHub>,
++) -> anyhow::Result<(
++    serde_json::Value,
++    Option<mpsc::Receiver<ChannelNotification>>,
++    Arc<RmcpClient>,
++)> {
++    let (sender, mut client_capabilities) = mpsc::channel(1);
++    let client = Arc::new(
++        RmcpClient::new_in_process_client(Arc::new(ChannelServer {
++            declares_channel,
++            client_capabilities: sender,
++        }))
++        .await?,
++    );
++    let receiver = hub.as_ref().and_then(ChannelHub::take_receiver);
++    let mut params = InitializeRequestParams::new(
++        ClientCapabilities::default(),
++        Implementation::new("test", "1"),
++    );
++    let channel = ChannelSubscription::prepare(hub, &client, &mut params);
++    let initialize_result = client
++        .initialize(
++            params,
++            Some(WAIT),
++            Box::new(|_, _| async { anyhow::bail!("unexpected elicitation") }.boxed()),
++        )
++        .await?;
++    if let Some(channel) = channel {
++        channel.connect("srv".to_string(), &initialize_result);
++    }
++    let seen = timeout(WAIT, client_capabilities.recv())
++        .await?
++        .expect("client capabilities");
++    Ok((seen, receiver, client))
++}
++
++#[tokio::test]
++async fn enabled_channel_declares_the_capability_and_forwards_in_order() -> anyhow::Result<()> {
++    let (seen, receiver, client) =
++        run(/*declares_channel*/ true, Some(ChannelHub::default())).await?;
++    let mut receiver = receiver.expect("hub receiver");
++
++    assert_eq!(seen["experimental"][CHANNEL_CAPABILITY], json!({}));
++    for n in [1, 2] {
++        let notification = timeout(WAIT, receiver.recv()).await?.expect("notification");
++        assert_eq!(
++            notification,
++            ChannelNotification {
++                server: "srv".to_string(),
++                params: Some(json!({ "content": format!("event {n}") })),
++            }
++        );
++    }
++    client.shutdown().await;
++    Ok(())
++}
++
++#[tokio::test]
++async fn server_without_the_capability_is_not_forwarded() -> anyhow::Result<()> {
++    let (seen, receiver, client) =
++        run(/*declares_channel*/ false, Some(ChannelHub::default())).await?;
++    let mut receiver = receiver.expect("hub receiver");
++
++    assert_eq!(seen["experimental"][CHANNEL_CAPABILITY], json!({}));
++    let next = timeout(Duration::from_millis(300), receiver.recv()).await;
++    assert!(!matches!(next, Ok(Some(_))), "{next:?}");
++    client.shutdown().await;
++    Ok(())
++}
++
++#[tokio::test]
++async fn disabled_channel_leaves_initialize_unchanged() -> anyhow::Result<()> {
++    let (seen, receiver, client) = run(/*declares_channel*/ true, /*hub*/ None).await?;
++
++    assert!(receiver.is_none());
++    assert_eq!(seen.get("experimental"), None);
++    client.shutdown().await;
++    Ok(())
++}
++
++#[test]
++fn hub_receiver_is_taken_once() {
++    let hub = ChannelHub::default();
++
++    assert!(hub.clone().take_receiver().is_some());
++    assert!(hub.take_receiver().is_none());
++}
+diff --git a/codex-rs/codex-mcp/src/elicitation.rs b/codex-rs/codex-mcp/src/elicitation.rs
+index 46d1ad84fd..858cd7e12b 100644
+--- a/codex-rs/codex-mcp/src/elicitation.rs
++++ b/codex-rs/codex-mcp/src/elicitation.rs
+@@ -103,6 +103,8 @@ pub(crate) struct ElicitationRequestRouter {
+     requests: Arc<StdMutex<PendingResponders>>,
+     terminal_actions_finished: Arc<tokio::sync::Notify>,
+     full_access_form_input_enabled: Arc<AtomicBool>,
++    /// Channel notifications of the thread; see [`crate::channel`].
++    pub(crate) channels: crate::channel::ChannelHub,
+ }
+ 
+ // Removes and abandons a published request when its native waiter is dropped.
+@@ -416,6 +418,19 @@ impl ElicitationRequestManager {
+         true
+     }
+ 
++    /// The thread's channel hub when the current config enables channels for `server`.
++    pub(crate) fn channel_hub_for(&self, server: &str) -> Option<crate::channel::ChannelHub> {
++        let enabled = self
++            .authority
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .as_ref()
++            .is_some_and(|authority| {
++                crate::channel::channel_enabled(&authority.config.config_layer_stack, server)
++            });
++        enabled.then(|| self.router.channels.clone())
++    }
++
+     pub(crate) fn make_sender(
+         &self,
+         server_name: String,
+diff --git a/codex-rs/codex-mcp/src/lib.rs b/codex-rs/codex-mcp/src/lib.rs
+index e9bf3852dd..6d34134abc 100644
+--- a/codex-rs/codex-mcp/src/lib.rs
++++ b/codex-rs/codex-mcp/src/lib.rs
+@@ -5,6 +5,12 @@ pub use binding::SEARCH_CONNECTOR;
+ pub use binding::SearchDiscovery;
+ pub use binding::is_model_search_tool;
+ pub use binding_clients::McpResourceListing;
++pub use channel::CHANNEL_CAPABILITY;
++pub use channel::CHANNEL_NOTIFICATION_METHOD;
++pub use channel::CHANNEL_QUEUE_CAPACITY;
++pub use channel::ChannelNotification;
++pub use channel::channel_enabled;
++pub use channel::channel_servers;
+ pub use client_capabilities::client_mcp_extensions;
+ pub use client_tool_catalog::CodexAppsToolSnapshot;
+ pub use codex_rmcp_client::McpProtocolMode;
+@@ -125,6 +131,7 @@ pub(crate) mod auth_elicitation;
+ mod binding;
+ pub(crate) mod binding_clients;
+ mod catalog;
++mod channel;
+ mod client_capabilities;
+ mod client_tool_catalog;
+ pub(crate) mod codex_apps;
+diff --git a/codex-rs/codex-mcp/src/resource_client.rs b/codex-rs/codex-mcp/src/resource_client.rs
+index 612f080979..f5b024bb3f 100644
+--- a/codex-rs/codex-mcp/src/resource_client.rs
++++ b/codex-rs/codex-mcp/src/resource_client.rs
+@@ -252,6 +252,14 @@ impl McpResourceClient {
+         Self { runtime }
+     }
+ 
++    /// The thread's channel notifications (see [`crate::ChannelNotification`]), to the first
++    /// caller only.
++    pub fn take_channel_notifications(
++        &self,
++    ) -> Option<tokio::sync::mpsc::Receiver<crate::ChannelNotification>> {
++        self.runtime.take_channel_notifications()
++    }
++
+     /// Returns the identity of the connection set used by this client.
+     pub fn cache_key(&self) -> McpResourceClientCacheKey {
+         McpResourceClientCacheKey(Arc::downgrade(&self.runtime.latest_connections()))
+diff --git a/codex-rs/codex-mcp/src/rmcp_client.rs b/codex-rs/codex-mcp/src/rmcp_client.rs
+index a287528289..5fb97f9b77 100644
+--- a/codex-rs/codex-mcp/src/rmcp_client.rs
++++ b/codex-rs/codex-mcp/src/rmcp_client.rs
+@@ -1171,6 +1171,12 @@ async fn start_server_task(
+             );
+     }
+ 
++    let channel = crate::channel::ChannelSubscription::prepare(
++        elicitation_requests.channel_hub_for(&server_name),
++        &client,
++        &mut params,
++    );
++
+     let requested_capabilities = params.capabilities.clone();
+     let started_at = Instant::now();
+     let initialize_result = client
+@@ -1183,6 +1189,9 @@ async fn start_server_task(
+         &initialize_result,
+     );
+     let initialize_result = initialize_result.map_err(StartupOutcomeError::from)?;
++    if let Some(channel) = channel {
++        channel.connect(server_name.clone(), &initialize_result);
++    }
+     if client.protocol_mode() == McpProtocolMode::DiscoverLocalStdio
+         && !initialize_result.protocol_version.has_initialize()
+         && let Some(context) = tool_catalog_cache_context.take()
+diff --git a/codex-rs/codex-mcp/src/runtime.rs b/codex-rs/codex-mcp/src/runtime.rs
+index 35ac0f980c..30174d00b9 100644
+--- a/codex-rs/codex-mcp/src/runtime.rs
++++ b/codex-rs/codex-mcp/src/runtime.rs
+@@ -731,6 +731,14 @@ impl McpRuntime {
+             })
+     }
+ 
++    /// The thread's channel notifications (see [`crate::ChannelNotification`]), to the first
++    /// caller only.
++    pub fn take_channel_notifications(
++        &self,
++    ) -> Option<tokio::sync::mpsc::Receiver<crate::ChannelNotification>> {
++        self.elicitation_router.channels.take_receiver()
++    }
++
+     pub fn enable_full_access_form_input(&self) {
+         self.elicitation_router.enable_full_access_form_input();
+     }
+-- 
+2.53.0
+

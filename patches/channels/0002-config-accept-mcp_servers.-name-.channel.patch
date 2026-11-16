@@ -1,0 +1,56 @@
+From dd6e4b0bbeef1e74453002b1b15fceb95b0e3714 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Mon, 16 Nov 2026 14:38:11 +0100
+Subject: [PATCH 2/4] config: accept mcp_servers.<name>.channel
+
+The key is read from the layered config by the MCP runtime and is not
+carried in McpServerConfig.
+---
+ codex-rs/config/src/mcp_types.rs | 7 +++++++
+ codex-rs/core/config.schema.json | 5 +++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/codex-rs/config/src/mcp_types.rs b/codex-rs/config/src/mcp_types.rs
+index 4a81cabe37..174b90d68d 100644
+--- a/codex-rs/config/src/mcp_types.rs
++++ b/codex-rs/config/src/mcp_types.rs
+@@ -432,6 +432,12 @@ pub struct RawMcpServerConfig {
+     pub enabled: Option<bool>,
+     #[serde(default)]
+     pub required: Option<bool>,
++    /// Pass this server's `notifications/claude/channel` notifications to the chat as input.
++    /// Takes effect only when the server also declares the `claude/channel` experimental
++    /// capability.
++    // The MCP runtime reads this from the layered config; it is not part of `McpServerConfig`.
++    #[serde(default)]
++    pub channel: Option<bool>,
+     /// Whether startup requires a live connection or can use a valid cached tool catalog.
+     #[serde(default)]
+     pub startup_readiness: Option<McpStartupReadiness>,
+@@ -487,6 +493,7 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
+             tool_timeout_sec,
+             enabled,
+             required,
++            channel: _,
+             startup_readiness,
+             supports_parallel_tool_calls,
+             tool_input_schema_max_bytes,
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index 5f72e108ec..0a75b6053e 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -4339,6 +4339,11 @@
+         "bearer_token_env_var": {
+           "type": "string"
+         },
++        "channel": {
++          "default": null,
++          "description": "Pass this server's `notifications/claude/channel` notifications to the chat as input. Takes effect only when the server also declares the `claude/channel` experimental capability.",
++          "type": "boolean"
++        },
+         "command": {
+           "type": "string"
+         },
+-- 
+2.53.0
+
