@@ -89,7 +89,9 @@ every `codex-update`:
 `update --from-cli` needs a daemon that has been set up, hence the `start`
 first. It copies the release of the `codex` you run it with and turns the
 upstream updates off; it restarts the daemon, so it may interrupt running work.
-The pin holds when the daemon stops and starts again.
+The pin holds when the daemon stops and starts again. Until the daemon is
+pinned, its updater (`codex app-server daemon pid-update-loop`) keeps running
+even after `codex app-server daemon stop`; pinning stops it.
 `codex app-server daemon update`, without `--from-cli`, goes back to upstream
 updates. The daemon belongs to `$CODEX_HOME`, so every Codex installation that
 uses the same `$CODEX_HOME` shares it.
