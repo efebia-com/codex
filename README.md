@@ -81,12 +81,15 @@ Pin the daemon to the installed release once after installing, and again after
 every `codex-update`:
 
 ```sh
+<prefix>/bin/codex app-server daemon start                # sets the daemon up; no-op if it runs
 <prefix>/bin/codex app-server daemon update --from-cli --yes
-<prefix>/bin/codex app-server daemon version    # what the daemon runs now
+<prefix>/bin/codex app-server daemon version              # what the daemon runs now
 ```
 
-`--from-cli` copies the release of the `codex` you run it with and turns the
+`update --from-cli` needs a daemon that has been set up, hence the `start`
+first. It copies the release of the `codex` you run it with and turns the
 upstream updates off; it restarts the daemon, so it may interrupt running work.
+The pin holds when the daemon stops and starts again.
 `codex app-server daemon update`, without `--from-cli`, goes back to upstream
 updates. The daemon belongs to `$CODEX_HOME`, so every Codex installation that
 uses the same `$CODEX_HOME` shares it.
