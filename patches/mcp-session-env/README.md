@@ -57,7 +57,7 @@ cargo test -p codex-config --lib mcp_codex_env
 cargo test -p codex-rmcp-client --lib codex_source
 cargo test -p codex-mcp --lib session_env
 cargo test -p codex-core --test all mcp_session_env
-cargo test -p codex-core --lib config::schema_tests
+cargo test -p codex-core --lib config::schema::tests
 ```
 
 `mcp_session_env` drives a stdio server written in Python (needs `python3`) through a chat that

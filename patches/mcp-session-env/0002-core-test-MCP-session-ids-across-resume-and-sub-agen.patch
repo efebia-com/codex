@@ -1,20 +1,20 @@
-From 1644af2bc8bb3b313c4c099a9a4332a6577c674d Mon Sep 17 00:00:00 2001
+From 9c268e9db61496928566be15c67f86fd17423cbf Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 15:54:13 +0100
 Subject: [PATCH 2/2] core: test MCP session ids across resume and sub-agents
 
 ---
- codex-rs/core/tests/suite/mcp_session_env.rs | 318 +++++++++++++++++++
+ codex-rs/core/tests/suite/mcp_session_env.rs | 330 +++++++++++++++++++
  codex-rs/core/tests/suite/mod.rs             |   1 +
- 2 files changed, 319 insertions(+)
+ 2 files changed, 331 insertions(+)
  create mode 100644 codex-rs/core/tests/suite/mcp_session_env.rs
 
 diff --git a/codex-rs/core/tests/suite/mcp_session_env.rs b/codex-rs/core/tests/suite/mcp_session_env.rs
 new file mode 100644
-index 0000000000..5bf01eb145
+index 0000000000..49c2d6d623
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/mcp_session_env.rs
-@@ -0,0 +1,318 @@
+@@ -0,0 +1,330 @@
 +//! Stdio MCP servers receive the session and thread identity only when they request it.
 +
 +use std::path::Path;
@@ -181,12 +181,24 @@ index 0000000000..5bf01eb145
 +    )
 +}
 +
++/// Reads the identity JSON from the tool output. A text-only MCP result reaches the model as
++/// content items, after a wall-time header.
 +fn identity_output(mock: &ResponseMock, call_id: &str) -> Value {
 +    let output = mock.single_request().function_call_output(call_id);
-+    let text = output["output"].as_str().expect("tool output text");
-+    let start = text.find('{').expect("identity JSON");
-+    let end = text.rfind('}').expect("identity JSON");
-+    serde_json::from_str(&text[start..=end]).expect("identity JSON")
++    let text = match &output["output"] {
++        Value::String(text) => text.clone(),
++        Value::Array(items) => items
++            .iter()
++            .filter_map(|item| item["text"].as_str())
++            .collect::<Vec<_>>()
++            .join("\n"),
++        other => panic!("unexpected tool output: {other}"),
++    };
++    let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) else {
++        panic!("no identity JSON in tool output: {text}");
++    };
++    serde_json::from_str(&text[start..=end])
++        .unwrap_or_else(|err| panic!("identity JSON in {text}: {err}"))
 +}
 +
 +fn identity(value: &Value) -> (Option<&str>, Option<&str>) {
@@ -244,7 +256,7 @@ index 0000000000..5bf01eb145
 +    )
 +    .await;
 +    let mut resume_builder = builder(logs.path());
-+    let resumed = Box::pin(resume_builder.restart(&server, &test)).await?;
++    let resumed = Box::pin(resume_builder.restart_with_auto_env(&server, &test)).await?;
 +    resumed.submit_turn("resumed turn").await?;
 +
 +    assert_eq!(
