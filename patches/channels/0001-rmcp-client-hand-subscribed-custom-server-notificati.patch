@@ -1,4 +1,4 @@
-From f65da156d541fd4c891f8ad5621cc99773a253cc Mon Sep 17 00:00:00 2001
+From 17e66202355fd0b89ccf250dfffa675039e0da3b Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 14:38:11 +0100
 Subject: [PATCH 1/4] rmcp-client: hand subscribed custom server notifications
@@ -8,21 +8,21 @@ The client handler ignores custom notifications. A caller can now subscribe
 to one method before initialize and receive its notifications in a bounded
 queue; a full queue drops new ones.
 ---
- .../rmcp-client/src/custom_notifications.rs   |  62 ++++++++
+ .../rmcp-client/src/custom_notifications.rs   |  65 ++++++++
  .../src/custom_notifications_tests.rs         | 140 ++++++++++++++++++
  .../src/elicitation_client_service.rs         |  14 ++
  codex-rs/rmcp-client/src/lib.rs               |   1 +
  codex-rs/rmcp-client/src/rmcp_client.rs       |  17 +++
- 5 files changed, 234 insertions(+)
+ 5 files changed, 237 insertions(+)
  create mode 100644 codex-rs/rmcp-client/src/custom_notifications.rs
  create mode 100644 codex-rs/rmcp-client/src/custom_notifications_tests.rs
 
 diff --git a/codex-rs/rmcp-client/src/custom_notifications.rs b/codex-rs/rmcp-client/src/custom_notifications.rs
 new file mode 100644
-index 0000000000..d06fe3c684
+index 0000000000..568aa4c596
 --- /dev/null
 +++ b/codex-rs/rmcp-client/src/custom_notifications.rs
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,65 @@
 +//! Delivers selected custom server notifications, which the client handler ignores, to
 +//! subscribers.
 +
@@ -36,11 +36,14 @@ index 0000000000..d06fe3c684
 +use tracing::debug;
 +use tracing::warn;
 +
++/// One subscriber: the notification method it takes and where those notifications go.
++type Tap = (String, mpsc::Sender<CustomNotification>);
++
 +/// Subscribers by notification method. Clones share one set, so a subscription made before
 +/// `initialize` also covers every later connection of the same client.
 +#[derive(Clone, Default)]
 +pub(crate) struct CustomNotificationTaps {
-+    taps: Arc<Mutex<Vec<(String, mpsc::Sender<CustomNotification>)>>>,
++    taps: Arc<Mutex<Vec<Tap>>>,
 +}
 +
 +impl CustomNotificationTaps {

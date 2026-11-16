@@ -1,4 +1,4 @@
-From 8fa1cef5163160e10449bcb4a301518bbcf1b87e Mon Sep 17 00:00:00 2001
+From 1b2714713cbf3c5a78c9dcbfd21a80e2590cacc2 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 14:38:12 +0100
 Subject: [PATCH 4/4] ext/channels: deliver MCP channel notifications to the

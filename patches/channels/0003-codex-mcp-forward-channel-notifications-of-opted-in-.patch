@@ -1,4 +1,4 @@
-From c72d65ebdff6a89c9a7216d157cb3ea9b2880f13 Mon Sep 17 00:00:00 2001
+From 8f3b24d82c429c0740431163d205750ef8a33b06 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 14:38:11 +0100
 Subject: [PATCH 3/4] codex-mcp: forward channel notifications of opted-in
