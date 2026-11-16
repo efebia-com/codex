@@ -1,0 +1,341 @@
+From f30a6abc53064947dc69dfe55eaea0d69435e22d Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Mon, 16 Nov 2026 15:54:13 +0100
+Subject: [PATCH 2/2] core: test MCP session ids across resume and sub-agents
+
+---
+ codex-rs/core/tests/suite/mcp_session_env.rs | 309 +++++++++++++++++++
+ codex-rs/core/tests/suite/mod.rs             |   1 +
+ 2 files changed, 310 insertions(+)
+ create mode 100644 codex-rs/core/tests/suite/mcp_session_env.rs
+
+diff --git a/codex-rs/core/tests/suite/mcp_session_env.rs b/codex-rs/core/tests/suite/mcp_session_env.rs
+new file mode 100644
+index 0000000000..0125d8eac4
+--- /dev/null
++++ b/codex-rs/core/tests/suite/mcp_session_env.rs
+@@ -0,0 +1,309 @@
++//! Stdio MCP servers receive the session and thread identity only when they request it.
++
++use std::path::Path;
++
++use anyhow::Context;
++use anyhow::Result;
++use codex_features::Feature;
++use codex_protocol::protocol::EventMsg;
++use core_test_support::responses::ResponseMock;
++use core_test_support::responses::ev_assistant_message;
++use core_test_support::responses::ev_completed;
++use core_test_support::responses::ev_function_call_with_namespace;
++use core_test_support::responses::ev_response_created;
++use core_test_support::responses::mount_sse_once_match;
++use core_test_support::responses::sse;
++use core_test_support::responses::start_mock_server;
++use core_test_support::skip_if_no_network;
++use core_test_support::skip_if_wine_exec;
++use core_test_support::test_codex::TestCodexBuilder;
++use core_test_support::test_codex::test_codex;
++use core_test_support::wait_for_event;
++use pretty_assertions::assert_eq;
++use serde_json::Value;
++use serde_json::json;
++use tempfile::TempDir;
++
++/// Records its identity at startup and returns it from the `identity` tool.
++const SERVER: &str = r#"
++import json
++import os
++import sys
++
++identity = {
++    "session": os.environ.get("CODEX_SESSION_ID"),
++    "thread": os.environ.get("CODEX_THREAD_ID"),
++    "pid": os.getpid(),
++}
++with open(sys.argv[1], "a") as log:
++    log.write(json.dumps(identity) + "\n")
++
++def send(message):
++    print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
++
++for line in sys.stdin:
++    request = json.loads(line)
++    method = request.get("method")
++    if method == "initialize":
++        result = {"protocolVersion": request["params"]["protocolVersion"],
++                  "capabilities": {"tools": {}},
++                  "serverInfo": {"name": "identity-test", "version": "1"}}
++    elif method == "tools/list":
++        result = {"tools": [{"name": "identity", "inputSchema": {"type": "object", "properties": {}},
++                             "annotations": {"readOnlyHint": True}}]}
++    elif method == "tools/call":
++        result = {"content": [{"type": "text", "text": json.dumps(identity)}]}
++    elif method == "resources/list":
++        result = {"resources": []}
++    elif method == "resources/templates/list":
++        result = {"resourceTemplates": []}
++    elif "id" not in request:
++        continue
++    else:
++        result = {}
++    send({"id": request["id"], "result": result})
++"#;
++
++const OPTED_IN: &str = "opted_in";
++const PLAIN: &str = "plain";
++const WORKER_TASK: &str = "report the worker identity";
++
++fn server_config(log: &Path, env_vars: Value) -> Value {
++    json!({
++        "command": if cfg!(windows) { "python" } else { "python3" },
++        "args": ["-u", "-c", SERVER, log.to_string_lossy()],
++        "env_vars": env_vars,
++        "default_tools_approval_mode": "approve",
++    })
++}
++
++fn builder(logs: &Path) -> TestCodexBuilder {
++    let servers = json!({
++        OPTED_IN: server_config(
++            &logs.join(OPTED_IN),
++            json!([
++                { "name": "CODEX_SESSION_ID", "source": "codex" },
++                { "name": "CODEX_THREAD_ID", "source": "codex" },
++            ]),
++        ),
++        PLAIN: server_config(&logs.join(PLAIN), json!([])),
++    });
++    test_codex()
++        .with_model("gpt-5.6-sol")
++        .with_config(move |config| {
++            config.features.enable(Feature::Collab).unwrap();
++            config.features.enable(Feature::MultiAgentV2).unwrap();
++            config
++                .mcp_servers
++                .set(serde_json::from_value(servers).expect("MCP servers"))
++                .expect("test MCP servers");
++        })
++}
++
++fn body(request: &wiremock::Request) -> String {
++    String::from_utf8_lossy(&request.body).into_owned()
++}
++
++fn has_call_output(request: &wiremock::Request, call_id: &str) -> bool {
++    serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| {
++        body["input"].as_array().is_some_and(|items| {
++            items
++                .iter()
++                .any(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
++        })
++    })
++}
++
++/// Answers the first request containing `marker` with `calls`, then finishes the turn.
++async fn mount_calls(
++    server: &wiremock::MockServer,
++    marker: &'static str,
++    unless_answered: Option<&'static str>,
++    calls: Vec<(String, String, String, String)>,
++) -> ResponseMock {
++    let first_call = calls[0].0.clone();
++    let response_id = format!("resp-{first_call}");
++    let mut events = vec![ev_response_created(&response_id)];
++    events.extend(calls.iter().map(|(id, namespace, tool, args)| {
++        ev_function_call_with_namespace(id, namespace, tool, args)
++    }));
++    events.push(ev_completed(&response_id));
++    let pending_call = first_call.clone();
++    mount_sse_once_match(
++        server,
++        move |request: &wiremock::Request| {
++            body(request).contains(marker)
++                && !has_call_output(request, &pending_call)
++                && unless_answered.is_none_or(|call_id| !has_call_output(request, call_id))
++        },
++        sse(events),
++    )
++    .await;
++    let done_id = format!("done-{first_call}");
++    let mut answer = ev_assistant_message(&format!("msg-{first_call}"), "done");
++    answer["item"]["phase"] = json!("final_answer");
++    mount_sse_once_match(
++        server,
++        move |request: &wiremock::Request| has_call_output(request, &first_call),
++        sse(vec![
++            ev_response_created(&done_id),
++            answer,
++            ev_completed(&done_id),
++        ]),
++    )
++    .await
++}
++
++fn identity_call(id: &str, server: &str) -> (String, String, String, String) {
++    (
++        id.to_string(),
++        format!("mcp__{server}"),
++        "identity".to_string(),
++        "{}".to_string(),
++    )
++}
++
++fn identity_output(mock: &ResponseMock, call_id: &str) -> Value {
++    let output = mock.single_request().function_call_output(call_id);
++    let text = output["output"].as_str().expect("tool output text");
++    let start = text.find('{').expect("identity JSON");
++    let end = text.rfind('}').expect("identity JSON");
++    serde_json::from_str(&text[start..=end]).expect("identity JSON")
++}
++
++fn identity(value: &Value) -> (Option<&str>, Option<&str>) {
++    (value["session"].as_str(), value["thread"].as_str())
++}
++
++fn startups(log: &Path) -> Vec<Value> {
++    std::fs::read_to_string(log)
++        .unwrap_or_default()
++        .lines()
++        .map(|line| serde_json::from_str(line).expect("startup record"))
++        .collect()
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn opted_in_server_keeps_the_thread_identity_across_resume() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    skip_if_wine_exec!(Ok(()), "the MCP fixture requires a host Python interpreter");
++    let server = start_mock_server().await;
++    let logs = TempDir::new()?;
++
++    let first = mount_calls(
++        &server,
++        "first turn",
++        /*unless_answered*/ None,
++        vec![
++            identity_call("first-opted", OPTED_IN),
++            identity_call("first-plain", PLAIN),
++        ],
++    )
++    .await;
++    let test = Box::pin(builder(logs.path()).build_with_auto_env(&server)).await?;
++    test.submit_turn("first turn").await?;
++    let thread_id = test.session_configured.thread_id.to_string();
++    let thread_id = Some(thread_id.as_str());
++
++    assert_eq!(
++        identity(&identity_output(&first, "first-opted")),
++        (thread_id, thread_id)
++    );
++    assert_eq!(
++        identity(&identity_output(&first, "first-plain")),
++        (None, None)
++    );
++
++    let resumed_calls = mount_calls(
++        &server,
++        "resumed turn",
++        /*unless_answered*/ None,
++        vec![identity_call("resumed-opted", OPTED_IN)],
++    )
++    .await;
++    let mut resume_builder = builder(logs.path());
++    let resumed = Box::pin(resume_builder.restart(&server, &test)).await?;
++    resumed.submit_turn("resumed turn").await?;
++
++    assert_eq!(
++        resumed.session_configured.thread_id,
++        test.session_configured.thread_id
++    );
++    assert_eq!(
++        identity(&identity_output(&resumed_calls, "resumed-opted")),
++        (thread_id, thread_id)
++    );
++    // Every process started for this thread, before and after resume, saw the same identity.
++    let opted_in_startups = startups(&logs.path().join(OPTED_IN));
++    assert!(opted_in_startups.len() >= 2, "{opted_in_startups:?}");
++    assert!(
++        opted_in_startups
++            .iter()
++            .all(|startup| identity(startup) == (thread_id, thread_id)),
++        "{opted_in_startups:?}"
++    );
++    assert!(
++        startups(&logs.path().join(PLAIN))
++            .iter()
++            .all(|startup| identity(startup) == (None, None))
++    );
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn subagent_server_shares_the_session_but_not_the_thread() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    skip_if_wine_exec!(Ok(()), "the MCP fixture requires a host Python interpreter");
++    let server = start_mock_server().await;
++    let logs = TempDir::new()?;
++
++    mount_calls(
++        &server,
++        "spawn the worker",
++        /*unless_answered*/ None,
++        vec![(
++            "spawn-call".to_string(),
++            "collaboration".to_string(),
++            "spawn_agent".to_string(),
++            json!({ "message": WORKER_TASK, "task_name": "worker", "fork_turns": "none" })
++                .to_string(),
++        )],
++    )
++    .await;
++    let worker_calls = mount_calls(
++        &server,
++        WORKER_TASK,
++        Some("spawn-call"),
++        vec![identity_call("worker-opted", OPTED_IN)],
++    )
++    .await;
++    let test = Box::pin(builder(logs.path()).build_with_auto_env(&server)).await?;
++    test.submit_turn("spawn the worker").await?;
++
++    let root_id = test.session_configured.thread_id;
++    let worker_id = test
++        .thread_manager
++        .list_thread_ids()
++        .await
++        .into_iter()
++        .find(|thread_id| *thread_id != root_id)
++        .context("worker thread")?;
++    let worker = test.thread_manager.get_thread(worker_id).await?;
++    wait_for_event(&worker, |event| matches!(event, EventMsg::TurnComplete(_))).await;
++
++    let root_id = root_id.to_string();
++    let worker_id = worker_id.to_string();
++    let worker_identity = identity_output(&worker_calls, "worker-opted");
++    assert_eq!(
++        identity(&worker_identity),
++        (Some(root_id.as_str()), Some(worker_id.as_str()))
++    );
++
++    let opted_in_startups = startups(&logs.path().join(OPTED_IN));
++    let root_startup = opted_in_startups
++        .iter()
++        .find(|startup| identity(startup) == (Some(root_id.as_str()), Some(root_id.as_str())))
++        .context("root server startup")?;
++    assert_ne!(root_startup["pid"], worker_identity["pid"]);
++    Ok(())
++}
+diff --git a/codex-rs/core/tests/suite/mod.rs b/codex-rs/core/tests/suite/mod.rs
+index b1f7a42313..bc317c38e1 100644
+--- a/codex-rs/core/tests/suite/mod.rs
++++ b/codex-rs/core/tests/suite/mod.rs
+@@ -148,6 +148,7 @@ mod mcp_executor_context;
+ mod mcp_extension_protocol;
+ mod mcp_optional_startup_grace;
+ mod mcp_refresh_cleanup;
++mod mcp_session_env;
+ mod mcp_startup_refresh_http_proxy;
+ mod mcp_subagent_elicitation;
+ mod mcp_tool_cache;
+-- 
+2.53.0
+

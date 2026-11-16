@@ -1,0 +1,683 @@
+From b79cc1cffb65f67e32570d35854ab1eff90cc578 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Mon, 16 Nov 2026 15:54:13 +0100
+Subject: [PATCH 1/2] mcp: pass session and thread ids to stdio servers that
+ ask for them
+
+A stdio MCP server can now request the identity of the chat that starts
+it, with the same values shell commands receive:
+
+    env_vars = [
+      { name = "CODEX_SESSION_ID", source = "codex" },
+      { name = "CODEX_THREAD_ID", source = "codex" },
+    ]
+
+`source = "codex"` is accepted only for these two names. Their values are
+never read from the Codex process environment. Servers started outside a
+thread get neither variable, and a pooled connection is never shared
+between threads that requested different ids.
+---
+ codex-rs/cli/src/doctor.rs                  |   2 +-
+ codex-rs/codex-mcp/src/lib.rs               |   2 +
+ codex-rs/codex-mcp/src/rmcp_client.rs       |   2 +
+ codex-rs/codex-mcp/src/runtime.rs           |  13 ++
+ codex-rs/codex-mcp/src/server.rs            |  11 ++
+ codex-rs/codex-mcp/src/session_env.rs       |  84 +++++++++++++
+ codex-rs/codex-mcp/src/session_env_tests.rs | 126 ++++++++++++++++++++
+ codex-rs/config/src/lib.rs                  |   3 +
+ codex-rs/config/src/mcp_codex_env.rs        |  28 +++++
+ codex-rs/config/src/mcp_codex_env_tests.rs  |  70 +++++++++++
+ codex-rs/config/src/mcp_types.rs            |  13 +-
+ codex-rs/core/config.schema.json            |   1 +
+ codex-rs/core/src/session/mcp.rs            |   4 +
+ codex-rs/rmcp-client/src/utils.rs           |  54 ++++++++-
+ 14 files changed, 410 insertions(+), 3 deletions(-)
+ create mode 100644 codex-rs/codex-mcp/src/session_env.rs
+ create mode 100644 codex-rs/codex-mcp/src/session_env_tests.rs
+ create mode 100644 codex-rs/config/src/mcp_codex_env.rs
+ create mode 100644 codex-rs/config/src/mcp_codex_env_tests.rs
+
+diff --git a/codex-rs/cli/src/doctor.rs b/codex-rs/cli/src/doctor.rs
+index ab43884ac8..5e597c9dfe 100644
+--- a/codex-rs/cli/src/doctor.rs
++++ b/codex-rs/cli/src/doctor.rs
+@@ -1610,7 +1610,7 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
+                                 env_var.name()
+                             ));
+                         }
+-                    } else if !env_var_present(env_var.name()) {
++                    } else if !env_var.is_codex_source() && !env_var_present(env_var.name()) {
+                         missing_env.push(format!("{name}: env var {} is not set", env_var.name()));
+                     }
+                 }
+diff --git a/codex-rs/codex-mcp/src/lib.rs b/codex-rs/codex-mcp/src/lib.rs
+index e9bf3852dd..df39f7450f 100644
+--- a/codex-rs/codex-mcp/src/lib.rs
++++ b/codex-rs/codex-mcp/src/lib.rs
+@@ -42,6 +42,7 @@ pub use sandbox_metadata::MCP_SANDBOX_LAUNCHER_META_KEY;
+ pub use sandbox_metadata::MCP_SANDBOX_STATE_CAPABILITY;
+ pub use sandbox_metadata::MCP_SANDBOX_STATE_META_CAPABILITY;
+ pub use sandbox_metadata::SandboxState;
++pub use session_env::McpSessionEnv;
+ pub use tool_catalog_cache::McpToolCatalogCache;
+ pub use tool_request_meta::McpToolRequestMetaHook;
+ pub use tool_request_meta::McpToolRequestMetaProvider;
+@@ -148,6 +149,7 @@ pub(crate) mod runtime;
+ mod sandbox_executable;
+ mod sandbox_metadata;
+ pub(crate) mod server;
++mod session_env;
+ mod tool_catalog_cache;
+ mod tool_request_meta;
+ pub(crate) mod tools;
+diff --git a/codex-rs/codex-mcp/src/rmcp_client.rs b/codex-rs/codex-mcp/src/rmcp_client.rs
+index a287528289..3894d006e6 100644
+--- a/codex-rs/codex-mcp/src/rmcp_client.rs
++++ b/codex-rs/codex-mcp/src/rmcp_client.rs
+@@ -1497,6 +1497,8 @@ pub(crate) async fn make_rmcp_client(
+         } => {
+             let command_os: OsString = command.into();
+             let args_os: Vec<OsString> = args.into_iter().map(Into::into).collect();
++            let env =
++                crate::session_env::with_codex_env(env, runtime_context.session_env(), &env_vars);
+             let env_os = env.map(|env| {
+                 env.into_iter()
+                     .map(|(key, value)| (key.into(), value.into()))
+diff --git a/codex-rs/codex-mcp/src/runtime.rs b/codex-rs/codex-mcp/src/runtime.rs
+index 35ac0f980c..58fb661527 100644
+--- a/codex-rs/codex-mcp/src/runtime.rs
++++ b/codex-rs/codex-mcp/src/runtime.rs
+@@ -71,6 +71,7 @@ use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
+ use crate::resource_client::McpResourceServerCacheKey;
+ use crate::resource_origin::ResourceOrigins;
+ use crate::server::EffectiveMcpServer;
++use crate::session_env::McpSessionEnv;
+ use crate::tool_catalog_cache::McpToolCatalogCache;
+ use crate::tools::ToolInfo;
+ 
+@@ -1066,6 +1067,7 @@ pub struct McpRuntimeContext {
+     ready_environments: HashMap<String, Arc<Environment>>,
+     local_process_cwd: PathBuf,
+     local_http_client: Arc<dyn HttpClient>,
++    session_env: Option<McpSessionEnv>,
+ }
+ 
+ /// Applies the local HTTP headers helper configured for an MCP server.
+@@ -1115,9 +1117,20 @@ impl McpRuntimeContext {
+             ready_environments: HashMap::new(),
+             local_process_cwd,
+             local_http_client,
++            session_env: None,
+         }
+     }
+ 
++    /// Records the thread that owns this runtime for servers that request its identity.
++    pub fn with_session_env(mut self, session_env: McpSessionEnv) -> Self {
++        self.session_env = Some(session_env);
++        self
++    }
++
++    pub(crate) fn session_env(&self) -> Option<&McpSessionEnv> {
++        self.session_env.as_ref()
++    }
++
+     /// Uses this process's pool for compatible local stdio servers using MCP 2026-07-28.
+     pub fn with_connection_pool(mut self, pool: McpConnectionPool) -> Self {
+         self.connection_pool = Some(pool);
+diff --git a/codex-rs/codex-mcp/src/server.rs b/codex-rs/codex-mcp/src/server.rs
+index dffab26c55..a3d825250b 100644
+--- a/codex-rs/codex-mcp/src/server.rs
++++ b/codex-rs/codex-mcp/src/server.rs
+@@ -7,6 +7,7 @@ use std::sync::Arc;
+ use crate::auth::McpAuthProvider;
+ use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
+ use crate::runtime::McpRuntimeContext;
++use crate::session_env::requested_codex_env;
+ use codex_config::AppToolApproval;
+ use codex_config::McpServerAuth;
+ use codex_config::McpServerConfig;
+@@ -176,6 +177,7 @@ pub(crate) struct McpServerConnectionIdentity {
+     resolved_environment: Result<Option<Arc<Environment>>, String>,
+     local_stdio_fallback_cwd: Option<PathBuf>,
+     referenced_environment_variables: Vec<(String, Option<OsString>)>,
++    codex_env: Vec<(String, String)>,
+     runtime_auth: Option<CodexAuth>,
+     runtime_auth_token: Option<String>,
+     runtime_auth_mode: Option<codex_features::RuntimeAuthMode>,
+@@ -282,6 +284,13 @@ impl McpServerConnectionIdentity {
+             McpCredentialPolicy::HostFallbackAllowed => referenced_environment_variables(config),
+             McpCredentialPolicy::ExecutorOnly => Vec::new(),
+         };
++        // Requested thread identity keeps pooled connections from serving other threads.
++        let codex_env = match &config.transport {
++            McpServerTransportConfig::Stdio { env_vars, .. } => {
++                requested_codex_env(runtime_context.session_env(), env_vars)
++            }
++            McpServerTransportConfig::StreamableHttp { .. } => Vec::new(),
++        };
+         let runtime_auth = runtime_auth_provider.and(auth).cloned();
+         let runtime_auth_token = runtime_auth.as_ref().and_then(|auth| auth.get_token().ok());
+         let oauth_store_was_contended = oauth_credentials
+@@ -306,6 +315,7 @@ impl McpServerConnectionIdentity {
+             resolved_environment: resolved_environment.clone(),
+             local_stdio_fallback_cwd,
+             referenced_environment_variables,
++            codex_env,
+             runtime_auth,
+             runtime_auth_token,
+             runtime_auth_mode,
+@@ -346,6 +356,7 @@ impl McpServerConnectionIdentity {
+             && same_resolved_environment(&self.resolved_environment, &other.resolved_environment)
+             && self.local_stdio_fallback_cwd == other.local_stdio_fallback_cwd
+             && self.referenced_environment_variables == other.referenced_environment_variables
++            && self.codex_env == other.codex_env
+             && same_runtime_auth
+             && self.runtime_auth_token == other.runtime_auth_token
+             && self.runtime_auth_mode == other.runtime_auth_mode
+diff --git a/codex-rs/codex-mcp/src/session_env.rs b/codex-rs/codex-mcp/src/session_env.rs
+new file mode 100644
+index 0000000000..c0b6f527a0
+--- /dev/null
++++ b/codex-rs/codex-mcp/src/session_env.rs
+@@ -0,0 +1,84 @@
++//! Thread identity for stdio MCP servers that request it with `env_vars` source `codex`.
++
++use std::collections::HashMap;
++
++use codex_config::McpServerEnvVar;
++use codex_protocol::SessionId;
++use codex_protocol::ThreadId;
++use codex_protocol::shell_environment::CODEX_SESSION_ID_ENV_VAR;
++use codex_protocol::shell_environment::CODEX_THREAD_ID_ENV_VAR;
++
++/// Session and thread that own an MCP runtime.
++///
++/// The values match those given to shell commands: `CODEX_SESSION_ID` identifies the root
++/// thread and is shared by its descendant agents; `CODEX_THREAD_ID` is the thread itself.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct McpSessionEnv {
++    session_id: SessionId,
++    thread_id: ThreadId,
++}
++
++impl McpSessionEnv {
++    pub fn new(session_id: SessionId, thread_id: ThreadId) -> Self {
++        Self {
++            session_id,
++            thread_id,
++        }
++    }
++
++    fn value(&self, name: &str) -> Option<String> {
++        match name {
++            CODEX_SESSION_ID_ENV_VAR => Some(self.session_id.to_string()),
++            CODEX_THREAD_ID_ENV_VAR => Some(self.thread_id.to_string()),
++            _ => None,
++        }
++    }
++}
++
++/// Values requested through `source = "codex"`, sorted by name.
++///
++/// Without a thread, as when a server is started only to inspect it, nothing is provided.
++pub(crate) fn requested_codex_env(
++    session_env: Option<&McpSessionEnv>,
++    env_vars: &[McpServerEnvVar],
++) -> Vec<(String, String)> {
++    let Some(session_env) = session_env else {
++        return Vec::new();
++    };
++    let mut values = env_vars
++        .iter()
++        .filter(|env_var| env_var.is_codex_source())
++        .filter_map(|env_var| {
++            session_env
++                .value(env_var.name())
++                .map(|value| (env_var.name().to_string(), value))
++        })
++        .collect::<Vec<_>>();
++    values.sort();
++    values.dedup();
++    values
++}
++
++/// Adds the requested values to a stdio server's literal `env`, which they override.
++pub(crate) fn with_codex_env(
++    env: Option<HashMap<String, String>>,
++    session_env: Option<&McpSessionEnv>,
++    env_vars: &[McpServerEnvVar],
++) -> Option<HashMap<String, String>> {
++    let values = requested_codex_env(session_env, env_vars);
++    if values.is_empty() {
++        return env;
++    }
++    let mut env = env.unwrap_or_default();
++    for (name, value) in values {
++        if cfg!(windows) {
++            env.retain(|key, _| !key.eq_ignore_ascii_case(&name));
++        }
++        env.insert(name, value);
++    }
++    Some(env)
++}
++
++#[cfg(test)]
++#[path = "session_env_tests.rs"]
++mod tests;
+diff --git a/codex-rs/codex-mcp/src/session_env_tests.rs b/codex-rs/codex-mcp/src/session_env_tests.rs
+new file mode 100644
+index 0000000000..26a07f539c
+--- /dev/null
++++ b/codex-rs/codex-mcp/src/session_env_tests.rs
+@@ -0,0 +1,126 @@
++use std::collections::HashMap;
++
++use codex_config::McpServerEnvVar;
++use codex_protocol::SessionId;
++use codex_protocol::ThreadId;
++use pretty_assertions::assert_eq;
++
++use super::McpSessionEnv;
++use super::requested_codex_env;
++use super::with_codex_env;
++
++const SESSION: &str = "00000000-0000-7000-8000-000000000001";
++const THREAD: &str = "00000000-0000-7000-8000-000000000002";
++
++fn session_env() -> McpSessionEnv {
++    McpSessionEnv::new(
++        SessionId::from_string(SESSION).expect("session id"),
++        ThreadId::from_string(THREAD).expect("thread id"),
++    )
++}
++
++fn sourced(name: &str, source: &str) -> McpServerEnvVar {
++    McpServerEnvVar::Config {
++        name: name.to_string(),
++        source: Some(source.to_string()),
++    }
++}
++
++#[test]
++fn provides_only_requested_codex_values() {
++    let env_vars = [
++        sourced("CODEX_THREAD_ID", "codex"),
++        sourced("CODEX_SESSION_ID", "local"),
++        "CODEX_SESSION_ID".into(),
++    ];
++
++    assert_eq!(
++        requested_codex_env(Some(&session_env()), &env_vars),
++        vec![("CODEX_THREAD_ID".to_string(), THREAD.to_string())]
++    );
++}
++
++#[test]
++fn provides_both_values_in_name_order() {
++    let env_vars = [
++        sourced("CODEX_THREAD_ID", "codex"),
++        sourced("CODEX_SESSION_ID", "codex"),
++        sourced("CODEX_THREAD_ID", "codex"),
++    ];
++
++    assert_eq!(
++        requested_codex_env(Some(&session_env()), &env_vars),
++        vec![
++            ("CODEX_SESSION_ID".to_string(), SESSION.to_string()),
++            ("CODEX_THREAD_ID".to_string(), THREAD.to_string()),
++        ]
++    );
++}
++
++#[test]
++fn without_a_thread_the_environment_is_unchanged() {
++    let env_vars = [sourced("CODEX_THREAD_ID", "codex")];
++    let env = Some(HashMap::from([("A".to_string(), "1".to_string())]));
++
++    assert_eq!(requested_codex_env(/*session_env*/ None, &env_vars), vec![]);
++    assert_eq!(
++        with_codex_env(env.clone(), /*session_env*/ None, &env_vars),
++        env
++    );
++    assert_eq!(
++        with_codex_env(/*env*/ None, /*session_env*/ None, &env_vars),
++        None
++    );
++}
++
++#[test]
++fn servers_without_the_opt_in_keep_their_environment() {
++    let env_vars = ["CODEX_THREAD_ID".into()];
++
++    assert_eq!(
++        with_codex_env(/*env*/ None, Some(&session_env()), &env_vars),
++        None
++    );
++}
++
++#[test]
++fn codex_values_override_literal_env() {
++    let env_vars = [sourced("CODEX_THREAD_ID", "codex")];
++    let env = Some(HashMap::from([
++        ("CODEX_THREAD_ID".to_string(), "configured".to_string()),
++        ("A".to_string(), "1".to_string()),
++    ]));
++
++    assert_eq!(
++        with_codex_env(env, Some(&session_env()), &env_vars),
++        Some(HashMap::from([
++            ("CODEX_THREAD_ID".to_string(), THREAD.to_string()),
++            ("A".to_string(), "1".to_string()),
++        ]))
++    );
++}
++
++#[tokio::test]
++async fn pooled_connections_never_serve_another_thread_that_requested_identity() {
++    use crate::connection_pool::tests as fixture;
++    use codex_config::McpServerConfig;
++
++    let opted_in: McpServerConfig = serde_json::from_value(serde_json::json!({
++        "command": "test-server",
++        "env_vars": [{ "name": "CODEX_THREAD_ID", "source": "codex" }],
++    }))
++    .expect("opted-in config");
++    let plain = fixture::config();
++    let other_thread = McpSessionEnv::new(
++        SessionId::from_string(SESSION).expect("session id"),
++        ThreadId::from_string("00000000-0000-7000-8000-000000000003").expect("thread id"),
++    );
++    // Threads of one process share the environment registry; only their identity differs.
++    let process = fixture::context();
++    let thread_a = process.clone().with_session_env(session_env());
++    let thread_b = process.with_session_env(other_thread);
++
++    assert!(fixture::key(&thread_a, &opted_in) != fixture::key(&thread_b, &opted_in));
++    assert!(fixture::key(&thread_a, &opted_in) == fixture::key(&thread_a, &opted_in));
++    assert!(fixture::key(&thread_a, &plain) == fixture::key(&thread_b, &plain));
++}
+diff --git a/codex-rs/config/src/lib.rs b/codex-rs/config/src/lib.rs
+index 4a10ce6872..2e1af72a3b 100644
+--- a/codex-rs/config/src/lib.rs
++++ b/codex-rs/config/src/lib.rs
+@@ -23,6 +23,7 @@ mod in_app_browser_requirements;
+ mod key_aliases;
+ pub mod loader;
+ mod marketplace_edit;
++mod mcp_codex_env;
+ mod mcp_edit;
+ mod mcp_ema;
+ mod mcp_ema_cancellation;
+@@ -184,6 +185,8 @@ pub use marketplace_edit::RemoveMarketplaceConfigOutcome;
+ pub use marketplace_edit::record_user_marketplace;
+ pub use marketplace_edit::remove_user_marketplace;
+ pub use marketplace_edit::remove_user_marketplace_config;
++pub use mcp_codex_env::MCP_CODEX_ENV_VAR_NAMES;
++pub use mcp_codex_env::MCP_CODEX_ENV_VAR_SOURCE;
+ pub use mcp_edit::load_global_mcp_servers;
+ pub use mcp_ema::McpEmaAuthScope;
+ pub use mcp_ema::McpEmaRegistration;
+diff --git a/codex-rs/config/src/mcp_codex_env.rs b/codex-rs/config/src/mcp_codex_env.rs
+new file mode 100644
+index 0000000000..2c7763a362
+--- /dev/null
++++ b/codex-rs/config/src/mcp_codex_env.rs
+@@ -0,0 +1,28 @@
++//! Variables that Codex itself provides to opted-in stdio MCP servers.
++
++use codex_protocol::shell_environment::CODEX_SESSION_ID_ENV_VAR;
++use codex_protocol::shell_environment::CODEX_THREAD_ID_ENV_VAR;
++
++/// `env_vars` source whose value Codex provides for the thread that starts the server.
++pub const MCP_CODEX_ENV_VAR_SOURCE: &str = "codex";
++
++/// Variable names accepted with [`MCP_CODEX_ENV_VAR_SOURCE`].
++pub const MCP_CODEX_ENV_VAR_NAMES: &[&str] = &[CODEX_SESSION_ID_ENV_VAR, CODEX_THREAD_ID_ENV_VAR];
++
++pub(crate) fn validate_codex_env_var_name(name: &str) -> Result<(), String> {
++    if MCP_CODEX_ENV_VAR_NAMES.contains(&name) {
++        return Ok(());
++    }
++    Err(format!(
++        "env_vars entry `{name}` uses source `{MCP_CODEX_ENV_VAR_SOURCE}`, which only supports {}",
++        MCP_CODEX_ENV_VAR_NAMES
++            .iter()
++            .map(|name| format!("`{name}`"))
++            .collect::<Vec<_>>()
++            .join(" and ")
++    ))
++}
++
++#[cfg(test)]
++#[path = "mcp_codex_env_tests.rs"]
++mod tests;
+diff --git a/codex-rs/config/src/mcp_codex_env_tests.rs b/codex-rs/config/src/mcp_codex_env_tests.rs
+new file mode 100644
+index 0000000000..986403d1fb
+--- /dev/null
++++ b/codex-rs/config/src/mcp_codex_env_tests.rs
+@@ -0,0 +1,70 @@
++use crate::McpServerConfig;
++use crate::McpServerEnvVar;
++use crate::McpServerTransportConfig;
++use pretty_assertions::assert_eq;
++
++#[test]
++fn stdio_server_accepts_codex_sourced_session_variables() {
++    let config: McpServerConfig = toml::from_str(
++        r#"
++            command = "echo"
++            env_vars = [
++                { name = "CODEX_SESSION_ID", source = "codex" },
++                { name = "CODEX_THREAD_ID", source = "codex" },
++                "PLAIN",
++            ]
++        "#,
++    )
++    .expect("codex-sourced session variables should be accepted");
++
++    let McpServerTransportConfig::Stdio { env_vars, .. } = config.transport else {
++        panic!("expected stdio transport");
++    };
++    assert_eq!(
++        env_vars
++            .iter()
++            .map(|env_var| (env_var.name(), env_var.is_codex_source()))
++            .collect::<Vec<_>>(),
++        vec![
++            ("CODEX_SESSION_ID", true),
++            ("CODEX_THREAD_ID", true),
++            ("PLAIN", false),
++        ]
++    );
++}
++
++#[test]
++fn codex_source_rejects_other_variable_names() {
++    let err = toml::from_str::<McpServerConfig>(
++        r#"
++            command = "echo"
++            env_vars = [{ name = "HOME", source = "codex" }]
++        "#,
++    )
++    .expect_err("codex source should only provide session variables");
++
++    assert!(
++        err.to_string().contains(
++            "env_vars entry `HOME` uses source `codex`, which only supports `CODEX_SESSION_ID` and `CODEX_THREAD_ID`"
++        ),
++        "unexpected error: {err}"
++    );
++}
++
++#[test]
++fn codex_source_round_trips_through_serialization() {
++    let env_var = McpServerEnvVar::Config {
++        name: "CODEX_THREAD_ID".to_string(),
++        source: Some("codex".to_string()),
++    };
++
++    let serialized = serde_json::to_value(&env_var).expect("serialize env var");
++    assert_eq!(
++        serialized,
++        serde_json::json!({ "name": "CODEX_THREAD_ID", "source": "codex" })
++    );
++    let deserialized: McpServerEnvVar =
++        serde_json::from_value(serialized).expect("deserialize env var");
++    assert_eq!(deserialized, env_var);
++    assert_eq!(deserialized.validate_source(), Ok(()));
++}
+diff --git a/codex-rs/config/src/mcp_types.rs b/codex-rs/config/src/mcp_types.rs
+index 4a81cabe37..fc9e3d0c76 100644
+--- a/codex-rs/config/src/mcp_types.rs
++++ b/codex-rs/config/src/mcp_types.rs
+@@ -17,9 +17,11 @@ use serde::Deserializer;
+ use serde::Serialize;
+ use serde::de::Error as SerdeError;
+ 
++use crate::MCP_CODEX_ENV_VAR_SOURCE;
+ use crate::McpEmaRegistration;
+ use crate::McpEmaTokenEndpointAuthMethod;
+ use crate::RequirementSource;
++use crate::mcp_codex_env::validate_codex_env_var_name;
+ 
+ /// Effective MCP environment id when config omits `environment_id`.
+ pub const DEFAULT_MCP_SERVER_ENVIRONMENT_ID: &str = "local";
+@@ -104,6 +106,9 @@ pub enum McpServerEnvVar {
+     Name(String),
+     Config {
+         name: String,
++        /// Where the value comes from: `local` (default) reads the Codex process environment,
++        /// `remote` reads the executor environment, and `codex` asks Codex to provide
++        /// `CODEX_SESSION_ID` or `CODEX_THREAD_ID` for the thread that starts the server.
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+         source: Option<String>,
+     },
+@@ -128,11 +133,17 @@ impl McpServerEnvVar {
+         self.source() == Some("remote")
+     }
+ 
++    /// Whether Codex provides this variable's value instead of reading an environment.
++    pub fn is_codex_source(&self) -> bool {
++        self.source() == Some(MCP_CODEX_ENV_VAR_SOURCE)
++    }
++
+     pub fn validate_source(&self) -> Result<(), String> {
+         match self.source() {
+             None | Some("local") | Some("remote") => Ok(()),
++            Some(MCP_CODEX_ENV_VAR_SOURCE) => validate_codex_env_var_name(self.name()),
+             Some(source) => Err(format!(
+-                "unsupported env_vars source `{source}`; expected `local` or `remote`"
++                "unsupported env_vars source `{source}`; expected `local`, `remote` or `codex`"
+             )),
+         }
+     }
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index 5f72e108ec..57592e39c8 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -2855,6 +2855,7 @@
+               "type": "string"
+             },
+             "source": {
++              "description": "Where the value comes from: `local` (default) reads the Codex process environment, `remote` reads the executor environment, and `codex` asks Codex to provide `CODEX_SESSION_ID` or `CODEX_THREAD_ID` for the thread that starts the server.",
+               "type": "string"
+             }
+           },
+diff --git a/codex-rs/core/src/session/mcp.rs b/codex-rs/core/src/session/mcp.rs
+index b2ec905920..cb82178849 100644
+--- a/codex-rs/core/src/session/mcp.rs
++++ b/codex-rs/core/src/session/mcp.rs
+@@ -176,6 +176,10 @@ impl Session {
+             local_process_cwd,
+         )
+         .with_connection_pool(self.services.mcp_manager.connection_pool())
++        .with_session_env(codex_mcp::McpSessionEnv::new(
++            self.session_id(),
++            self.thread_id,
++        ))
+         .with_selected_environments(
+             environments.all_selections().into(),
+             environments.ready_environment_handles(),
+diff --git a/codex-rs/rmcp-client/src/utils.rs b/codex-rs/rmcp-client/src/utils.rs
+index dac42ca611..4dfdb0f1c9 100644
+--- a/codex-rs/rmcp-client/src/utils.rs
++++ b/codex-rs/rmcp-client/src/utils.rs
+@@ -67,7 +67,7 @@ pub(crate) fn create_env_overlay_for_remote_mcp_server(
+     // by the MCP config plus literal env overrides from that config.
+     let mut env: HashMap<OsString, OsString> = env_vars
+         .iter()
+-        .filter(|var| !var.is_remote_source())
++        .filter(|var| !var.is_remote_source() && !var.is_codex_source())
+         .filter_map(|var| env::var_os(var.name()).map(|value| (OsString::from(var.name()), value)))
+         .chain(extra_env.unwrap_or_default())
+         .collect();
+@@ -94,8 +94,10 @@ fn local_stdio_env_var_names(env_vars: &[McpServerEnvVar]) -> Result<impl Iterat
+             remote_var.name()
+         ));
+     }
++    // Codex-sourced values come from the starting thread, never from this process.
+     Ok(env_vars
+         .iter()
++        .filter(|var| !var.is_codex_source())
+         .map(McpServerEnvVar::name)
+         .filter(|name| !is_non_inheritable_env_var(name)))
+ }
+@@ -354,4 +356,54 @@ mod tests {
+ 
+         assert_eq!(env.get(OsStr::new("PATH")), Some(&expected));
+     }
++
++    fn codex_sourced(name: &str) -> McpServerEnvVar {
++        McpServerEnvVar::Config {
++            name: name.to_string(),
++            source: Some("codex".to_string()),
++        }
++    }
++
++    #[test]
++    #[serial(extra_rmcp_env)]
++    fn codex_source_variables_are_never_read_from_the_process_environment() {
++        let _session_guard = EnvVarGuard::set("CODEX_SESSION_ID", "outer-session");
++        let _thread_guard = EnvVarGuard::set("CODEX_THREAD_ID", "outer-thread");
++        let env_vars = [
++            codex_sourced("CODEX_SESSION_ID"),
++            codex_sourced("CODEX_THREAD_ID"),
++        ];
++
++        let local = create_env_for_mcp_server(/*extra_env*/ None, &env_vars)
++            .expect("local MCP env should build");
++        let remote = create_env_overlay_for_remote_mcp_server(/*extra_env*/ None, &env_vars);
++
++        for env in [local, remote] {
++            assert_eq!(env.get(OsStr::new("CODEX_SESSION_ID")), None);
++            assert_eq!(env.get(OsStr::new("CODEX_THREAD_ID")), None);
++        }
++        assert_eq!(remote_mcp_env_var_names(&env_vars), Vec::<String>::new());
++    }
++
++    #[test]
++    #[serial(extra_rmcp_env)]
++    fn codex_source_variables_use_values_supplied_by_codex() {
++        let _thread_guard = EnvVarGuard::set("CODEX_THREAD_ID", "outer-thread");
++        let supplied = HashMap::from([(
++            OsString::from("CODEX_THREAD_ID"),
++            OsString::from("current-thread"),
++        )]);
++        let env_vars = [codex_sourced("CODEX_THREAD_ID")];
++
++        let local = create_env_for_mcp_server(Some(supplied.clone()), &env_vars)
++            .expect("local MCP env should build");
++        let remote = create_env_overlay_for_remote_mcp_server(Some(supplied), &env_vars);
++
++        for env in [local, remote] {
++            assert_eq!(
++                env.get(OsStr::new("CODEX_THREAD_ID")),
++                Some(&OsString::from("current-thread"))
++            );
++        }
++    }
+ }
+-- 
+2.53.0
+
