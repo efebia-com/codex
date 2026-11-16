@@ -1,0 +1,65 @@
+# Standalone starter configuration: copy into a project; do not extend this file.
+# Python minimum is inferred from the adjacent pyproject.toml's requires-python.
+src = ["src"]
+line-length = 120
+
+[format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+skip-magic-trailing-comma = true
+docstring-code-format = true
+docstring-code-line-length = 80
+
+[analyze]
+detect-string-imports = false
+
+[lint.flake8-tidy-imports]
+ban-lazy = "all"
+ban-relative-imports = "all"
+
+[lint.flake8-tidy-imports.banned-api]
+"__future__.annotations".msg = "Do not use from __future__ import annotations."
+"typing.TYPE_CHECKING".msg = "Keep imports available at runtime; type-checking guards are prohibited."
+"typing_extensions.TYPE_CHECKING".msg = "Keep imports available at runtime; type-checking guards are prohibited."
+
+[lint.flake8-type-checking]
+quote-annotations = false
+strict = false
+
+[lint.isort]
+lines-after-imports = 2
+
+[lint.mccabe]
+max-complexity = 10
+
+[lint.pylint]
+max-args = 6
+max-branches = 12
+max-statements = 50
+
+[lint.pycodestyle]
+max-doc-length = 100
+
+[lint]
+select = ["ALL"]
+future-annotations = false
+ignore = [
+    "D",      # No docstring requirements or docstring-style enforcement.
+    "TC001",  # First-party imports stay available at runtime.
+    "TC002",  # Third-party imports stay available at runtime.
+    "TC003",  # Standard-library imports stay available at runtime.
+    "CPY001",  # no repeated copyright headers in source files.
+    "COM812",  # it demands the trailing comma that format removes.
+
+    # --- Project-specific exceptions: add only with human approval. ---
+]
+
+# --- Project-specific logger objects: use actual importable object paths. ---
+# Example: logger-objects = ["myapp.log.log"]
+logger-objects = []
+
+[lint.extend-per-file-ignores]
+"tests/*.py" = ["S101"]  # pytest asserts are the test mechanism.
+
+# --- Project-specific file/path exceptions: add only with human approval. ---

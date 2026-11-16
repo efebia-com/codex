@@ -1,0 +1,6 @@
+[project]
+name = "codex-channels-smoke"
+version = "0"
+# Runs on the CI runners' system python3, offline, so it stays at the oldest Python the
+# supported runners ship instead of the latest release; standard library only.
+requires-python = ">=3.10"
