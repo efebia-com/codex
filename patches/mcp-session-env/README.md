@@ -36,6 +36,7 @@ The server sees the ids of the thread whose MCP runtime starts it:
 
 - A new chat (`codex`, `codex exec`, `/new`, app-server `thread/start`): a new thread id, and a
   session id equal to it.
+- A fork (`/fork`, app-server `thread/fork`): a new chat, with new ids like a new chat.
 - A resumed chat (`codex resume`, `/resume`, `codex exec resume`, app-server `thread/resume`):
   the chat keeps its ids, and the servers it starts again see the same values as before.
 - A sub-agent that starts its own instance of the server: the root chat's session id and the
@@ -43,6 +44,10 @@ The server sees the ids of the thread whose MCP runtime starts it:
   when one of its tools is called.
 - A server started outside any thread, for example to list servers or their status: neither
   variable.
+
+One Codex process can run servers for several chats at once. For example, the TUI can keep the
+servers of a chat it left with `/resume` or `/fork` until it exits. Each server process keeps the
+ids it was started with.
 
 Codex can share one stdio server process between chats when it speaks MCP 2026-07-28 and allows
 it. A server that requests these variables is never shared between threads with different ids.
