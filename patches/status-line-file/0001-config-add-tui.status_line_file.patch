@@ -1,0 +1,124 @@
+From f03f3fe75d88627951f11699adbd56154f1a8638 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Mon, 16 Nov 2026 15:50:06 +0100
+Subject: [PATCH 1/2] config: add tui.status_line_file
+
+Path of a JSON file whose fields can be shown as status line items.
+Read only by the TUI; unset keeps the current behavior.
+---
+ codex-rs/config/src/types.rs               | 8 ++++++++
+ codex-rs/core/config.schema.json           | 9 +++++++++
+ codex-rs/core/src/config/config_tests.rs   | 2 ++
+ codex-rs/core/src/config/mod.rs            | 4 ++++
+ codex-rs/thread-manager-sample/src/main.rs | 1 +
+ codex-rs/tui/src/local_settings.rs         | 1 +
+ 6 files changed, 25 insertions(+)
+
+diff --git a/codex-rs/config/src/types.rs b/codex-rs/config/src/types.rs
+index 177faa086c..c798ea5910 100644
+--- a/codex-rs/config/src/types.rs
++++ b/codex-rs/config/src/types.rs
+@@ -992,6 +992,14 @@ pub struct Tui {
+     #[serde(default = "default_true")]
+     pub status_line_use_colors: bool,
+ 
++    /// JSON file whose fields can be shown in the status line as `file:<key>` items.
++    ///
++    /// The file is written by an external program as `{"fields": {"<key>": "<text>"}}`
++    /// and re-read when it changes. `{session_id}` in the path expands to the current
++    /// session id. The `CODEX_STATUS_LINE_FILE` environment variable takes precedence.
++    #[serde(default)]
++    pub status_line_file: Option<AbsolutePathBuf>,
++
+     /// Ordered list of terminal title item identifiers.
+     ///
+     /// When set, the TUI renders the selected items into the terminal window/tab title.
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index 5f72e108ec..0138e23d30 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -5654,6 +5654,15 @@
+           },
+           "type": "array"
+         },
++        "status_line_file": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/AbsolutePathBuf"
++            }
++          ],
++          "default": null,
++          "description": "JSON file whose fields can be shown in the status line as `file:<key>` items.\n\nThe file is written by an external program as `{\"fields\": {\"<key>\": \"<text>\"}}` and re-read when it changes. `{session_id}` in the path expands to the current session id. The `CODEX_STATUS_LINE_FILE` environment variable takes precedence."
++        },
+         "status_line_use_colors": {
+           "default": true,
+           "description": "Color status line items with colors derived from the active syntax theme. Defaults to `true`.",
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index 1be838e1dd..034a15eb44 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -1413,6 +1413,7 @@ fn config_toml_deserializes_model_availability_nux() {
+             alternate_screen: AltScreenMode::default(),
+             status_line: None,
+             status_line_use_colors: true,
++            status_line_file: None,
+             terminal_title: None,
+             theme: None,
+             pet: None,
+@@ -4782,6 +4783,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
+             alternate_screen: AltScreenMode::Auto,
+             status_line: None,
+             status_line_use_colors: true,
++            status_line_file: None,
+             terminal_title: None,
+             theme: None,
+             pet: None,
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index baf6aa6647..90fff8ecd0 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -894,6 +894,9 @@ pub struct Config {
+     /// Whether to color status line items with colors from the active syntax theme.
+     pub tui_status_line_use_colors: bool,
+ 
++    /// JSON file providing externally written `file:<key>` status line items.
++    pub tui_status_line_file: Option<AbsolutePathBuf>,
++
+     /// Ordered list of terminal title item identifiers for the TUI.
+     ///
+     /// When unset, the TUI defaults to: `activity` and `project`.
+@@ -4855,6 +4858,7 @@ impl Config {
+                 .as_ref()
+                 .map(|t| t.status_line_use_colors)
+                 .unwrap_or(true),
++            tui_status_line_file: cfg.tui.as_ref().and_then(|t| t.status_line_file.clone()),
+             tui_terminal_title: cfg.tui.as_ref().and_then(|t| t.terminal_title.clone()),
+             tui_theme: cfg.tui.as_ref().and_then(|t| t.theme.clone()),
+             tui_pet: cfg.tui.as_ref().and_then(|t| t.pet.clone()),
+diff --git a/codex-rs/thread-manager-sample/src/main.rs b/codex-rs/thread-manager-sample/src/main.rs
+index 80bb021eae..795b515259 100644
+--- a/codex-rs/thread-manager-sample/src/main.rs
++++ b/codex-rs/thread-manager-sample/src/main.rs
+@@ -311,6 +311,7 @@ async fn new_config(
+         tui_alternate_screen: AltScreenMode::Auto,
+         tui_status_line: None,
+         tui_status_line_use_colors: true,
++        tui_status_line_file: None,
+         tui_terminal_title: None,
+         tui_theme: None,
+         tui_raw_output_mode: false,
+diff --git a/codex-rs/tui/src/local_settings.rs b/codex-rs/tui/src/local_settings.rs
+index 0d8477b271..04e1da6345 100644
+--- a/codex-rs/tui/src/local_settings.rs
++++ b/codex-rs/tui/src/local_settings.rs
+@@ -86,6 +86,7 @@ impl LocalSettings {
+                 alternate_screen: config.tui_alternate_screen,
+                 status_line: config.tui_status_line.clone(),
+                 status_line_use_colors: config.tui_status_line_use_colors,
++                status_line_file: config.tui_status_line_file.clone(),
+                 terminal_title: config.tui_terminal_title.clone(),
+                 theme: config.tui_theme.clone(),
+                 pet: config.tui_pet.clone(),
+-- 
+2.53.0
+

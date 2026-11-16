@@ -1,0 +1,1672 @@
+From 15b2b5139fdeeaea98d5230265b00ecb007bf0f4 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Mon, 16 Nov 2026 15:50:07 +0100
+Subject: [PATCH 2/2] tui: show status line items from an external JSON file
+
+When tui.status_line_file or CODEX_STATUS_LINE_FILE names a file, its
+fields can be placed in tui.status_line as file:<key> items, next to the
+built-in ones. Any program can write the file as
+{"fields": {"<key>": "<text>"}}.
+
+A background thread polls the file's metadata and re-reads it only when
+it changes, so rendering never touches the file system. Missing files,
+invalid JSON and unusable values hide the items without warnings; long
+values are truncated. {session_id} in the path expands to the session
+shown by the TUI, and values of the previous file are dropped when the
+session changes.
+
+The /statusline picker lists the configured file items and the fields
+present in the file, and saving keeps file: items instead of dropping
+them as unknown ids.
+---
+ codex-rs/tui/src/app.rs                       |   5 +
+ codex-rs/tui/src/app_event.rs                 |   4 +-
+ ...shot_includes_status_line_file_fields.snap |  16 +
+ .../tui/src/bottom_pane/status_line_setup.rs  | 118 ++++-
+ .../tui/src/bottom_pane/status_line_style.rs  |  27 +-
+ .../src/bottom_pane/status_surface_preview.rs |  22 +-
+ codex-rs/tui/src/chatwidget.rs                |   4 +
+ codex-rs/tui/src/chatwidget/constructor.rs    |   1 +
+ ...tests__status_line_file_fields_footer.snap |  10 +
+ .../tui/src/chatwidget/status_controls.rs     |   6 +-
+ .../tui/src/chatwidget/status_line_file.rs    |  29 ++
+ .../src/chatwidget/status_surface_commands.rs |   7 +-
+ .../tui/src/chatwidget/status_surfaces.rs     |  16 +-
+ codex-rs/tui/src/chatwidget/tests.rs          |   2 +
+ .../tests/status_line_file_tests.rs           | 148 ++++++
+ codex-rs/tui/src/lib.rs                       |   1 +
+ codex-rs/tui/src/status_line_file.rs          | 459 ++++++++++++++++++
+ codex-rs/tui/src/status_line_file_tests.rs    | 354 ++++++++++++++
+ 18 files changed, 1197 insertions(+), 32 deletions(-)
+ create mode 100644 codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__status_line_setup__tests__setup_view_snapshot_includes_status_line_file_fields.snap
+ create mode 100644 codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_file_fields_footer.snap
+ create mode 100644 codex-rs/tui/src/chatwidget/status_line_file.rs
+ create mode 100644 codex-rs/tui/src/chatwidget/tests/status_line_file_tests.rs
+ create mode 100644 codex-rs/tui/src/status_line_file.rs
+ create mode 100644 codex-rs/tui/src/status_line_file_tests.rs
+
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index ddddc61d49..4a11d5b430 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -1312,6 +1312,11 @@ impl App {
+                     if let Some(owner) = self.background_voice.as_mut() {
+                         owner.refresh_realtime_microphone_level();
+                     }
++                    crate::status_line_file::sync(
++                        self.local_settings.tui.status_line_file.as_ref(),
++                        self.primary_thread_id,
++                        &tui.frame_requester(),
++                    );
+                     self.chat_widget.pre_draw_tick();
+                     self.refresh_agents_overview_usage(app_server, tui.frame_requester());
+                     let rendered_area = self.render_chat_widget_frame(tui, screen_size)?;
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index c858e8196f..9c09abdfbf 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -52,7 +52,6 @@ use uuid::Uuid;
+ use crate::app_command::AppCommand;
+ use crate::app_server_session::AppServerStartedThread;
+ use crate::bottom_pane::ApprovalRequest;
+-use crate::bottom_pane::StatusLineItem;
+ use crate::bottom_pane::TerminalTitleItem;
+ use crate::chatwidget::AstraModelPickerAction;
+ use crate::chatwidget::ConfiguredPetLoadGeneration;
+@@ -61,6 +60,7 @@ use crate::chatwidget::ThreadUsageOutcome;
+ use crate::chatwidget::UserMessage;
+ use crate::experimental_features::FeatureWriteResult;
+ use crate::goal_files::GoalDraft;
++use crate::status_line_file::StatusLineEntry;
+ use codex_app_server_protocol::AskForApproval;
+ use codex_config::types::ApprovalsReviewer;
+ use codex_features::Feature;
+@@ -1830,7 +1830,7 @@ pub(crate) enum AppEvent {
+     },
+     /// Apply a user-confirmed status-line item ordering/selection.
+     StatusLineSetup {
+-        items: Vec<StatusLineItem>,
++        items: Vec<StatusLineEntry>,
+         use_theme_colors: bool,
+     },
+     /// Dismiss the status-line setup UI without changing config.
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__status_line_setup__tests__setup_view_snapshot_includes_status_line_file_fields.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__status_line_setup__tests__setup_view_snapshot_includes_status_line_file_fields.snap
+new file mode 100644
+index 0000000000..504a8f0af7
+--- /dev/null
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__status_line_setup__tests__setup_view_snapshot_includes_status_line_file_fields.snap
+@@ -0,0 +1,16 @@
++---
++source: tui/src/bottom_pane/status_line_setup.rs
++expression: "render_lines(&view,\n100).lines().map(str::trim_end).collect::<Vec<_>>().join(\"\\n\")"
++---
++
++  Configure Status Line
++  Select which items to display in the status line.
++
++  file:
++
++› [x] file:build  Field "build" of the status line file (omitted when unavailable)
++  [x] file:gone   Field "gone" of the status line file (omitted when unavailable)
++  [ ] file:queue  Field "queue" of the status line file (omitted when unavailable)
++
++  gpt-5-codex · build ok · gone
++  space toggle · ←/→ reorder · enter save · esc cancel
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+index 0d7985f6ea..319028703c 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -20,6 +20,7 @@
+ //! - Usage limits (primary, secondary)
+ //! - Session info (thread title, thread ID, tokens used)
+ //! - Application version
++//! - Fields of the status line file (`file:<key>`), when one is configured
+ 
+ use ratatui::buffer::Buffer;
+ use ratatui::layout::Rect;
+@@ -39,6 +40,7 @@ use crate::bottom_pane::status_surface_preview::StatusSurfacePreviewData;
+ use crate::bottom_pane::status_surface_preview::StatusSurfacePreviewItem;
+ use crate::keymap::ListKeymap;
+ use crate::render::renderable::Renderable;
++use crate::status_line_file::StatusLineEntry;
+ 
+ const STATUS_LINE_USE_THEME_COLORS_ITEM_ID: &str = "status-line-use-theme-colors";
+ 
+@@ -317,18 +319,21 @@ impl StatusLineSetupView {
+ 
+         if let Some(selected_items) = status_line_items.as_ref() {
+             for id in *selected_items {
+-                let Ok(item) = id.parse::<StatusLineItem>() else {
++                let Ok(entry) = id.parse::<StatusLineEntry>() else {
+                     continue;
+                 };
+-                let item_id = item.to_string();
++                let item_id = entry.to_string();
+                 if !used_ids.insert(item_id.clone()) {
+                     continue;
+                 }
+-                items.push(Self::status_line_select_item(
+-                    item,
+-                    /*enabled*/ true,
+-                    &preview_data,
+-                ));
++                items.push(match entry {
++                    StatusLineEntry::Builtin(item) => {
++                        Self::status_line_select_item(item, /*enabled*/ true, &preview_data)
++                    }
++                    StatusLineEntry::File(key) => {
++                        Self::status_line_file_select_item(&key, /*enabled*/ true)
++                    }
++                });
+             }
+         }
+ 
+@@ -344,6 +349,14 @@ impl StatusLineSetupView {
+             ));
+         }
+ 
++        for key in preview_data.status_line_file.keys() {
++            if used_ids.insert(StatusLineEntry::File(key.to_string()).to_string()) {
++                items.push(Self::status_line_file_select_item(
++                    key, /*enabled*/ false,
++                ));
++            }
++        }
++
+         Self {
+             picker: MultiSelectPicker::builder(
+                 "Configure Status Line".to_string(),
+@@ -361,7 +374,7 @@ impl StatusLineSetupView {
+                     items
+                         .iter()
+                         .filter(|item| item.enabled)
+-                        .filter_map(|item| item.id.parse::<StatusLineItem>().ok()),
++                        .filter_map(|item| item.id.parse::<StatusLineEntry>().ok()),
+                     use_theme_colors,
+                 )
+             })
+@@ -371,7 +384,7 @@ impl StatusLineSetupView {
+                     .any(|id| id == STATUS_LINE_USE_THEME_COLORS_ITEM_ID);
+                 let items = ids
+                     .iter()
+-                    .filter_map(|id| id.parse::<StatusLineItem>().ok())
++                    .filter_map(|id| id.parse::<StatusLineEntry>().ok())
+                     .collect::<Vec<_>>();
+                 app_event.send(AppEvent::StatusLineSetup {
+                     items,
+@@ -410,6 +423,21 @@ impl StatusLineSetupView {
+             section_break_after: false,
+         }
+     }
++
++    /// Converts a status line file field into a [`MultiSelectItem`] for the picker.
++    fn status_line_file_select_item(key: &str, enabled: bool) -> MultiSelectItem {
++        let id = StatusLineEntry::File(key.to_string()).to_string();
++        MultiSelectItem {
++            id: id.clone(),
++            name: id,
++            description: Some(format!(
++                "Field \"{key}\" of the status line file (omitted when unavailable)"
++            )),
++            enabled,
++            orderable: true,
++            section_break_after: false,
++        }
++    }
+ }
+ 
+ impl BottomPaneView for StatusLineSetupView {
+@@ -817,6 +845,78 @@ mod tests {
+         );
+     }
+ 
++    fn file_fields_preview() -> StatusSurfacePreviewData {
++        let mut preview = StatusSurfacePreviewData::from_iter([(
++            StatusLineItem::ModelName.preview_item(),
++            "gpt-5-codex".to_string(),
++        )]);
++        preview.status_line_file =
++            std::sync::Arc::new(crate::status_line_file::StatusLineFileFields::from_pairs([
++                ("build", "build ok"),
++                ("queue", "3 queued"),
++            ]));
++        preview
++    }
++
++    #[test]
++    fn picker_preserves_configured_file_items_on_confirm() {
++        let (tx, mut rx) = unbounded_channel();
++        let mut view = StatusLineSetupView::new(
++            Some(&[
++                "file:build".to_string(),
++                StatusLineItem::ModelName.to_string(),
++                "file:gone".to_string(),
++                "file:bad key".to_string(),
++                "file:build".to_string(),
++            ]),
++            /*use_theme_colors*/ false,
++            file_fields_preview(),
++            AppEventSender::new(tx),
++            crate::keymap::RuntimeKeymap::defaults().list,
++        );
++
++        view.handle_key_event(crossterm::event::KeyCode::Enter.into());
++
++        match rx.try_recv() {
++            Ok(AppEvent::StatusLineSetup { items, .. }) => assert_eq!(
++                items,
++                vec![
++                    StatusLineEntry::File("build".to_string()),
++                    StatusLineEntry::Builtin(StatusLineItem::ModelName),
++                    StatusLineEntry::File("gone".to_string()),
++                ]
++            ),
++            event => panic!("expected status line setup, got {event:?}"),
++        }
++    }
++
++    #[test]
++    fn setup_view_snapshot_includes_status_line_file_fields() {
++        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
++        let mut view = StatusLineSetupView::new(
++            Some(&[
++                StatusLineItem::ModelName.to_string(),
++                "file:build".to_string(),
++                "file:gone".to_string(),
++            ]),
++            /*use_theme_colors*/ true,
++            file_fields_preview(),
++            AppEventSender::new(tx_raw),
++            crate::keymap::RuntimeKeymap::defaults().list,
++        );
++        for ch in "file:".chars() {
++            view.handle_key_event(crossterm::event::KeyCode::Char(ch).into());
++        }
++
++        assert_snapshot!(
++            render_lines(&view, /*width*/ 100)
++                .lines()
++                .map(str::trim_end)
++                .collect::<Vec<_>>()
++                .join("\n")
++        );
++    }
++
+     fn render_lines(view: &StatusLineSetupView, width: u16) -> String {
+         let height = view.desired_height(width);
+         let area = Rect::new(0, 0, width, height);
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index 2efa1a07db..a153a9bb35 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -7,6 +7,7 @@ use ratatui::text::Span;
+ 
+ use super::status_line_setup::StatusLineItem;
+ use crate::render::highlight::foreground_style_for_scopes;
++use crate::status_line_file::StatusLineEntry;
+ use crate::style::readable_color_on;
+ use crate::style::secondary_text_style;
+ use crate::terminal_hyperlinks::HyperlinkLine;
+@@ -80,6 +81,13 @@ impl StatusLineAccent {
+         }
+     }
+ 
++    fn for_entry(entry: &StatusLineEntry) -> Self {
++        match entry {
++            StatusLineEntry::Builtin(item) => Self::for_item(*item),
++            StatusLineEntry::File(_) => Self::Metadata,
++        }
++    }
++
+     pub(crate) fn scopes(self) -> &'static [&'static str] {
+         match self {
+             Self::Model => &["entity.name.type", "support.type", "variable"],
+@@ -104,14 +112,15 @@ impl StatusLineAccent {
+     }
+ }
+ 
+-pub(crate) fn status_line_from_segments<I>(
++pub(crate) fn status_line_from_segments<I, S>(
+     segments: I,
+     use_theme_colors: bool,
+     thread_id: Option<ThreadId>,
+     pull_request_url: Option<&str>,
+ ) -> Option<HyperlinkLine>
+ where
+-    I: IntoIterator<Item = (StatusLineItem, String)>,
++    I: IntoIterator<Item = (S, String)>,
++    S: Into<StatusLineEntry>,
+ {
+     status_line_from_segments_with_resolver(
+         segments,
+@@ -122,7 +131,7 @@ where
+     )
+ }
+ 
+-fn status_line_from_segments_with_resolver<I, F>(
++fn status_line_from_segments_with_resolver<I, S, F>(
+     segments: I,
+     use_theme_colors: bool,
+     thread_id: Option<ThreadId>,
+@@ -130,11 +139,13 @@ fn status_line_from_segments_with_resolver<I, F>(
+     theme_style_for_accent: F,
+ ) -> Option<HyperlinkLine>
+ where
+-    I: IntoIterator<Item = (StatusLineItem, String)>,
++    I: IntoIterator<Item = (S, String)>,
++    S: Into<StatusLineEntry>,
+     F: Fn(StatusLineAccent) -> Option<Style>,
+ {
+     let mut line = HyperlinkLine::default();
+     for (item, mut text) in segments {
++        let item: StatusLineEntry = item.into();
+         // Paragraph skips control characters, so they must not enter this single row's link offsets.
+         text.retain(|ch| !ch.is_control());
+         if !line.line.spans.is_empty() {
+@@ -144,13 +155,13 @@ where
+         let style = if use_theme_colors
+             && matches!(
+                 item,
+-                StatusLineItem::ThreadName | StatusLineItem::ThreadTitle
++                StatusLineEntry::Builtin(StatusLineItem::ThreadName | StatusLineItem::ThreadTitle)
+             )
+             && let Some(thread_id) = thread_id
+         {
+             Style::default().fg(thread_color(thread_id))
+         } else if use_theme_colors {
+-            let accent = StatusLineAccent::for_item(item);
++            let accent = StatusLineAccent::for_entry(&item);
+             soften_status_line_style(
+                 theme_style_for_accent(accent)
+                     .unwrap_or_else(|| Style::default().fg(accent.fallback_color())),
+@@ -163,14 +174,14 @@ where
+             if effective_stdout_color_level() == StdoutColorLevel::Ansi16
+                 && matches!(foreground, Color::Rgb(..) | Color::Indexed(16..))
+             {
+-                style.fg(StatusLineAccent::for_item(item).fallback_color())
++                style.fg(StatusLineAccent::for_entry(&item).fallback_color())
+             } else {
+                 style.fg(readable_color_on(foreground, /*background*/ None))
+             }
+         } else {
+             style
+         };
+-        if item == StatusLineItem::PullRequestNumber {
++        if item == StatusLineEntry::Builtin(StatusLineItem::PullRequestNumber) {
+             line.push_span(Span::styled(text, style.underlined()), pull_request_url);
+         } else {
+             line.line.push_span(Span::styled(text, style));
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+index 3018d12749..e31e5279a6 100644
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -1,10 +1,12 @@
+ use std::collections::BTreeMap;
++use std::sync::Arc;
+ 
+ use super::footer_content::FooterContent;
+ use codex_protocol::ThreadId;
+ 
+ use super::status_line_from_segments;
+-use super::status_line_setup::StatusLineItem;
++use crate::status_line_file::StatusLineEntry;
++use crate::status_line_file::StatusLineFileFields;
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+ pub(crate) enum StatusSurfacePreviewItem {
+@@ -138,6 +140,8 @@ struct PreviewValue {
+ pub(crate) struct StatusSurfacePreviewData {
+     pub(crate) thread_id: Option<ThreadId>,
+     pub(crate) pull_request_url: Option<String>,
++    /// Current values of `file:<key>` items.
++    pub(crate) status_line_file: Arc<StatusLineFileFields>,
+     values: BTreeMap<StatusSurfacePreviewItem, PreviewValue>,
+ }
+ 
+@@ -146,6 +150,7 @@ impl Default for StatusSurfacePreviewData {
+         let mut data = Self {
+             thread_id: None,
+             pull_request_url: None,
++            status_line_file: crate::status_line_file::empty_fields(),
+             values: BTreeMap::new(),
+         };
+         for item in StatusSurfacePreviewItem::iter() {
+@@ -250,11 +255,20 @@ impl StatusSurfacePreviewData {
+         use_theme_colors: bool,
+     ) -> Option<FooterContent>
+     where
+-        I: IntoIterator<Item = StatusLineItem>,
++        I: IntoIterator,
++        I::Item: Into<StatusLineEntry>,
+     {
+         let segments = items.into_iter().filter_map(|item| {
+-            self.value_for(item.preview_item())
+-                .map(|value| (item, value.to_string()))
++            let item = item.into();
++            let value = match &item {
++                StatusLineEntry::Builtin(builtin) => self.value_for(builtin.preview_item()),
++                // Unavailable fields preview as their key so their position stays visible.
++                StatusLineEntry::File(key) => {
++                    Some(self.status_line_file.get(key).unwrap_or(key.as_str()))
++                }
++            }
++            .map(str::to_string);
++            value.map(|value| (item, value))
+         });
+         status_line_from_segments(
+             segments,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index e748352efd..fd0e689350 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -396,6 +396,7 @@ use self::status_state::StatusIndicatorState;
+ use self::status_state::StatusState;
+ use self::status_state::TerminalTitleStatusKind;
+ mod status_controls;
++mod status_line_file;
+ mod status_surface_commands;
+ mod status_surfaces;
+ use self::status_surface_commands::StatusSurfaceOverrides;
+@@ -779,6 +780,8 @@ pub(crate) struct ChatWidget {
+     status_line_git_summary_pending: bool,
+     // True once we've attempted a Git summary lookup for the current CWD.
+     status_line_git_summary_lookup_complete: bool,
++    // Last fields read from the status line file, for `file:<key>` items.
++    status_line_file_fields: Arc<crate::status_line_file::StatusLineFileFields>,
+     // Cached workspace notification headline for the status line.
+     status_line_workspace_headline: Option<String>,
+     // Request ID for the async workspace headline fetch currently in flight.
+@@ -1230,6 +1233,7 @@ impl ChatWidget {
+             self.refresh_terminal_title();
+         }
+         self.refresh_status_line_if_workspace_headline_due();
++        self.refresh_status_line_if_file_changed();
+         self.refresh_thread_usage_if_settlement_due();
+         self.refresh_terminal_program_status();
+     }
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 1ae43235f0..92ea7d73d4 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -291,6 +291,7 @@ impl ChatWidget {
+             status_line_git_summary_cwd: None,
+             status_line_git_summary_pending: false,
+             status_line_git_summary_lookup_complete: false,
++            status_line_file_fields: crate::status_line_file::current_fields(),
+             status_line_workspace_headline: None,
+             status_line_workspace_headline_pending_request_id: None,
+             next_status_line_workspace_headline_request_id: 0,
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_file_fields_footer.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_file_fields_footer.snap
+new file mode 100644
+index 0000000000..1e9e55749f
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_file_fields_footer.snap
+@@ -0,0 +1,10 @@
++---
++source: tui/src/chatwidget/tests/status_line_file_tests.rs
++expression: normalized_backend_snapshot(terminal.backend())
++---
++"                                                                                "
++"                                                                                "
++"› Ask Codex to do anything                                                      "
++"                                                                                "
++"  Ready · build ok · staging deploy waiting for approval from the re…           "
++"  ? for shortcuts                                                               "
+diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
+index 4d947a952b..e43f0df87f 100644
+--- a/codex-rs/tui/src/chatwidget/status_controls.rs
++++ b/codex-rs/tui/src/chatwidget/status_controls.rs
+@@ -121,7 +121,10 @@ impl ChatWidget {
+     /// Applies status-line item selection from the setup view to in-memory config.
+     ///
+     /// An empty selection persists as an explicit empty list.
+-    pub(crate) fn setup_status_line(&mut self, items: Vec<StatusLineItem>, use_theme_colors: bool) {
++    pub(crate) fn setup_status_line<S>(&mut self, items: Vec<S>, use_theme_colors: bool)
++    where
++        S: Into<crate::status_line_file::StatusLineEntry> + std::fmt::Debug + std::fmt::Display,
++    {
+         tracing::info!(
+             "status line setup confirmed with items: {items:#?}, use_theme_colors: {use_theme_colors}"
+         );
+@@ -368,6 +371,7 @@ impl ChatWidget {
+             }),
+         );
+         preview_data.thread_id = self.thread_id;
++        preview_data.status_line_file = Arc::clone(&self.status_line_file_fields);
+         preview_data.pull_request_url = self.status_line_pull_request_url().map(str::to_owned);
+ 
+         if self.rate_limit_snapshots_by_limit_id.contains_key("codex") {
+diff --git a/codex-rs/tui/src/chatwidget/status_line_file.rs b/codex-rs/tui/src/chatwidget/status_line_file.rs
+new file mode 100644
+index 0000000000..758a8797d4
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/status_line_file.rs
+@@ -0,0 +1,29 @@
++//! `file:<key>` status-line items backed by the status line file.
++//!
++//! The file itself is watched off the render path by [`crate::status_line_file`]; this module
++//! only swaps in the latest parsed snapshot and resolves item values from it.
++
++use super::*;
++use crate::status_line_file::StatusLineEntry;
++
++impl ChatWidget {
++    /// Refreshes the status line when the watcher has published new file fields.
++    pub(super) fn refresh_status_line_if_file_changed(&mut self) {
++        let latest = crate::status_line_file::current_fields();
++        if !Arc::ptr_eq(&latest, &self.status_line_file_fields) {
++            self.status_line_file_fields = latest;
++            self.refresh_status_line();
++        }
++    }
++
++    /// Resolves one configured status-line entry; `None` omits it, as for built-in items.
++    pub(super) fn status_line_entry_value(&mut self, entry: &StatusLineEntry) -> Option<String> {
++        match entry {
++            StatusLineEntry::Builtin(item) => self.status_line_value_for_item(*item),
++            StatusLineEntry::File(key) => self
++                .status_line_file_fields
++                .get(key)
++                .map(ToString::to_string),
++        }
++    }
++}
+diff --git a/codex-rs/tui/src/chatwidget/status_surface_commands.rs b/codex-rs/tui/src/chatwidget/status_surface_commands.rs
+index caf0ab1cb2..b493670b1d 100644
+--- a/codex-rs/tui/src/chatwidget/status_surface_commands.rs
++++ b/codex-rs/tui/src/chatwidget/status_surface_commands.rs
+@@ -6,6 +6,7 @@
+ 
+ use super::slash_command_args;
+ use super::*;
++use crate::status_line_file::StatusLineEntry;
+ 
+ #[derive(Clone, Debug, Default, PartialEq, Eq)]
+ pub(super) struct StatusSurfaceOverrides {
+@@ -16,7 +17,7 @@ pub(super) struct StatusSurfaceOverrides {
+ 
+ #[derive(Debug, PartialEq, Eq)]
+ struct StatusLineCommand {
+-    items: Option<Vec<StatusLineItem>>,
++    items: Option<Vec<StatusLineEntry>>,
+     use_theme_colors: Option<bool>,
+ }
+ 
+@@ -104,9 +105,9 @@ fn parse_status_line_command(
+ }
+ 
+ fn status_line_items(
+-    items: Vec<StatusLineItem>,
++    items: Vec<StatusLineEntry>,
+     clear: bool,
+-) -> Result<Option<Vec<StatusLineItem>>, String> {
++) -> Result<Option<Vec<StatusLineEntry>>, String> {
+     if clear && !items.is_empty() {
+         return Err("Cannot combine --clear with status-line items.".into());
+     }
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index c7109c6e3d..6bb04b20ea 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -14,6 +14,7 @@ use crate::status::format_credit_micros;
+ use crate::status::format_estimated_usd_micros;
+ use crate::status::format_tokens_compact;
+ use crate::status::thread_cost_micros;
++use crate::status_line_file::StatusLineEntry;
+ use crate::terminal_program_status::ProgramStatus;
+ use codex_app_server_protocol::AskForApproval;
+ use codex_config::ConfigLayerSource;
+@@ -53,6 +54,8 @@ const TERMINAL_TITLE_ACTION_REQUIRED_PREFIX_HIDDEN: &str = "[ . ] Action Require
+ /// from the same selection set.
+ struct StatusSurfaceSelections {
+     status_line_items: Vec<StatusLineItem>,
++    /// Configured order of built-in and `file:<key>` status-line items.
++    status_line_entries: Vec<StatusLineEntry>,
+     invalid_status_line_items: Vec<String>,
+     terminal_title_items: Vec<TerminalTitleItem>,
+     invalid_terminal_title_items: Vec<String>,
+@@ -107,11 +110,14 @@ pub(super) struct CachedProjectRootName {
+ 
+ impl ChatWidget {
+     fn status_surface_selections(&self) -> StatusSurfaceSelections {
+-        let (status_line_items, invalid_status_line_items) = self.status_line_items_with_invalids();
++        let (status_line_entries, invalid_status_line_items) =
++            parse_items_with_invalids::<StatusLineEntry>(self.configured_status_line_items());
++        let status_line_items = StatusLineEntry::builtin_items(&status_line_entries);
+         let (terminal_title_items, invalid_terminal_title_items) =
+             self.terminal_title_items_with_invalids();
+         StatusSurfaceSelections {
+             status_line_items,
++            status_line_entries,
+             invalid_status_line_items,
+             terminal_title_items,
+             invalid_terminal_title_items,
+@@ -202,7 +208,7 @@ impl ChatWidget {
+     }
+ 
+     fn refresh_status_line_from_selections(&mut self, selections: &StatusSurfaceSelections) {
+-        let enabled = !selections.status_line_items.is_empty();
++        let enabled = !selections.status_line_entries.is_empty();
+         self.bottom_pane.set_status_line_enabled(enabled);
+         if !enabled {
+             self.set_status_line(/*status_line*/ None);
+@@ -210,9 +216,9 @@ impl ChatWidget {
+         }
+ 
+         let mut segments = Vec::new();
+-        for item in &selections.status_line_items {
+-            if let Some(value) = self.status_line_value_for_item(*item) {
+-                segments.push((*item, value));
++        for entry in &selections.status_line_entries {
++            if let Some(value) = self.status_line_entry_value(entry) {
++                segments.push((entry.clone(), value));
+             }
+         }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/tests.rs b/codex-rs/tui/src/chatwidget/tests.rs
+index 42f292b52b..c7542d42f6 100644
+--- a/codex-rs/tui/src/chatwidget/tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests.rs
+@@ -298,6 +298,8 @@ mod sparkle_submission_tests;
+ mod startup_submission_tests;
+ mod status_and_layout;
+ mod status_command_tests;
++#[path = "tests/status_line_file_tests.rs"]
++mod status_line_file_tests;
+ #[path = "tests/status_surface_command_tests.rs"]
+ mod status_surface_command_tests;
+ mod status_surface_previews;
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_line_file_tests.rs b/codex-rs/tui/src/chatwidget/tests/status_line_file_tests.rs
+new file mode 100644
+index 0000000000..605be1d3ed
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/tests/status_line_file_tests.rs
+@@ -0,0 +1,148 @@
++//! `file:<key>` status-line items backed by an externally written JSON file.
++
++use super::*;
++use crate::status_line_file::StatusLineFileFields;
++use pretty_assertions::assert_eq;
++
++fn set_file_fields(chat: &mut ChatWidget, pairs: &[(&str, &str)]) {
++    chat.status_line_file_fields =
++        Arc::new(StatusLineFileFields::from_pairs(pairs.iter().copied()));
++}
++
++#[tokio::test]
++async fn status_line_renders_file_fields_in_configured_order() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let thread_id = ThreadId::from_u128(/*value*/ 42);
++    chat.thread_id = Some(thread_id);
++    set_file_fields(&mut chat, &[("build", "build ok"), ("queue", "3 queued")]);
++    chat.local_settings.tui.status_line = Some(vec![
++        "file:queue".to_string(),
++        "thread-id".to_string(),
++        "file:missing".to_string(),
++        "file:build".to_string(),
++    ]);
++
++    chat.refresh_status_line();
++
++    assert_eq!(
++        status_line_text(&chat),
++        Some(format!("3 queued · {thread_id} · build ok"))
++    );
++    assert!(
++        drain_insert_history(&mut rx).is_empty(),
++        "file items must not be reported as invalid"
++    );
++}
++
++#[tokio::test]
++async fn status_line_with_only_unavailable_file_fields_stays_quiet() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.local_settings.tui.status_line = Some(vec!["file:build".to_string()]);
++
++    chat.refresh_status_line();
++
++    assert_eq!(status_line_text(&chat).unwrap_or_default(), "");
++    assert!(drain_insert_history(&mut rx).is_empty());
++}
++
++#[tokio::test]
++async fn malformed_file_item_ids_warn_like_other_invalid_items() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.local_settings.tui.status_line =
++        Some(vec!["file:build".to_string(), "file:bad key".to_string()]);
++
++    chat.refresh_status_line();
++
++    let cells = drain_insert_history_transcript(&mut rx);
++    assert_eq!(cells.len(), 1, "expected one warning history cell");
++    let rendered = lines_to_single_string(&cells[0]);
++    assert!(
++        rendered.contains("file:bad key") && !rendered.contains("\"file:build\""),
++        "unexpected warning: {rendered}"
++    );
++}
++
++#[tokio::test]
++async fn status_line_drops_file_fields_when_the_watcher_publishes_new_ones() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.local_settings.tui.status_line =
++        Some(vec!["file:build".to_string(), "run-state".to_string()]);
++    set_file_fields(&mut chat, &[("build", "build ok")]);
++    chat.refresh_status_line();
++    assert_eq!(
++        status_line_text(&chat),
++        Some("build ok · Ready".to_string())
++    );
++
++    // No file is watched in tests, so the process-wide snapshot is empty.
++    chat.refresh_status_line_if_file_changed();
++
++    assert_eq!(status_line_text(&chat), Some("Ready".to_string()));
++    let unchanged = Arc::clone(&chat.status_line_file_fields);
++    chat.refresh_status_line_if_file_changed();
++    assert!(Arc::ptr_eq(&unchanged, &chat.status_line_file_fields));
++}
++
++#[tokio::test]
++async fn statusline_command_accepts_file_items() {
++    let (mut chat, mut events, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    set_file_fields(&mut chat, &[("build", "build ok")]);
++
++    chat.dispatch_command_with_args(
++        SlashCommand::Statusline,
++        "file:build run-state file:later".to_string(),
++        Vec::new(),
++    );
++
++    assert_eq!(
++        chat.local_settings.tui.status_line,
++        Some(vec![
++            "file:build".to_string(),
++            "run-state".to_string(),
++            "file:later".to_string(),
++        ])
++    );
++    assert_eq!(
++        status_line_text(&chat),
++        Some("build ok · Ready".to_string())
++    );
++    let errors = std::iter::from_fn(|| events.try_recv().ok())
++        .filter(|event| matches!(event, AppEvent::InsertHistoryCell(_)))
++        .count();
++    assert_eq!(errors, 0);
++}
++
++#[tokio::test]
++async fn status_line_file_fields_footer_snapshot() {
++    use ratatui::Terminal;
++    use ratatui::backend::TestBackend;
++
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.show_welcome_banner = false;
++    chat.local_settings.tui.status_line_use_colors = false;
++    chat.status_line_file_fields = Arc::new(StatusLineFileFields::parse(
++        br#"{"fields": {
++            "build": "build ok",
++            "deploy": "staging deploy\nwaiting for approval from the release team"
++        }}"#,
++    ));
++    chat.local_settings.tui.status_line = Some(vec![
++        "run-state".to_string(),
++        "file:build".to_string(),
++        "file:deploy".to_string(),
++    ]);
++    chat.refresh_status_line();
++
++    let width = 80;
++    let height = chat.desired_height(width);
++    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("create terminal");
++    terminal
++        .draw(|frame| chat.render(frame.area(), frame.buffer_mut()))
++        .expect("draw status line file footer");
++    assert_chatwidget_snapshot!(
++        "status_line_file_fields_footer",
++        normalized_backend_snapshot(terminal.backend())
++    );
++}
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 8b3608cf9c..7a4528a4f8 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -228,6 +228,7 @@ mod startup_presentation;
+ mod startup_recovery;
+ mod status;
+ mod status_indicator_widget;
++mod status_line_file;
+ mod streaming;
+ mod style;
+ mod subscription;
+diff --git a/codex-rs/tui/src/status_line_file.rs b/codex-rs/tui/src/status_line_file.rs
+new file mode 100644
+index 0000000000..280851ab75
+--- /dev/null
++++ b/codex-rs/tui/src/status_line_file.rs
+@@ -0,0 +1,459 @@
++//! Status line items provided by an external program through a JSON file.
++//!
++//! When `tui.status_line_file`, or the `CODEX_STATUS_LINE_FILE` environment variable, names a
++//! file, its fields can be referenced from `tui.status_line` as `file:<key>` items next to the
++//! built-in items. Any program may write the file:
++//!
++//! ```json
++//! {"fields": {"build": "build ok", "queue": 3}}
++//! ```
++//!
++//! Values are strings or numbers. Missing files, invalid JSON, unknown keys and other value types
++//! hide the corresponding items without warnings; control characters are replaced with spaces and
++//! long values are truncated with an ellipsis. Writers should replace the file atomically (write a
++//! temporary file, then rename it) so a half-written file is never read.
++//!
++//! `{session_id}` in the path expands to the id of the session shown by the TUI, the value shell
++//! commands receive as `CODEX_SESSION_ID`, so each instance and session can use its own file.
++//! When the session changes, values read from the previous file are discarded immediately.
++//!
++//! A background thread polls the file's metadata and re-reads it only when it changes. Rendering
++//! never touches the file system: it only clones an `Arc` of the last parsed values, and the
++//! watcher schedules a frame whenever those values change.
++
++use std::collections::BTreeMap;
++use std::fmt;
++use std::fs::File;
++use std::io::Read;
++use std::path::Path;
++use std::path::PathBuf;
++use std::str::FromStr;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::sync::MutexGuard;
++use std::sync::OnceLock;
++use std::sync::PoisonError;
++use std::sync::atomic::AtomicBool;
++use std::sync::atomic::Ordering;
++use std::sync::mpsc;
++use std::sync::mpsc::RecvTimeoutError;
++use std::time::Duration;
++use std::time::SystemTime;
++
++use codex_protocol::ThreadId;
++use codex_utils_absolute_path::AbsolutePathBuf;
++use unicode_segmentation::UnicodeSegmentation;
++use unicode_width::UnicodeWidthStr;
++
++use crate::bottom_pane::StatusLineItem;
++use crate::tui::FrameRequester;
++
++/// Environment variable naming the status line file; it takes precedence over the config.
++pub(crate) const STATUS_LINE_FILE_ENV_VAR: &str = "CODEX_STATUS_LINE_FILE";
++
++/// Prefix of status line item ids that refer to fields of the status line file.
++///
++/// Built-in ids are kebab-case, so a colon can never collide with them.
++pub(crate) const STATUS_LINE_FILE_ITEM_PREFIX: &str = "file:";
++
++/// Path placeholder replaced with the current session id.
++pub(crate) const SESSION_ID_PLACEHOLDER: &str = "{session_id}";
++
++/// Maximum display width of one field value, ellipsis included.
++pub(crate) const MAX_FIELD_WIDTH: usize = 48;
++
++/// Maximum length of a field key, in bytes.
++const MAX_KEY_LEN: usize = 64;
++
++/// Files larger than this are ignored.
++const MAX_FILE_BYTES: u64 = 64 * 1024;
++
++/// How often the watcher checks the file's metadata.
++const POLL_INTERVAL: Duration = Duration::from_millis(500);
++
++/// One configured status line item: a built-in item or a field of the status line file.
++#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
++pub(crate) enum StatusLineEntry {
++    Builtin(StatusLineItem),
++    File(String),
++}
++
++impl StatusLineEntry {
++    /// Built-in items in configured order, without file fields.
++    pub(crate) fn builtin_items(entries: &[Self]) -> Vec<StatusLineItem> {
++        entries
++            .iter()
++            .filter_map(|entry| match entry {
++                Self::Builtin(item) => Some(*item),
++                Self::File(_) => None,
++            })
++            .collect()
++    }
++}
++
++impl From<StatusLineItem> for StatusLineEntry {
++    fn from(item: StatusLineItem) -> Self {
++        Self::Builtin(item)
++    }
++}
++
++impl FromStr for StatusLineEntry {
++    type Err = strum::ParseError;
++
++    fn from_str(id: &str) -> Result<Self, Self::Err> {
++        match id.strip_prefix(STATUS_LINE_FILE_ITEM_PREFIX) {
++            Some(key) if is_valid_key(key) => Ok(Self::File(key.to_string())),
++            Some(_) => Err(strum::ParseError::VariantNotFound),
++            None => id.parse().map(Self::Builtin),
++        }
++    }
++}
++
++impl fmt::Display for StatusLineEntry {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Builtin(item) => item.fmt(f),
++            Self::File(key) => write!(f, "{STATUS_LINE_FILE_ITEM_PREFIX}{key}"),
++        }
++    }
++}
++
++/// Displayable field values parsed from the status line file.
++#[derive(Clone, Debug, Default, Eq, PartialEq)]
++pub(crate) struct StatusLineFileFields {
++    values: BTreeMap<String, String>,
++}
++
++impl StatusLineFileFields {
++    /// Parses the file contents. Anything unusable yields no fields rather than an error.
++    pub(crate) fn parse(contents: &[u8]) -> Self {
++        let Ok(serde_json::Value::Object(root)) = serde_json::from_slice(contents) else {
++            return Self::default();
++        };
++        let Some(serde_json::Value::Object(fields)) = root.get("fields") else {
++            return Self::default();
++        };
++        let values = fields
++            .iter()
++            .filter(|(key, _)| is_valid_key(key))
++            .filter_map(|(key, value)| {
++                let text = match value {
++                    serde_json::Value::String(text) => normalize_value(text),
++                    serde_json::Value::Number(number) => normalize_value(&number.to_string()),
++                    _ => None,
++                }?;
++                Some((key.clone(), text))
++            })
++            .collect();
++        Self { values }
++    }
++
++    pub(crate) fn get(&self, key: &str) -> Option<&str> {
++        self.values.get(key).map(String::as_str)
++    }
++
++    /// Field keys in sorted order.
++    pub(crate) fn keys(&self) -> impl Iterator<Item = &str> {
++        self.values.keys().map(String::as_str)
++    }
++
++    pub(crate) fn is_empty(&self) -> bool {
++        self.values.is_empty()
++    }
++
++    #[cfg(test)]
++    pub(crate) fn from_pairs<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
++        Self {
++            values: pairs
++                .into_iter()
++                .map(|(key, value)| (key.to_string(), value.to_string()))
++                .collect(),
++        }
++    }
++}
++
++/// The shared empty value, so unchanged empty snapshots compare equal with [`Arc::ptr_eq`].
++pub(crate) fn empty_fields() -> Arc<StatusLineFileFields> {
++    static EMPTY: OnceLock<Arc<StatusLineFileFields>> = OnceLock::new();
++    Arc::clone(EMPTY.get_or_init(Default::default))
++}
++
++fn is_valid_key(key: &str) -> bool {
++    !key.is_empty()
++        && key.len() <= MAX_KEY_LEN
++        && key
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
++}
++
++/// Collapses whitespace and control characters into single spaces and limits the display width.
++fn normalize_value(raw: &str) -> Option<String> {
++    let text = raw
++        .split(|ch: char| ch.is_whitespace() || ch.is_control())
++        .filter(|part| !part.is_empty())
++        .collect::<Vec<_>>()
++        .join(" ");
++    (!text.is_empty()).then(|| truncate_to_width(text, MAX_FIELD_WIDTH))
++}
++
++fn truncate_to_width(text: String, max_width: usize) -> String {
++    if text.width() <= max_width {
++        return text;
++    }
++    let mut truncated = String::new();
++    let mut width = 0;
++    for grapheme in text.graphemes(/*is_extended*/ true) {
++        let grapheme_width = grapheme.width();
++        if width + grapheme_width >= max_width {
++            break;
++        }
++        truncated.push_str(grapheme);
++        width += grapheme_width;
++    }
++    let mut truncated = truncated.trim_end().to_string();
++    truncated.push('…');
++    truncated
++}
++
++/// Expands [`SESSION_ID_PLACEHOLDER`]; a path that needs a session id has none until one exists.
++pub(crate) fn resolve_path(template: &Path, session_id: Option<ThreadId>) -> Option<PathBuf> {
++    match template.to_str() {
++        Some(text) if text.contains(SESSION_ID_PLACEHOLDER) => session_id
++            .map(|id| PathBuf::from(text.replace(SESSION_ID_PLACEHOLDER, &id.to_string()))),
++        _ => Some(template.to_path_buf()),
++    }
++}
++
++/// Path template from the environment, read once; relative paths use the startup directory.
++fn env_template() -> Option<&'static Path> {
++    static TEMPLATE: OnceLock<Option<PathBuf>> = OnceLock::new();
++    TEMPLATE
++        .get_or_init(|| {
++            let value = std::env::var_os(STATUS_LINE_FILE_ENV_VAR)?;
++            if value.is_empty() {
++                return None;
++            }
++            std::path::absolute(PathBuf::from(value)).ok()
++        })
++        .as_deref()
++}
++
++/// Watches one file at a time from a background thread.
++pub(crate) struct StatusLineFileWatcher {
++    path: Option<PathBuf>,
++    epoch: u64,
++    published: Arc<Mutex<Published>>,
++    targets: mpsc::Sender<WatchTarget>,
++}
++
++struct Published {
++    epoch: u64,
++    fields: Arc<StatusLineFileFields>,
++}
++
++struct WatchTarget {
++    epoch: u64,
++    path: Option<PathBuf>,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++struct FileSignature {
++    modified: Option<SystemTime>,
++    len: u64,
++    #[cfg(unix)]
++    inode: u64,
++}
++
++impl StatusLineFileWatcher {
++    /// Starts the watcher thread; `on_change` runs on it whenever the published fields change.
++    pub(crate) fn spawn(
++        poll_interval: Duration,
++        on_change: impl Fn() + Send + 'static,
++    ) -> std::io::Result<Self> {
++        let published = Arc::new(Mutex::new(Published {
++            epoch: 0,
++            fields: empty_fields(),
++        }));
++        let (targets, receiver) = mpsc::channel();
++        let thread_published = Arc::clone(&published);
++        std::thread::Builder::new()
++            .name("status-line-file".to_string())
++            .spawn(move || watch_loop(&receiver, &thread_published, poll_interval, &on_change))?;
++        Ok(Self {
++            path: None,
++            epoch: 0,
++            published,
++            targets,
++        })
++    }
++
++    /// Watches `path` instead of the current file, discarding values read from the old one.
++    pub(crate) fn set_path(&mut self, path: Option<PathBuf>) {
++        if self.path == path {
++            return;
++        }
++        self.epoch += 1;
++        self.path.clone_from(&path);
++        {
++            let mut published = lock(&self.published);
++            published.epoch = self.epoch;
++            published.fields = empty_fields();
++        }
++        let _ = self.targets.send(WatchTarget {
++            epoch: self.epoch,
++            path,
++        });
++    }
++
++    pub(crate) fn fields(&self) -> Arc<StatusLineFileFields> {
++        Arc::clone(&lock(&self.published).fields)
++    }
++}
++
++fn watch_loop(
++    receiver: &mpsc::Receiver<WatchTarget>,
++    published: &Mutex<Published>,
++    poll_interval: Duration,
++    on_change: &dyn Fn(),
++) {
++    let mut target = WatchTarget {
++        epoch: 0,
++        path: None,
++    };
++    let mut last_signature = None;
++    loop {
++        match receiver.recv_timeout(poll_interval) {
++            Ok(next) => {
++                target = receiver.try_iter().last().unwrap_or(next);
++                last_signature = None;
++            }
++            Err(RecvTimeoutError::Timeout) => {}
++            Err(RecvTimeoutError::Disconnected) => return,
++        }
++        let Some(path) = target.path.as_deref() else {
++            continue;
++        };
++        let signature = file_signature(path);
++        if signature == last_signature {
++            continue;
++        }
++        last_signature = signature;
++        let fields = match signature {
++            Some(signature) if signature.len <= MAX_FILE_BYTES => read_fields(path),
++            _ => StatusLineFileFields::default(),
++        };
++        if publish(published, target.epoch, fields) {
++            on_change();
++        }
++    }
++}
++
++fn file_signature(path: &Path) -> Option<FileSignature> {
++    let metadata = std::fs::metadata(path).ok()?;
++    Some(FileSignature {
++        modified: metadata.modified().ok(),
++        len: metadata.len(),
++        #[cfg(unix)]
++        inode: std::os::unix::fs::MetadataExt::ino(&metadata),
++    })
++}
++
++fn read_fields(path: &Path) -> StatusLineFileFields {
++    let mut contents = Vec::new();
++    let read =
++        File::open(path).and_then(|file| file.take(MAX_FILE_BYTES + 1).read_to_end(&mut contents));
++    match read {
++        Ok(len) if len as u64 <= MAX_FILE_BYTES => StatusLineFileFields::parse(&contents),
++        Ok(_) => StatusLineFileFields::default(),
++        Err(err) => {
++            tracing::debug!(error = %err, path = %path.display(), "failed to read status line file");
++            StatusLineFileFields::default()
++        }
++    }
++}
++
++/// Publishes fields read for `epoch`; returns whether visible values changed.
++fn publish(published: &Mutex<Published>, epoch: u64, fields: StatusLineFileFields) -> bool {
++    let mut published = lock(published);
++    if published.epoch != epoch || *published.fields == fields {
++        return false;
++    }
++    published.fields = if fields.is_empty() {
++        empty_fields()
++    } else {
++        Arc::new(fields)
++    };
++    true
++}
++
++fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
++    mutex.lock().unwrap_or_else(PoisonError::into_inner)
++}
++
++/// The process-wide watcher: one status line file per running Codex instance.
++struct Instance {
++    watcher: StatusLineFileWatcher,
++    template: Option<PathBuf>,
++    session_id: Option<ThreadId>,
++}
++
++static INSTANCE: Mutex<Option<Instance>> = Mutex::new(None);
++static SPAWN_FAILED: AtomicBool = AtomicBool::new(false);
++
++/// Points the process-wide watcher at the configured file for `session_id`.
++///
++/// Cheap enough to call before every frame. Nothing is started until a path is configured.
++pub(crate) fn sync(
++    config_path: Option<&AbsolutePathBuf>,
++    session_id: Option<ThreadId>,
++    frame_requester: &FrameRequester,
++) {
++    let template = env_template().or(config_path.map(AbsolutePathBuf::as_path));
++    let mut instance = lock(&INSTANCE);
++    if let Some(instance) = instance.as_ref()
++        && instance.template.as_deref() == template
++        && instance.session_id == session_id
++    {
++        return;
++    }
++    if instance.is_none() {
++        if template.is_none() || SPAWN_FAILED.load(Ordering::Relaxed) {
++            return;
++        }
++        let frame_requester = frame_requester.clone();
++        match StatusLineFileWatcher::spawn(POLL_INTERVAL, move || {
++            frame_requester.schedule_frame();
++        }) {
++            Ok(watcher) => {
++                *instance = Some(Instance {
++                    watcher,
++                    template: None,
++                    session_id: None,
++                });
++            }
++            Err(err) => {
++                SPAWN_FAILED.store(true, Ordering::Relaxed);
++                tracing::warn!(error = %err, "failed to start the status line file watcher");
++                return;
++            }
++        }
++    }
++    if let Some(instance) = instance.as_mut() {
++        instance.template = template.map(Path::to_path_buf);
++        instance.session_id = session_id;
++        instance
++            .watcher
++            .set_path(template.and_then(|template| resolve_path(template, session_id)));
++    }
++}
++
++/// Latest fields of the process-wide status line file.
++pub(crate) fn current_fields() -> Arc<StatusLineFileFields> {
++    lock(&INSTANCE)
++        .as_ref()
++        .map_or_else(empty_fields, |instance| instance.watcher.fields())
++}
++
++#[cfg(test)]
++#[path = "status_line_file_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/status_line_file_tests.rs b/codex-rs/tui/src/status_line_file_tests.rs
+new file mode 100644
+index 0000000000..34795fe4a3
+--- /dev/null
++++ b/codex-rs/tui/src/status_line_file_tests.rs
+@@ -0,0 +1,354 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use std::time::Instant;
++use strum::IntoEnumIterator;
++use tempfile::TempDir;
++
++const TEST_POLL_INTERVAL: Duration = Duration::from_millis(10);
++const TEST_TIMEOUT: Duration = Duration::from_secs(10);
++
++fn fields(pairs: &[(&str, &str)]) -> StatusLineFileFields {
++    StatusLineFileFields::from_pairs(pairs.iter().copied())
++}
++
++#[test]
++fn entries_parse_file_prefix_and_builtin_ids() {
++    assert_eq!(
++        "file:build".parse::<StatusLineEntry>(),
++        Ok(StatusLineEntry::File("build".to_string()))
++    );
++    assert_eq!(
++        "file:ci_job-2.status".parse::<StatusLineEntry>(),
++        Ok(StatusLineEntry::File("ci_job-2.status".to_string()))
++    );
++    assert_eq!(
++        "model".parse::<StatusLineEntry>(),
++        Ok(StatusLineEntry::Builtin(StatusLineItem::ModelName))
++    );
++    assert_eq!(
++        "context-usage".parse::<StatusLineEntry>(),
++        Ok(StatusLineEntry::Builtin(StatusLineItem::ContextUsed))
++    );
++    for invalid in [
++        "file:",
++        "file:bad key",
++        "file:a/b",
++        "file:ünïcode",
++        "bogus",
++        "File:build",
++    ] {
++        assert!(
++            invalid.parse::<StatusLineEntry>().is_err(),
++            "{invalid} should be rejected"
++        );
++    }
++    assert!(
++        format!("file:{}", "k".repeat(MAX_KEY_LEN))
++            .parse::<StatusLineEntry>()
++            .is_ok()
++    );
++    assert!(
++        format!("file:{}", "k".repeat(MAX_KEY_LEN + 1))
++            .parse::<StatusLineEntry>()
++            .is_err()
++    );
++}
++
++#[test]
++fn entries_round_trip_through_their_ids() {
++    let entries = [
++        StatusLineEntry::File("build".to_string()),
++        StatusLineEntry::Builtin(StatusLineItem::ContextUsed),
++        StatusLineEntry::Builtin(StatusLineItem::ModelName),
++    ];
++    let ids = entries.iter().map(ToString::to_string).collect::<Vec<_>>();
++    assert_eq!(ids, vec!["file:build", "context-used", "model"]);
++    assert_eq!(
++        ids.iter()
++            .map(|id| id.parse::<StatusLineEntry>())
++            .collect::<Result<Vec<_>, _>>(),
++        Ok(entries.to_vec())
++    );
++}
++
++#[test]
++fn file_prefix_cannot_collide_with_builtin_ids() {
++    for item in StatusLineItem::iter() {
++        let id = item.to_string();
++        assert!(
++            !id.contains(':'),
++            "built-in status line id {id} must not contain ':'"
++        );
++        assert_eq!(
++            id.parse::<StatusLineEntry>(),
++            Ok(StatusLineEntry::Builtin(item))
++        );
++    }
++}
++
++#[test]
++fn builtin_items_keep_order_and_skip_file_fields() {
++    let entries = [
++        StatusLineEntry::File("build".to_string()),
++        StatusLineEntry::Builtin(StatusLineItem::GitBranch),
++        StatusLineEntry::File("queue".to_string()),
++        StatusLineEntry::Builtin(StatusLineItem::ModelName),
++    ];
++    assert_eq!(
++        StatusLineEntry::builtin_items(&entries),
++        vec![StatusLineItem::GitBranch, StatusLineItem::ModelName]
++    );
++}
++
++#[test]
++fn parse_keeps_strings_and_numbers() {
++    let parsed = StatusLineFileFields::parse(
++        br#"{
++            "version": 1,
++            "fields": {
++                "build": "build ok",
++                "queue": 3,
++                "ratio": 0.5,
++                "flag": true,
++                "nothing": null,
++                "list": ["a"],
++                "object": {"a": 1},
++                "bad key": "hidden",
++                "blank": "  \n\t "
++            }
++        }"#,
++    );
++    assert_eq!(
++        parsed,
++        fields(&[("build", "build ok"), ("queue", "3"), ("ratio", "0.5")])
++    );
++    assert_eq!(
++        parsed.keys().collect::<Vec<_>>(),
++        vec!["build", "queue", "ratio"]
++    );
++    assert_eq!(parsed.get("queue"), Some("3"));
++    assert_eq!(parsed.get("flag"), None);
++}
++
++#[test]
++fn parse_ignores_unusable_files() {
++    let cases: &[&[u8]] = &[
++        b"",
++        b"not json",
++        b"{\"fields\": {\"build\": \"ok\"",
++        b"[]",
++        b"\"fields\"",
++        b"{}",
++        b"{\"build\": \"ok\"}",
++        b"{\"fields\": [\"ok\"]}",
++        b"{\"fields\": \"ok\"}",
++        b"\xff\xfe",
++    ];
++    for contents in cases {
++        assert!(
++            StatusLineFileFields::parse(contents).is_empty(),
++            "{} should yield no fields",
++            String::from_utf8_lossy(contents)
++        );
++    }
++}
++
++#[test]
++fn parse_flattens_control_characters_and_whitespace() {
++    let parsed = StatusLineFileFields::parse(
++        "{\"fields\": {\"multi\": \"  first\\nsecond\\r\\n\\tthird \", \"escape\": \"\\u001b[31mred\\u0007\"}}"
++            .as_bytes(),
++    );
++    assert_eq!(
++        parsed,
++        fields(&[("escape", "[31mred"), ("multi", "first second third")])
++    );
++}
++
++#[test]
++fn parse_truncates_long_values_to_display_width() {
++    let long = "x".repeat(MAX_FIELD_WIDTH + 10);
++    let wide = "界".repeat(MAX_FIELD_WIDTH);
++    let exact = "y".repeat(MAX_FIELD_WIDTH);
++    let spaced = format!("{} tail", "z".repeat(MAX_FIELD_WIDTH - 2));
++    let contents = serde_json::json!({
++        "fields": {"long": long, "wide": wide, "exact": exact, "spaced": spaced}
++    });
++    let parsed = StatusLineFileFields::parse(contents.to_string().as_bytes());
++
++    let long = parsed.get("long").expect("long value");
++    assert_eq!(long, format!("{}…", "x".repeat(MAX_FIELD_WIDTH - 1)));
++    assert_eq!(long.width(), MAX_FIELD_WIDTH);
++
++    let wide = parsed.get("wide").expect("wide value");
++    assert_eq!(wide, format!("{}…", "界".repeat((MAX_FIELD_WIDTH - 1) / 2)));
++    assert!(wide.width() <= MAX_FIELD_WIDTH);
++
++    assert_eq!(parsed.get("exact"), Some(exact.as_str()));
++    assert_eq!(
++        parsed.get("spaced"),
++        Some(format!("{}…", "z".repeat(MAX_FIELD_WIDTH - 2)).as_str())
++    );
++}
++
++#[test]
++fn resolve_path_expands_session_placeholder() {
++    let session_id = ThreadId::from_u128(/*value*/ 7);
++    let template = Path::new("/run/status/{session_id}.json");
++
++    assert_eq!(
++        resolve_path(template, Some(session_id)),
++        Some(PathBuf::from(format!("/run/status/{session_id}.json")))
++    );
++    assert_eq!(resolve_path(template, /*session_id*/ None), None);
++
++    let fixed = Path::new("/run/status/fixed.json");
++    assert_eq!(
++        resolve_path(fixed, Some(session_id)),
++        Some(fixed.to_path_buf())
++    );
++    assert_eq!(
++        resolve_path(fixed, /*session_id*/ None),
++        Some(fixed.to_path_buf())
++    );
++}
++
++#[test]
++fn sync_without_a_configured_path_starts_nothing() {
++    if env_template().is_some() {
++        // The environment configures a file for this process; nothing to check.
++        return;
++    }
++    sync(
++        /*config_path*/ None,
++        Some(ThreadId::new()),
++        &FrameRequester::test_dummy(),
++    );
++    assert!(lock(&INSTANCE).is_none());
++    assert!(Arc::ptr_eq(&current_fields(), &empty_fields()));
++}
++
++struct TestWatcher {
++    watcher: StatusLineFileWatcher,
++    changes: mpsc::Receiver<()>,
++}
++
++impl TestWatcher {
++    fn spawn() -> Self {
++        let (tx, changes) = mpsc::channel();
++        let watcher = StatusLineFileWatcher::spawn(TEST_POLL_INTERVAL, move || {
++            let _ = tx.send(());
++        })
++        .expect("spawn watcher");
++        Self { watcher, changes }
++    }
++
++    fn wait_for(&self, expected: &StatusLineFileFields) {
++        let deadline = Instant::now() + TEST_TIMEOUT;
++        while *self.watcher.fields() != *expected {
++            let remaining = deadline.saturating_duration_since(Instant::now());
++            assert!(
++                !remaining.is_zero(),
++                "timed out waiting for {expected:?}, have {:?}",
++                self.watcher.fields()
++            );
++            let _ = self
++                .changes
++                .recv_timeout(remaining.min(TEST_POLL_INTERVAL * 10));
++        }
++    }
++}
++
++fn write_atomically(path: &Path, contents: &str) {
++    let temp = path.with_extension("tmp");
++    std::fs::write(&temp, contents).expect("write temp file");
++    std::fs::rename(&temp, path).expect("rename temp file");
++}
++
++#[test]
++fn watcher_follows_file_changes() {
++    let dir = TempDir::new().expect("temp dir");
++    let path = dir.path().join("status.json");
++    let mut test = TestWatcher::spawn();
++    test.watcher.set_path(Some(path.clone()));
++    assert!(
++        test.watcher.fields().is_empty(),
++        "missing file has no fields"
++    );
++
++    write_atomically(&path, r#"{"fields": {"build": "running"}}"#);
++    test.wait_for(&fields(&[("build", "running")]));
++
++    write_atomically(&path, r#"{"fields": {"build": "ok", "queue": 2}}"#);
++    test.wait_for(&fields(&[("build", "ok"), ("queue", "2")]));
++
++    write_atomically(&path, "{\"fields\": {\"build\": ");
++    test.wait_for(&StatusLineFileFields::default());
++
++    write_atomically(&path, r#"{"fields": {"build": "back"}}"#);
++    test.wait_for(&fields(&[("build", "back")]));
++
++    std::fs::remove_file(&path).expect("remove file");
++    test.wait_for(&StatusLineFileFields::default());
++}
++
++#[test]
++fn watcher_ignores_oversized_files() {
++    let dir = TempDir::new().expect("temp dir");
++    let path = dir.path().join("status.json");
++    let mut test = TestWatcher::spawn();
++    test.watcher.set_path(Some(path.clone()));
++    write_atomically(&path, r#"{"fields": {"build": "ok"}}"#);
++    test.wait_for(&fields(&[("build", "ok")]));
++
++    let padding = " ".repeat(usize::try_from(MAX_FILE_BYTES).expect("file limit fits usize"));
++    write_atomically(
++        &path,
++        &format!(r#"{{"fields": {{"build": "big"}}}}{padding}"#),
++    );
++    test.wait_for(&StatusLineFileFields::default());
++}
++
++#[test]
++fn watcher_discards_old_fields_when_the_path_changes() {
++    let dir = TempDir::new().expect("temp dir");
++    let first = dir.path().join("first.json");
++    let second = dir.path().join("second.json");
++    write_atomically(&first, r#"{"fields": {"build": "first"}}"#);
++    write_atomically(&second, r#"{"fields": {"build": "second"}}"#);
++
++    let mut test = TestWatcher::spawn();
++    test.watcher.set_path(Some(first));
++    test.wait_for(&fields(&[("build", "first")]));
++
++    test.watcher.set_path(Some(second));
++    assert!(
++        test.watcher.fields().is_empty(),
++        "fields of the previous file are dropped immediately"
++    );
++    test.wait_for(&fields(&[("build", "second")]));
++
++    test.watcher.set_path(/*path*/ None);
++    assert!(Arc::ptr_eq(&test.watcher.fields(), &empty_fields()));
++}
++
++#[test]
++fn watcher_reports_only_visible_changes() {
++    let dir = TempDir::new().expect("temp dir");
++    let path = dir.path().join("status.json");
++    write_atomically(&path, r#"{"fields": {"build": "ok"}}"#);
++    let mut test = TestWatcher::spawn();
++    test.watcher.set_path(Some(path.clone()));
++    test.wait_for(&fields(&[("build", "ok")]));
++    let snapshot = test.watcher.fields();
++    while test.changes.try_recv().is_ok() {}
++
++    // Same visible values with different formatting and an ignored key.
++    write_atomically(&path, r#"{"fields": {"build": " ok ", "flag": false}}"#);
++    std::thread::sleep(TEST_POLL_INTERVAL * 20);
++    assert!(
++        test.changes.try_recv().is_err(),
++        "no change should be reported"
++    );
++    assert!(Arc::ptr_eq(&test.watcher.fields(), &snapshot));
++}
+-- 
+2.53.0
+
