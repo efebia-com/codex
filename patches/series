@@ -3,3 +3,5 @@
 # Each line names a directory under patches/. Its *.patch files (git format-patch
 # output, 0001-..., 0002-...) are applied in name order with `git am --3way`.
 # Blank lines and text after # are ignored.
+channels
+channels-tests

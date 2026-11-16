@@ -4,7 +4,7 @@
 # Usage: scripts/test-extensions.sh --source <dir>
 #
 # Each line of patches/tests is `<extension>: <cargo test arguments>` and runs
-# as one `cargo test` from codex-rs/. Lines of extensions that are not in
+# as one `cargo test --no-fail-fast` from codex-rs/. Lines of extensions that are not in
 # patches/series are skipped, and a command listed twice runs once. Every
 # command runs even after a failure; the summary lists the failures.
 
@@ -38,14 +38,14 @@ while IFS= read -r line <&3; do
     log "Skipping ${extension}: not in patches/series"
     continue
   fi
-  command="cargo test ${args[*]}"
+  command="cargo test --no-fail-fast ${args[*]}"
   if [[ -n "${seen["$command"]:-}" ]]; then
     log "${extension}: ${command} (already run)"
     continue
   fi
   seen["$command"]=1
   log "${extension}: ${command}"
-  if (cd "$codex_rs" && cargo test "${args[@]}"); then
+  if (cd "$codex_rs" && cargo test --no-fail-fast "${args[@]}"); then
     passed+=("${extension}: ${command}")
   else
     failed+=("${extension}: ${command}")
