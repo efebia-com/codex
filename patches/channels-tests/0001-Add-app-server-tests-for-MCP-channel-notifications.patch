@@ -1,22 +1,22 @@
-From 292a5adafcaf1d2de304fc318a6d4f9ade06115a Mon Sep 17 00:00:00 2001
+From 6083dc126845c2cda52e9ebc8045aad226a8fde0 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 13:52:12 +0100
 Subject: [PATCH] Add app-server tests for MCP channel notifications
 
 ---
- .../app-server/tests/suite/v2/mcp_channels.rs | 846 ++++++++++++++++++
+ .../app-server/tests/suite/v2/mcp_channels.rs | 972 ++++++++++++++++++
  .../tests/suite/v2/mcp_channels_server.py     | 136 +++
  codex-rs/app-server/tests/suite/v2/mod.rs     |   1 +
- 3 files changed, 983 insertions(+)
+ 3 files changed, 1109 insertions(+)
  create mode 100644 codex-rs/app-server/tests/suite/v2/mcp_channels.rs
  create mode 100644 codex-rs/app-server/tests/suite/v2/mcp_channels_server.py
 
 diff --git a/codex-rs/app-server/tests/suite/v2/mcp_channels.rs b/codex-rs/app-server/tests/suite/v2/mcp_channels.rs
 new file mode 100644
-index 0000000000..71849e20a0
+index 0000000000..c9e12894c9
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/mcp_channels.rs
-@@ -0,0 +1,846 @@
+@@ -0,0 +1,972 @@
 +//! MCP servers that opt in as channels push `notifications/claude/channel` events, which reach
 +//! the model of the root thread that owns the server as `<channel>` user input.
 +
@@ -32,6 +32,7 @@ index 0000000000..71849e20a0
 +use app_test_support::MockResponsesConfig;
 +use app_test_support::TestAppServer;
 +use codex_app_server_protocol::ClientRequest;
++use codex_app_server_protocol::JSONRPCMessage;
 +use codex_app_server_protocol::ThreadStartParams;
 +use codex_app_server_protocol::ThreadStartResponse;
 +use codex_app_server_protocol::TurnStartParams;
@@ -61,6 +62,17 @@ index 0000000000..71849e20a0
 +const POLL_INTERVAL: Duration = Duration::from_millis(50);
 +/// Time given to a sub-agent's MCP startup to launch servers after its first model request.
 +const SUBAGENT_SETTLE: Duration = Duration::from_secs(3);
++/// Longest text kept whole in a failure report.
++const REPORT_TEXT_CHARS: usize = 120;
++/// App-server notifications that tell what became of a turn and its input.
++const REPORTED_EVENTS: &[&str] = &[
++    "turn/started",
++    "turn/completed",
++    "item/started",
++    "item/completed",
++    "thread/status/changed",
++    "error",
++];
 +
 +#[derive(Clone, Copy)]
 +struct ServerSpec {
@@ -191,6 +203,50 @@ index 0000000000..71849e20a0
 +        .replace("&gt;", ">")
 +        .replace("&quot;", "\"")
 +        .replace("&amp;", "&")
++}
++
++/// Texts of the `function_call_output` item for `call_id`, or `None` when the request has none.
++/// A tool's output is a plain string or a list of content items; an MCP tool's text result is
++/// the latter (a wall-time header item, then the tool's own text).
++fn call_output_texts(request: &ResponsesRequest, call_id: &str) -> Option<Vec<String>> {
++    let item = request
++        .inputs_of_type("function_call_output")
++        .into_iter()
++        .find(|item| item["call_id"] == call_id)?;
++    Some(match &item["output"] {
++        Value::String(text) => vec![text.clone()],
++        Value::Array(parts) => parts
++            .iter()
++            .filter(|part| part["type"] == "input_text")
++            .filter_map(|part| part["text"].as_str().map(str::to_owned))
++            .collect(),
++        _ => Vec::new(),
++    })
++}
++
++/// `text` cut to `max` characters, for failure reports.
++fn abbreviate(text: &str, max: usize) -> String {
++    if text.chars().count() <= max {
++        return text.to_string();
++    }
++    let head: String = text.chars().take(max).collect();
++    format!("{head}...")
++}
++
++/// `value` with every string cut to `max` characters, for failure reports.
++fn abbreviate_json(value: &Value, max: usize) -> Value {
++    match value {
++        Value::String(text) => Value::String(abbreviate(text, max)),
++        Value::Array(items) => items
++            .iter()
++            .map(|item| abbreviate_json(item, max))
++            .collect(),
++        Value::Object(map) => map
++            .iter()
++            .map(|(key, item)| (key.clone(), abbreviate_json(item, max)))
++            .collect(),
++        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
++    }
 +}
 +
 +/// Every `<channel>` input text of user messages, in request order and item order.
@@ -390,6 +446,56 @@ index 0000000000..71849e20a0
 +            );
 +        }
 +    }
++
++    /// What became of the notifications of `server`: what it sent, the user messages of each
++    /// model request and the turn and item events of the app-server. Reads the app-server stream
++    /// until it is quiet and may cut a message in half, so it is only for a test about to fail.
++    async fn delivery_report(&mut self, server: &str) -> Result<String> {
++        let sent: Value = self
++            .server(server)
++            .sent_notifications()?
++            .iter()
++            .map(|params| abbreviate_json(params, REPORT_TEXT_CHARS))
++            .collect();
++        let mut report = format!("server `{server}` sent: {sent}\n");
++        for (index, request) in self.requests().await.iter().enumerate() {
++            let messages: Vec<Vec<String>> = request
++                .message_input_text_groups("user")
++                .iter()
++                .map(|texts| {
++                    texts
++                        .iter()
++                        .map(|text| abbreviate(text, REPORT_TEXT_CHARS))
++                        .collect()
++                })
++                .collect();
++            report.push_str(&format!(
++                "model request #{index} user messages: {messages:?}\n"
++            ));
++        }
++        report.push_str("app-server events the test had not read yet:\n");
++        let deadline = Instant::now() + READ_TIMEOUT;
++        while Instant::now() < deadline {
++            let Ok(Ok(message)) = timeout(QUIET_PERIOD, self.app.read_next_message()).await else {
++                break;
++            };
++            let JSONRPCMessage::Notification(notification) = message else {
++                continue;
++            };
++            if REPORTED_EVENTS.contains(&notification.method.as_str()) {
++                let params = notification
++                    .params
++                    .as_ref()
++                    .map(|params| abbreviate_json(params, REPORT_TEXT_CHARS));
++                report.push_str(&format!(
++                    "  {} {}\n",
++                    notification.method,
++                    params.unwrap_or(Value::Null)
++                ));
++            }
++        }
++        Ok(report)
++    }
 +}
 +
 +fn server_toml(spec: &ServerSpec, script: &Path, server: &FakeServer) -> Result<String> {
@@ -479,16 +585,28 @@ index 0000000000..71849e20a0
 +
 +    let (index, element) = harness.wait_for_delivery("chan", "during the turn").await?;
 +    let requests = harness.requests().await;
++    let tool_calls = harness.server("chan").records("tool_call")?;
++    let emit_output = requests
++        .get(1)
++        .and_then(|request| call_output_texts(request, CALL_ID));
++    if requests.len() < 2
++        || tool_calls.len() != 1
++        || !emit_output
++            .as_ref()
++            .is_some_and(|texts| texts.iter().any(|text| text.contains("sent 1")))
++    {
++        let report = harness.delivery_report("chan").await?;
++        panic!(
++            "the user turn should call emit once and continue with its output in model request \
++             #1; emit calls: {tool_calls:?}, emit output in request #1: {emit_output:?}\n{report}"
++        );
++    }
 +    assert!(
 +        requests[0]
 +            .message_input_texts("user")
 +            .iter()
 +            .any(|text| text == PROMPT),
 +        "first model request should be the user turn"
-+    );
-+    assert!(
-+        requests[1].function_call_output_text(CALL_ID).is_some(),
-+        "second model request should continue the user turn after the emit tool call"
 +    );
 +    assert_eq!(
 +        channel_elements(&requests[1]),
@@ -605,7 +723,8 @@ index 0000000000..71849e20a0
 +#[tokio::test]
 +async fn notifications_are_delivered_once_and_in_order() -> Result<()> {
 +    skip_if_no_network!(Ok(()));
-+    let harness = Harness::start(&[CHANNEL]).await?;
++    const EXPECTED: [&str; 3] = ["first", "second", "third"];
++    let mut harness = Harness::start(&[CHANNEL]).await?;
 +
 +    harness.server("chan").push(&[
 +        json!({"content": "first"}),
@@ -620,7 +739,6 @@ index 0000000000..71849e20a0
 +        .into_iter()
 +        .map(|(_, element)| element.body())
 +        .collect();
-+    assert_eq!(order, vec!["first", "second", "third"]);
 +    let last = harness
 +        .requests()
 +        .await
@@ -630,10 +748,18 @@ index 0000000000..71849e20a0
 +        .iter()
 +        .map(ChannelElement::body)
 +        .collect();
++    let report = if order == EXPECTED && bodies == EXPECTED {
++        String::new()
++    } else {
++        harness.delivery_report("chan").await?
++    };
 +    assert_eq!(
-+        bodies,
-+        vec!["first", "second", "third"],
-+        "the latest model request should carry each notification exactly once, in order"
++        order, EXPECTED,
++        "each notification should reach the model, in the order sent\n{report}"
++    );
++    assert_eq!(
++        bodies, EXPECTED,
++        "the latest model request should carry each notification exactly once, in order\n{report}"
 +    );
 +    Ok(())
 +}
