@@ -1,20 +1,20 @@
-From f30a6abc53064947dc69dfe55eaea0d69435e22d Mon Sep 17 00:00:00 2001
+From 1644af2bc8bb3b313c4c099a9a4332a6577c674d Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 15:54:13 +0100
 Subject: [PATCH 2/2] core: test MCP session ids across resume and sub-agents
 
 ---
- codex-rs/core/tests/suite/mcp_session_env.rs | 309 +++++++++++++++++++
+ codex-rs/core/tests/suite/mcp_session_env.rs | 318 +++++++++++++++++++
  codex-rs/core/tests/suite/mod.rs             |   1 +
- 2 files changed, 310 insertions(+)
+ 2 files changed, 319 insertions(+)
  create mode 100644 codex-rs/core/tests/suite/mcp_session_env.rs
 
 diff --git a/codex-rs/core/tests/suite/mcp_session_env.rs b/codex-rs/core/tests/suite/mcp_session_env.rs
 new file mode 100644
-index 0000000000..0125d8eac4
+index 0000000000..5bf01eb145
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/mcp_session_env.rs
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,318 @@
 +//! Stdio MCP servers receive the session and thread identity only when they request it.
 +
 +use std::path::Path;
@@ -34,6 +34,7 @@ index 0000000000..0125d8eac4
 +use core_test_support::skip_if_no_network;
 +use core_test_support::skip_if_wine_exec;
 +use core_test_support::test_codex::TestCodexBuilder;
++use core_test_support::test_codex::run_test_with_large_stack;
 +use core_test_support::test_codex::test_codex;
 +use core_test_support::wait_for_event;
 +use pretty_assertions::assert_eq;
@@ -200,8 +201,12 @@ index 0000000000..0125d8eac4
 +        .collect()
 +}
 +
-+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-+async fn opted_in_server_keeps_the_thread_identity_across_resume() -> Result<()> {
++#[test]
++fn opted_in_server_keeps_the_thread_identity_across_resume() -> Result<()> {
++    run_test_with_large_stack("mcp-session-env-resume", resume_scenario)
++}
++
++async fn resume_scenario() -> Result<()> {
 +    skip_if_no_network!(Ok(()));
 +    skip_if_wine_exec!(Ok(()), "the MCP fixture requires a host Python interpreter");
 +    let server = start_mock_server().await;
@@ -267,8 +272,12 @@ index 0000000000..0125d8eac4
 +    Ok(())
 +}
 +
-+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-+async fn subagent_server_shares_the_session_but_not_the_thread() -> Result<()> {
++#[test]
++fn subagent_server_shares_the_session_but_not_the_thread() -> Result<()> {
++    run_test_with_large_stack("mcp-session-env-subagent", subagent_scenario)
++}
++
++async fn subagent_scenario() -> Result<()> {
 +    skip_if_no_network!(Ok(()));
 +    skip_if_wine_exec!(Ok(()), "the MCP fixture requires a host Python interpreter");
 +    let server = start_mock_server().await;
