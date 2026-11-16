@@ -45,9 +45,10 @@ The server sees the ids of the thread whose MCP runtime starts it:
 - A server started outside any thread, for example to list servers or their status: neither
   variable.
 
-One Codex process can run servers for several chats at once. For example, the TUI can keep the
-servers of a chat it left with `/resume` or `/fork` until it exits. Each server process keeps the
-ids it was started with.
+Server lifecycle is upstream's and this extension does not change it. One Codex process can run
+servers for several chats at once; for example, the TUI can keep the servers of a chat it left
+with `/resume` or `/fork` until it exits. This does not affect the ids: each server process keeps
+the ids of the chat that started it.
 
 Codex can share one stdio server process between chats when it speaks MCP 2026-07-28 and allows
 it. A server that requests these variables is never shared between threads with different ids.
