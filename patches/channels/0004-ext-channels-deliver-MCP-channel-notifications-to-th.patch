@@ -1,4 +1,4 @@
-From 1b2714713cbf3c5a78c9dcbfd21a80e2590cacc2 Mon Sep 17 00:00:00 2001
+From c3f1a835fb095210839e0594d9055eac68494224 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 14:38:12 +0100
 Subject: [PATCH 4/4] ext/channels: deliver MCP channel notifications to the
@@ -16,10 +16,10 @@ for sub-agents and other non-root threads.
  codex-rs/ext/channels/src/delivery.rs       | 191 ++++++++++
  codex-rs/ext/channels/src/delivery_tests.rs | 198 ++++++++++
  codex-rs/ext/channels/src/lib.rs            | 158 ++++++++
- codex-rs/ext/channels/src/render.rs         |  83 +++++
+ codex-rs/ext/channels/src/render.rs         |  83 ++++
  codex-rs/ext/channels/src/render_tests.rs   | 116 ++++++
- codex-rs/ext/channels/tests/lifecycle.rs    | 391 ++++++++++++++++++++
- 10 files changed, 1174 insertions(+)
+ codex-rs/ext/channels/tests/lifecycle.rs    | 403 ++++++++++++++++++++
+ 10 files changed, 1186 insertions(+)
  create mode 100644 codex-rs/ext/channels/Cargo.toml
  create mode 100644 codex-rs/ext/channels/src/delivery.rs
  create mode 100644 codex-rs/ext/channels/src/delivery_tests.rs
@@ -889,10 +889,10 @@ index 0000000000..01a28b5576
 +}
 diff --git a/codex-rs/ext/channels/tests/lifecycle.rs b/codex-rs/ext/channels/tests/lifecycle.rs
 new file mode 100644
-index 0000000000..33d642ce33
+index 0000000000..e2dc6b87a2
 --- /dev/null
 +++ b/codex-rs/ext/channels/tests/lifecycle.rs
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,403 @@
 +//! Channel servers across a thread's life: delivery to an idle thread, a second thread, a
 +//! resumed thread, and a server that dies.
 +#![cfg(unix)]
@@ -901,6 +901,8 @@ index 0000000000..33d642ce33
 +use std::process::Command;
 +use std::process::Stdio;
 +use std::sync::Arc;
++use std::sync::Mutex;
++use std::sync::PoisonError;
 +use std::time::Duration;
 +use std::time::Instant;
 +
@@ -910,6 +912,7 @@ index 0000000000..33d642ce33
 +use codex_config::TomlValue;
 +use codex_core::CodexThread;
 +use codex_core::TurnInputRequest;
++use codex_core::config::Config;
 +use codex_extension_api::ExtensionRegistryBuilder;
 +use codex_protocol::mcp::ClientMcpExtensions;
 +use codex_protocol::protocol::EventMsg;
@@ -1022,30 +1025,22 @@ index 0000000000..33d642ce33
 +            dir.path().join("outbox"),
 +        ]
 +        .map(|path| path.to_string_lossy().into_owned());
++        // A config mutator cannot fail, so its outcome is checked once the build returns.
++        let configured = Arc::new(Mutex::new(None));
++        let outcome = Arc::clone(&configured);
 +        let test = test_codex()
 +            .with_extensions(Arc::new(extensions.build()))
 +            .with_config(move |config| {
-+                config
-+                    .mcp_servers
-+                    .set(
-+                        serde_json::from_value(json!({
-+                            SERVER_NAME: { "command": "python3", "args": paths },
-+                        }))
-+                        .expect("server config"),
-+                    )
-+                    .expect("set servers");
-+                let layer: TomlValue = serde_json::from_value(json!({
-+                    "mcp_servers": { SERVER_NAME: { "channel": true } },
-+                }))
-+                .expect("channel layer");
-+                config.config_layer_stack = config
-+                    .config_layer_stack
-+                    .clone()
-+                    .with_session_config(layer)
-+                    .expect("session layer");
++                let result = enable_channel_server(config, paths);
++                *outcome.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
 +            })
 +            .build(&server)
 +            .await?;
++        configured
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .take()
++            .context("the config mutator did not run")??;
 +        extension.attach(Arc::downgrade(&test.thread_manager));
 +        wait_for_mcp_server(&test.codex, SERVER_NAME).await?;
 +        Ok(Self {
@@ -1092,6 +1087,23 @@ index 0000000000..33d642ce33
 +        wait_until(|| self.responses.requests().len() > index).await?;
 +        Ok(self.responses.requests()[index].message_input_texts("user"))
 +    }
++}
++
++/// Enables the channel server in `config`, as `mcp_servers.chan` with `channel = true` in a
++/// config file would.
++fn enable_channel_server(config: &mut Config, args: [String; 4]) -> Result<()> {
++    config.mcp_servers.set(serde_json::from_value(json!({
++        SERVER_NAME: { "command": "python3", "args": args },
++    }))?)?;
++    // The typed server config has no `channel`; the extension reads it from the layers.
++    let layer: TomlValue = serde_json::from_value(json!({
++        "mcp_servers": { SERVER_NAME: { "channel": true } },
++    }))?;
++    config.config_layer_stack = config
++        .config_layer_stack
++        .clone()
++        .with_session_config(layer)?;
++    Ok(())
 +}
 +
 +async fn wait_until(mut condition: impl FnMut() -> bool) -> Result<()> {

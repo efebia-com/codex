@@ -1,4 +1,4 @@
-From 17e66202355fd0b89ccf250dfffa675039e0da3b Mon Sep 17 00:00:00 2001
+From dbbc128e2dd96a01f0e9cbcbf85e63d7b4b2183e Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 14:38:11 +0100
 Subject: [PATCH 1/4] rmcp-client: hand subscribed custom server notifications
@@ -6,31 +6,44 @@ Subject: [PATCH 1/4] rmcp-client: hand subscribed custom server notifications
 
 The client handler ignores custom notifications. A caller can now subscribe
 to one method before initialize and receive its notifications in a bounded
-queue; a full queue drops new ones.
+queue, in the order the server sent them: they are taken from the transport,
+before the SDK dispatches each notification in a task of its own. A full
+queue drops new ones.
 ---
- .../rmcp-client/src/custom_notifications.rs   |  65 ++++++++
- .../src/custom_notifications_tests.rs         | 140 ++++++++++++++++++
- .../src/elicitation_client_service.rs         |  14 ++
+ .../rmcp-client/src/custom_notifications.rs   | 126 +++++++++
+ .../src/custom_notifications_tests.rs         | 240 ++++++++++++++++++
  codex-rs/rmcp-client/src/lib.rs               |   1 +
- codex-rs/rmcp-client/src/rmcp_client.rs       |  17 +++
- 5 files changed, 237 insertions(+)
+ codex-rs/rmcp-client/src/rmcp_client.rs       |  37 ++-
+ 4 files changed, 398 insertions(+), 6 deletions(-)
  create mode 100644 codex-rs/rmcp-client/src/custom_notifications.rs
  create mode 100644 codex-rs/rmcp-client/src/custom_notifications_tests.rs
 
 diff --git a/codex-rs/rmcp-client/src/custom_notifications.rs b/codex-rs/rmcp-client/src/custom_notifications.rs
 new file mode 100644
-index 0000000000..568aa4c596
+index 0000000000..b4da3cb9c0
 --- /dev/null
 +++ b/codex-rs/rmcp-client/src/custom_notifications.rs
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,126 @@
 +//! Delivers selected custom server notifications, which the client handler ignores, to
 +//! subscribers.
++//!
++//! The SDK handles each server notification in a task of its own, so notifications sent back to
++//! back can reach the handler in any order. Subscribed notifications are therefore taken from the
++//! transport, in the order the server sent them, before the SDK dispatches anything.
 +
++use std::future::Future;
 +use std::sync::Arc;
 +use std::sync::Mutex;
 +use std::sync::PoisonError;
 +
 +use rmcp::model::CustomNotification;
++use rmcp::model::JsonRpcMessage;
++use rmcp::model::ServerNotification;
++use rmcp::service::RoleClient;
++use rmcp::service::RxJsonRpcMessage;
++use rmcp::service::TxJsonRpcMessage;
++use rmcp::transport::IntoTransport;
++use rmcp::transport::Transport;
 +use tokio::sync::mpsc;
 +use tokio::sync::mpsc::error::TrySendError;
 +use tracing::debug;
@@ -60,8 +73,24 @@ index 0000000000..568aa4c596
 +        receiver
 +    }
 +
-+    /// Whether `notification` has a subscriber. Such a notification never reaches the
-+    /// handler; when the subscriber's queue is full it is dropped.
++    /// Wraps `transport` so that subscribed notifications go to their subscribers as they are
++    /// received, and never reach the SDK. Every other message passes through unchanged.
++    pub(crate) fn capture<T, E, A>(
++        &self,
++        transport: T,
++    ) -> impl Transport<RoleClient, Error = E> + 'static
++    where
++        T: IntoTransport<RoleClient, E, A>,
++        E: std::error::Error + Send + Sync + 'static,
++    {
++        CustomNotificationTransport {
++            inner: transport.into_transport(),
++            taps: self.clone(),
++        }
++    }
++
++    /// Whether `notification` has a subscriber. Such a notification is consumed; when the
++    /// subscriber's queue is full it is dropped.
 +    pub(crate) fn offer(&self, notification: &CustomNotification) -> bool {
 +        let taps = self.taps.lock().unwrap_or_else(PoisonError::into_inner);
 +        let Some((_, sender)) = taps
@@ -85,33 +114,143 @@ index 0000000000..568aa4c596
 +    }
 +}
 +
++struct CustomNotificationTransport<T> {
++    inner: T,
++    taps: CustomNotificationTaps,
++}
++
++impl<T: Transport<RoleClient> + 'static> Transport<RoleClient> for CustomNotificationTransport<T> {
++    type Error = T::Error;
++
++    fn send(
++        &mut self,
++        message: TxJsonRpcMessage<RoleClient>,
++    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
++        self.inner.send(message)
++    }
++
++    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
++        loop {
++            let message = self.inner.receive().await?;
++            if let JsonRpcMessage::Notification(envelope) = &message
++                && let ServerNotification::CustomNotification(notification) = &envelope.notification
++                && self.taps.offer(notification)
++            {
++                continue;
++            }
++            return Some(message);
++        }
++    }
++
++    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
++        self.inner.close()
++    }
++}
++
 +#[cfg(test)]
 +#[path = "custom_notifications_tests.rs"]
 +mod tests;
 diff --git a/codex-rs/rmcp-client/src/custom_notifications_tests.rs b/codex-rs/rmcp-client/src/custom_notifications_tests.rs
 new file mode 100644
-index 0000000000..856370ffe5
+index 0000000000..d84e1a132e
 --- /dev/null
 +++ b/codex-rs/rmcp-client/src/custom_notifications_tests.rs
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,240 @@
++use std::collections::VecDeque;
++use std::future::Future;
++
 +use pretty_assertions::assert_eq;
 +use rmcp::model::CustomNotification;
++use rmcp::model::JsonRpcMessage;
++use rmcp::model::ServerNotification;
++use rmcp::service::RoleClient;
++use rmcp::service::RxJsonRpcMessage;
++use rmcp::service::TxJsonRpcMessage;
++use rmcp::transport::Transport;
++use serde_json::Value;
 +use serde_json::json;
 +
 +use super::CustomNotificationTaps;
++
++const EVENT: &str = "notifications/example/event";
++const OTHER: &str = "notifications/other";
 +
 +fn notification(method: &str, n: u64) -> CustomNotification {
 +    CustomNotification::new(method, Some(json!({ "n": n })))
 +}
 +
++/// A transport that receives the given custom notifications, then ends.
++struct Scripted(VecDeque<CustomNotification>);
++
++impl Transport<RoleClient> for Scripted {
++    type Error = std::io::Error;
++
++    fn send(
++        &mut self,
++        _message: TxJsonRpcMessage<RoleClient>,
++    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
++        std::future::ready(Ok(()))
++    }
++
++    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
++        self.0.pop_front().map(|notification| {
++            JsonRpcMessage::notification(ServerNotification::CustomNotification(notification))
++        })
++    }
++
++    async fn close(&mut self) -> Result<(), Self::Error> {
++        Ok(())
++    }
++}
++
++/// The params of a custom notification message.
++fn custom_params(message: RxJsonRpcMessage<RoleClient>) -> Option<Value> {
++    let JsonRpcMessage::Notification(envelope) = message else {
++        return None;
++    };
++    let ServerNotification::CustomNotification(notification) = envelope.notification else {
++        return None;
++    };
++    notification.params
++}
++
++#[tokio::test]
++async fn capture_takes_subscribed_notifications_in_transport_order() {
++    let taps = CustomNotificationTaps::default();
++    let mut receiver = taps.subscribe(EVENT.to_string(), 8);
++    let mut transport = taps.capture(Scripted(VecDeque::from([
++        notification(EVENT, 1),
++        notification(OTHER, 2),
++        notification(EVENT, 3),
++        notification(EVENT, 4),
++    ])));
++
++    let passed = transport.receive().await.and_then(custom_params);
++    assert_eq!(passed, Some(json!({ "n": 2 })));
++    assert!(transport.receive().await.is_none());
++
++    let mut delivered = Vec::new();
++    while let Ok(notification) = receiver.try_recv() {
++        delivered.push(notification.params);
++    }
++    assert_eq!(
++        delivered,
++        vec![
++            Some(json!({ "n": 1 })),
++            Some(json!({ "n": 3 })),
++            Some(json!({ "n": 4 })),
++        ]
++    );
++}
++
 +#[tokio::test]
 +async fn subscribed_method_is_delivered_in_order_and_others_pass_through() {
 +    let taps = CustomNotificationTaps::default();
-+    let mut receiver = taps.subscribe("notifications/example/event".to_string(), 4);
++    let mut receiver = taps.subscribe(EVENT.to_string(), 4);
 +
-+    assert!(taps.offer(&notification("notifications/example/event", 1)));
-+    assert!(taps.offer(&notification("notifications/example/event", 2)));
-+    assert!(!taps.offer(&notification("notifications/other", 3)));
++    assert!(taps.offer(&notification(EVENT, 1)));
++    assert!(taps.offer(&notification(EVENT, 2)));
++    assert!(!taps.offer(&notification(OTHER, 3)));
 +
 +    let first = receiver.recv().await.expect("first notification");
 +    let second = receiver.recv().await.expect("second notification");
@@ -123,10 +262,10 @@ index 0000000000..856370ffe5
 +#[tokio::test]
 +async fn full_queue_drops_new_notifications_but_still_claims_them() {
 +    let taps = CustomNotificationTaps::default();
-+    let mut receiver = taps.subscribe("notifications/example/event".to_string(), 1);
++    let mut receiver = taps.subscribe(EVENT.to_string(), 1);
 +
-+    assert!(taps.offer(&notification("notifications/example/event", 1)));
-+    assert!(taps.offer(&notification("notifications/example/event", 2)));
++    assert!(taps.offer(&notification(EVENT, 1)));
++    assert!(taps.offer(&notification(EVENT, 2)));
 +
 +    let kept = receiver.recv().await.expect("kept notification");
 +    assert_eq!(kept.params, Some(json!({ "n": 1 })));
@@ -136,36 +275,33 @@ index 0000000000..856370ffe5
 +#[tokio::test]
 +async fn closed_subscriber_still_claims_its_method() {
 +    let taps = CustomNotificationTaps::default();
-+    drop(taps.subscribe("notifications/example/event".to_string(), 1));
++    drop(taps.subscribe(EVENT.to_string(), 1));
 +
-+    assert!(taps.offer(&notification("notifications/example/event", 1)));
++    assert!(taps.offer(&notification(EVENT, 1)));
 +}
 +
 +#[tokio::test]
 +async fn later_subscription_replaces_the_earlier_one() {
 +    let taps = CustomNotificationTaps::default();
-+    let mut first = taps.subscribe("notifications/example/event".to_string(), 1);
-+    let mut second = taps
-+        .clone()
-+        .subscribe("notifications/example/event".to_string(), 1);
++    let mut first = taps.subscribe(EVENT.to_string(), 1);
++    let mut second = taps.clone().subscribe(EVENT.to_string(), 1);
 +
-+    assert!(taps.offer(&notification("notifications/example/event", 1)));
++    assert!(taps.offer(&notification(EVENT, 1)));
 +
 +    assert!(first.recv().await.is_none());
 +    let delivered = second.recv().await.expect("replacement subscriber");
 +    assert_eq!(delivered.params, Some(json!({ "n": 1 })));
 +}
 +
++/// Sends `notifications` back to back once the client is initialized.
 +#[derive(Clone)]
-+struct NotifyingServer;
++struct NotifyingServer {
++    notifications: Vec<(&'static str, u64)>,
++}
 +
 +impl rmcp::ServerHandler for NotifyingServer {
 +    async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::RoleServer>) {
-+        for (method, n) in [
-+            ("notifications/example/event", 1),
-+            ("notifications/other", 2),
-+            ("notifications/example/event", 3),
-+        ] {
++        for &(method, n) in &self.notifications {
 +            context
 +                .peer
 +                .send_notification(rmcp::model::ServerNotification::CustomNotification(
@@ -197,8 +333,13 @@ index 0000000000..856370ffe5
 +    }
 +}
 +
-+#[tokio::test]
-+async fn client_hands_subscribed_server_notifications_to_the_subscriber() -> anyhow::Result<()> {
++/// Connects an in-process client to a server that sends `notifications` right after
++/// `initialize`, and returns the params of the first `count` that reach the subscriber of
++/// [`EVENT`], checking that no more arrive.
++async fn deliver_through_client(
++    notifications: Vec<(&'static str, u64)>,
++    count: usize,
++) -> anyhow::Result<Vec<Option<Value>>> {
 +    use futures::FutureExt;
 +    use rmcp::model::ClientCapabilities;
 +    use rmcp::model::Implementation;
@@ -206,8 +347,9 @@ index 0000000000..856370ffe5
 +    use std::sync::Arc;
 +    use std::time::Duration;
 +
-+    let client = crate::RmcpClient::new_in_process_client(Arc::new(NotifyingServer)).await?;
-+    let mut receiver = client.subscribe_custom_notifications("notifications/example/event", 8);
++    let server = NotifyingServer { notifications };
++    let client = crate::RmcpClient::new_in_process_client(Arc::new(server)).await?;
++    let mut receiver = client.subscribe_custom_notifications(EVENT, count + 1);
 +    client
 +        .initialize(
 +            InitializeRequestParams::new(
@@ -220,69 +362,40 @@ index 0000000000..856370ffe5
 +        .await?;
 +
 +    let mut delivered = Vec::new();
-+    for _ in 0..2 {
++    for _ in 0..count {
 +        let notification = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
 +            .await?
-+            .expect("subscribed notification");
++            .ok_or_else(|| anyhow::anyhow!("subscriber closed after {delivered:?}"))?;
 +        delivered.push(notification.params);
 +    }
++    assert!(receiver.try_recv().is_err());
++    client.shutdown().await;
++    Ok(delivered)
++}
++
++#[tokio::test]
++async fn client_hands_subscribed_server_notifications_to_the_subscriber() -> anyhow::Result<()> {
++    let delivered =
++        deliver_through_client(vec![(EVENT, 1), (OTHER, 2), (EVENT, 3)], /*count*/ 2).await?;
 +    assert_eq!(
 +        delivered,
 +        vec![Some(json!({ "n": 1 })), Some(json!({ "n": 3 }))]
 +    );
-+    assert!(receiver.try_recv().is_err());
-+    client.shutdown().await;
 +    Ok(())
 +}
-diff --git a/codex-rs/rmcp-client/src/elicitation_client_service.rs b/codex-rs/rmcp-client/src/elicitation_client_service.rs
-index 8a54bc9367..bd33b107da 100644
---- a/codex-rs/rmcp-client/src/elicitation_client_service.rs
-+++ b/codex-rs/rmcp-client/src/elicitation_client_service.rs
-@@ -29,6 +29,7 @@ use serde_json::Map;
- use serde_json::Value;
- use tokio::sync::oneshot;
- 
-+use crate::custom_notifications::CustomNotificationTaps;
- use crate::logging_client_handler::LoggingClientHandler;
- use crate::rmcp_client::Elicitation;
- use crate::rmcp_client::ElicitationPauseState;
-@@ -65,6 +66,7 @@ pub(crate) struct ElicitationClientService {
-     send_elicitation: Arc<SendElicitation>,
-     pause_state: ElicitationPauseState,
-     pending_verifications: Arc<Mutex<VerificationCancellations>>,
-+    custom_notifications: CustomNotificationTaps,
- }
- 
- // A notification handler can run before its request handler. Never evict an early
-@@ -143,9 +145,16 @@ impl ElicitationClientService {
-             send_elicitation,
-             pause_state,
-             pending_verifications: Arc::default(),
-+            custom_notifications: CustomNotificationTaps::default(),
-         }
-     }
- 
-+    /// Hands the notifications that `taps` subscribe to over to them instead of the handler.
-+    pub(crate) fn with_custom_notifications(mut self, taps: CustomNotificationTaps) -> Self {
-+        self.custom_notifications = taps;
-+        self
-+    }
 +
-     async fn create_elicitation(
-         &self,
-         request: Elicitation,
-@@ -320,6 +329,11 @@ impl Service<RoleClient> for ElicitationClientService {
-         notification: ServerNotification,
-         context: NotificationContext<RoleClient>,
-     ) -> Result<(), rmcp::ErrorData> {
-+        if let ServerNotification::CustomNotification(custom) = &notification
-+            && self.custom_notifications.offer(custom)
-+        {
-+            return Ok(());
-+        }
-         if let ServerNotification::CancelledNotification(cancelled) = &notification
-             && let Some(request_id) = cancelled.params.request_id.as_ref()
-         {
++/// The SDK handles each notification in a task of its own; on a multi-threaded runtime, a burst
++/// would reach a handler out of order.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn client_keeps_the_server_order_of_a_burst() -> anyhow::Result<()> {
++    const BURST: u64 = 64;
++    let sent: Vec<(&'static str, u64)> = (1..=BURST).map(|n| (EVENT, n)).collect();
++    let count = sent.len();
++    let delivered = deliver_through_client(sent, count).await?;
++    let expected: Vec<Option<Value>> = (1..=BURST).map(|n| Some(json!({ "n": n }))).collect();
++    assert_eq!(delivered, expected);
++    Ok(())
++}
 diff --git a/codex-rs/rmcp-client/src/lib.rs b/codex-rs/rmcp-client/src/lib.rs
 index 4ac4e55b8c..265de8ad07 100644
 --- a/codex-rs/rmcp-client/src/lib.rs
@@ -295,7 +408,7 @@ index 4ac4e55b8c..265de8ad07 100644
  mod ema_auth;
  mod ema_auth_policy;
 diff --git a/codex-rs/rmcp-client/src/rmcp_client.rs b/codex-rs/rmcp-client/src/rmcp_client.rs
-index 221336dfc8..a1393375f8 100644
+index 221336dfc8..b88c7e1ebe 100644
 --- a/codex-rs/rmcp-client/src/rmcp_client.rs
 +++ b/codex-rs/rmcp-client/src/rmcp_client.rs
 @@ -80,6 +80,7 @@ use tokio::time;
@@ -314,13 +427,14 @@ index 221336dfc8..a1393375f8 100644
  }
  
  impl RmcpClient {
-@@ -463,6 +465,17 @@ impl RmcpClient {
+@@ -463,6 +465,18 @@ impl RmcpClient {
          self.protocol_mode
      }
  
 +    /// Delivers server notifications with `method`, which this client otherwise ignores, to the
-+    /// returned receiver. Subscribe before `initialize` to receive notifications sent right
-+    /// after it. When the receiver falls `capacity` behind, new notifications are dropped.
++    /// returned receiver in the order the server sent them. Subscribe before `initialize` to
++    /// receive notifications sent right after it. When the receiver falls `capacity` behind, new
++    /// notifications are dropped.
 +    pub fn subscribe_custom_notifications(
 +        &self,
 +        method: impl Into<String>,
@@ -332,7 +446,7 @@ index 221336dfc8..a1393375f8 100644
      pub async fn new_in_process_client(
          factory: Arc<dyn InProcessTransportFactory>,
      ) -> io::Result<Self> {
-@@ -484,6 +497,7 @@ impl RmcpClient {
+@@ -484,6 +498,7 @@ impl RmcpClient {
              elicitation_pause_state: ElicitationPauseState::new(),
              tool_list_revision: Arc::default(),
              cancel_requests_on_drop: AtomicBool::new(false),
@@ -340,7 +454,7 @@ index 221336dfc8..a1393375f8 100644
          })
      }
  
-@@ -560,6 +574,7 @@ impl RmcpClient {
+@@ -560,6 +575,7 @@ impl RmcpClient {
              elicitation_pause_state: ElicitationPauseState::new(),
              tool_list_revision: Arc::default(),
              cancel_requests_on_drop: AtomicBool::new(false),
@@ -348,7 +462,7 @@ index 221336dfc8..a1393375f8 100644
          })
      }
  
-@@ -669,6 +684,7 @@ impl RmcpClient {
+@@ -669,6 +685,7 @@ impl RmcpClient {
              elicitation_pause_state: ElicitationPauseState::new(),
              tool_list_revision: Arc::default(),
              cancel_requests_on_drop: AtomicBool::new(false),
@@ -356,14 +470,62 @@ index 221336dfc8..a1393375f8 100644
          })
      }
  
-@@ -1570,6 +1586,7 @@ impl RmcpClient {
-                 Box::new(move |id, request| send_elicitation(id, request)),
-                 self.elicitation_pause_state.clone(),
-             )
-+            .with_custom_notifications(self.custom_notifications.clone())
-         };
-         let _initialize_deadline = match &self.transport_recipe {
-             TransportRecipe::StreamableHttp {
+@@ -1591,7 +1608,8 @@ impl RmcpClient {
+             client_service()
+                 .serve_with_lifecycle(
+                     track_tool_list_changes(
+-                        OrderedByteTransport::new(transport),
++                        self.custom_notifications
++                            .capture(OrderedByteTransport::new(transport)),
+                         Arc::clone(&self.tool_list_revision),
+                     ),
+                     lifecycle,
+@@ -1604,9 +1622,9 @@ impl RmcpClient {
+                 client_service()
+                     .serve_with_lifecycle(
+                         track_tool_list_changes(
+-                            OrderedByteTransport::new(
++                            self.custom_notifications.capture(OrderedByteTransport::new(
+                                 IntoTransport::<RoleClient, _, _>::into_transport(transport),
+-                            ),
++                            )),
+                             Arc::clone(&self.tool_list_revision),
+                         ),
+                         lifecycle,
+@@ -1627,7 +1645,8 @@ impl RmcpClient {
+                 client_service()
+                     .serve_with_lifecycle(
+                         track_tool_list_changes(
+-                            capture_event_notifications(transport),
++                            self.custom_notifications
++                                .capture(capture_event_notifications(transport)),
+                             Arc::clone(&self.tool_list_revision),
+                         ),
+                         lifecycle,
+@@ -1641,7 +1660,10 @@ impl RmcpClient {
+             } => (
+                 client_service()
+                     .serve_with_lifecycle(
+-                        track_tool_list_changes(transport, Arc::clone(&self.tool_list_revision)),
++                        track_tool_list_changes(
++                            self.custom_notifications.capture(transport),
++                            Arc::clone(&self.tool_list_revision),
++                        ),
+                         lifecycle,
+                     )
+                     .boxed(),
+@@ -1650,7 +1672,10 @@ impl RmcpClient {
+             PendingTransport::StreamableHttpWithAccessTokenOnly { transport } => (
+                 client_service()
+                     .serve_with_lifecycle(
+-                        track_tool_list_changes(transport, Arc::clone(&self.tool_list_revision)),
++                        track_tool_list_changes(
++                            self.custom_notifications.capture(transport),
++                            Arc::clone(&self.tool_list_revision),
++                        ),
+                         lifecycle,
+                     )
+                     .boxed(),
 -- 
 2.53.0
 

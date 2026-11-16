@@ -1,4 +1,4 @@
-From 8f3b24d82c429c0740431163d205750ef8a33b06 Mon Sep 17 00:00:00 2001
+From d74556ef5c2730cc513db3d5999ae58c9df79487 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 14:38:11 +0100
 Subject: [PATCH 3/4] codex-mcp: forward channel notifications of opted-in
@@ -10,13 +10,13 @@ session with an initialize handshake, forward its notifications/claude/channel
 notifications to a bounded per-thread queue that a host can take.
 ---
  codex-rs/codex-mcp/src/channel.rs         | 174 ++++++++++++++++++
- codex-rs/codex-mcp/src/channel_tests.rs   | 210 ++++++++++++++++++++++
+ codex-rs/codex-mcp/src/channel_tests.rs   | 212 ++++++++++++++++++++++
  codex-rs/codex-mcp/src/elicitation.rs     |  15 ++
  codex-rs/codex-mcp/src/lib.rs             |   7 +
  codex-rs/codex-mcp/src/resource_client.rs |   8 +
  codex-rs/codex-mcp/src/rmcp_client.rs     |   9 +
  codex-rs/codex-mcp/src/runtime.rs         |   8 +
- 7 files changed, 431 insertions(+)
+ 7 files changed, 433 insertions(+)
  create mode 100644 codex-rs/codex-mcp/src/channel.rs
  create mode 100644 codex-rs/codex-mcp/src/channel_tests.rs
 
@@ -202,10 +202,10 @@ index 0000000000..2d32eb1c7e
 +mod tests;
 diff --git a/codex-rs/codex-mcp/src/channel_tests.rs b/codex-rs/codex-mcp/src/channel_tests.rs
 new file mode 100644
-index 0000000000..8107e7a3f7
+index 0000000000..4bb85a0709
 --- /dev/null
 +++ b/codex-rs/codex-mcp/src/channel_tests.rs
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,212 @@
 +use std::sync::Arc;
 +use std::time::Duration;
 +
@@ -412,9 +412,11 @@ index 0000000000..8107e7a3f7
 +#[test]
 +fn hub_receiver_is_taken_once() {
 +    let hub = ChannelHub::default();
++    let [first, second] = [hub.clone(), hub];
 +
-+    assert!(hub.clone().take_receiver().is_some());
-+    assert!(hub.take_receiver().is_none());
++    assert!(first.take_receiver().is_some());
++    assert!(second.take_receiver().is_none());
++    assert!(first.take_receiver().is_none());
 +}
 diff --git a/codex-rs/codex-mcp/src/elicitation.rs b/codex-rs/codex-mcp/src/elicitation.rs
 index 46d1ad84fd..858cd7e12b 100644

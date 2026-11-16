@@ -55,6 +55,9 @@ two-way channel should expose a reply tool and explain the attributes in its ins
 
 ## Delivery
 
+- Each server's events reach the model in the order the server sent them, also when several
+  arrive at once. Codex takes them from the connection before the MCP SDK dispatches its
+  notifications, which it does concurrently.
 - An idle chat starts a turn for an event at once.
 - Events that arrive during a turn wait, in order, and are delivered together as one turn when
   the chat is next idle. After an interrupted turn they wait for the next event or completed

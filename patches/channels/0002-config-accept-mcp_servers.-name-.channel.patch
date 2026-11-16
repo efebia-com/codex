@@ -1,4 +1,4 @@
-From 0e810287f9e17ce206381d21e8b549ec54fd231b Mon Sep 17 00:00:00 2001
+From e10aa5801c1b5209a5ca2f56dd998602fb60d385 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 14:38:11 +0100
 Subject: [PATCH 2/4] config: accept mcp_servers.<name>.channel
