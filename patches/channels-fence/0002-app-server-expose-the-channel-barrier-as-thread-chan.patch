@@ -1,0 +1,685 @@
+From 54f650125f0d95009af2265d9252aeff595985ff Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 19:49:51 +0100
+Subject: [PATCH 2/3] app-server: expose the channel barrier as thread/channels
+ requests
+
+thread/channels/fence closes or opens a loaded thread's channel barrier,
+thread/channels/read reports it and can wait for it to drain, and
+thread/channels/release drops held input the client has kept. Reads are
+not serialized with the thread's other requests, so a waiting read never
+delays a turn or a steer. Errors carry a reason: threadNotFound,
+noChannels, fenceMismatch or fenceOpen.
+---
+ .../src/protocol/common.rs                    |  19 ++
+ .../src/protocol/v2/mod.rs                    |   2 +
+ .../src/protocol/v2/thread_channels.rs        | 221 ++++++++++++++++
+ codex-rs/app-server/src/extensions.rs         |   6 +-
+ codex-rs/app-server/src/mcp_refresh.rs        |   1 +
+ codex-rs/app-server/src/message_processor.rs  |  22 ++
+ codex-rs/app-server/src/request_processors.rs |   2 +
+ .../thread_channels_processor.rs              | 236 ++++++++++++++++++
+ 8 files changed, 508 insertions(+), 1 deletion(-)
+ create mode 100644 codex-rs/app-server-protocol/src/protocol/v2/thread_channels.rs
+ create mode 100644 codex-rs/app-server/src/request_processors/thread_channels_processor.rs
+
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+index 52ed76c606..87418a782d 100644
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -699,6 +699,25 @@ client_request_definitions! {
+         serialization: thread_id(params.thread_id),
+         response: v2::ThreadQueueStartResponse,
+     },
++    #[experimental("thread/channels/fence")]
++    ThreadChannelsFence => "thread/channels/fence" {
++        params: v2::ThreadChannelsFenceParams,
++        serialization: thread_id(params.thread_id),
++        response: v2::ThreadChannelsFenceResponse,
++    },
++    #[experimental("thread/channels/read")]
++    /// Not serialized with the thread's requests: a waiting read must not delay them.
++    ThreadChannelsRead => "thread/channels/read" {
++        params: v2::ThreadChannelsReadParams,
++        serialization: None,
++        response: v2::ThreadChannelsReadResponse,
++    },
++    #[experimental("thread/channels/release")]
++    ThreadChannelsRelease => "thread/channels/release" {
++        params: v2::ThreadChannelsReleaseParams,
++        serialization: thread_id(params.thread_id),
++        response: v2::ThreadChannelsReleaseResponse,
++    },
+     ThreadMetadataUpdate => "thread/metadata/update" {
+         params: v2::ThreadMetadataUpdateParams,
+         inspect_params: true,
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/mod.rs b/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
+index 96bb11c2aa..7d66cd3caa 100644
+--- a/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/mod.rs
+@@ -36,6 +36,7 @@ mod review;
+ mod rollout;
+ mod thread;
+ mod thread_attachment;
++mod thread_channels;
+ mod thread_data;
+ mod thread_prediction;
+ mod thread_sample;
+@@ -81,6 +82,7 @@ pub use rollout::*;
+ pub use shared::*;
+ pub use thread::*;
+ pub use thread_attachment::*;
++pub use thread_channels::*;
+ pub use thread_data::*;
+ pub use thread_prediction::*;
+ pub use thread_sample::*;
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/thread_channels.rs b/codex-rs/app-server-protocol/src/protocol/v2/thread_channels.rs
+new file mode 100644
+index 0000000000..bca8d2af21
+--- /dev/null
++++ b/codex-rs/app-server-protocol/src/protocol/v2/thread_channels.rs
+@@ -0,0 +1,221 @@
++//! The channel input barrier of a loaded thread.
++//!
++//! While the barrier is closed, input from MCP channel servers does not reach the model: each
++//! server stops accepting input, emits what it already accepted and then a marker. Input that
++//! reaches the thread meanwhile is held until it is released or the barrier opens again.
++
++use crate::JsonSchema;
++use crate::TS;
++use serde::Deserialize;
++use serde::Serialize;
++use serde_json::Value as JsonValue;
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadChannelsFenceParams {
++    pub thread_id: String,
++    /// Close (`true`) or open (`false`) the barrier. Closing an open barrier picks a new fence
++    /// id; closing a closed one changes nothing. Opening delivers the held input.
++    pub closed: bool,
++    /// The current fence id. Required to open a closed barrier; when given while closing, a
++    /// barrier closed under another id is an error.
++    #[ts(optional = nullable)]
++    pub expected_fence_id: Option<String>,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadChannelsFenceResponse {
++    pub barrier: ChannelBarrier,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadChannelsReadParams {
++    pub thread_id: String,
++    /// While the barrier is closed and not drained, wait for it to drain or open, up to this
++    /// many milliseconds (at most 60000). The current state is returned either way.
++    #[ts(type = "number | null")]
++    #[ts(optional = nullable)]
++    pub wait_drained_ms: Option<i64>,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadChannelsReadResponse {
++    pub barrier: ChannelBarrier,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadChannelsReleaseParams {
++    pub thread_id: String,
++    /// The current fence id.
++    pub fence_id: String,
++    /// Held input with this sequence number or lower, kept by the caller, is dropped.
++    #[ts(type = "number")]
++    pub through_seq: i64,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadChannelsReleaseResponse {
++    pub barrier: ChannelBarrier,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ChannelBarrier {
++    pub closed: bool,
++    pub fence_id: Option<String>,
++    /// Unix time in milliseconds when the barrier closed.
++    #[ts(type = "number | null")]
++    pub since: Option<i64>,
++    /// Closed, and nothing in `blockedBy`. The outcome is certain only if `uncertain` is empty.
++    pub drained: bool,
++    pub blocked_by: Vec<ChannelBarrierBlock>,
++    pub uncertain: Vec<ChannelBarrierUncertainty>,
++    pub servers: Vec<ChannelBarrierServer>,
++    /// Input that reached the thread and was not handed to the model, oldest first.
++    pub held: Vec<ChannelHeldInput>,
++    /// Input handed to a turn and not yet recorded.
++    pub in_flight: Vec<ChannelInFlightInput>,
++    pub dropped: ChannelDropped,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub enum ChannelBlockReason {
++    MarkerPending,
++    Launching,
++    Recovering,
++    GaveUp,
++    Unsupported,
++    Failed,
++    InFlight,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ChannelBarrierBlock {
++    pub reason: ChannelBlockReason,
++    pub server: Option<String>,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub enum ChannelUncertainReason {
++    /// A connection that could accept input ended before emitting its marker.
++    ExitedBeforeMarker,
++    /// A server sent input after its marker.
++    LateAfterMarker,
++    /// Input was dropped by a full queue or for invalid content after the barrier closed.
++    DroppedSinceClose,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ChannelBarrierUncertainty {
++    pub reason: ChannelUncertainReason,
++    pub server: Option<String>,
++    #[ts(type = "number | null")]
++    pub generation: Option<i64>,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub enum ChannelServerConnection {
++    Launching,
++    Ready,
++    Recovering,
++    FencedWaiting,
++    GaveUp,
++    Closed,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub enum ChannelServerFence {
++    Open,
++    Requested,
++    Acknowledged,
++    Unsupported,
++    Failed,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ChannelBarrierServer {
++    pub name: String,
++    /// The server's current connection; 0 before its first one.
++    #[ts(type = "number")]
++    pub generation: i64,
++    pub pid: Option<u32>,
++    pub connection: ChannelServerConnection,
++    pub fence: ChannelServerFence,
++    pub fence_error: Option<String>,
++    /// The current connection's marker for this fence arrived.
++    pub marker_seen: bool,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ChannelHeldInput {
++    #[ts(type = "number")]
++    pub seq: i64,
++    pub server: String,
++    #[ts(type = "number")]
++    pub generation: i64,
++    /// The notification's content and meta, as the server sent them.
++    pub content: String,
++    pub meta: Option<JsonValue>,
++    /// Returned to the queue after a turn that did not record it.
++    pub requeued: bool,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub enum ChannelInFlightPath {
++    /// Steered into an active turn.
++    Steered,
++    /// Started its own turn.
++    Started,
++}
++
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ChannelInFlightInput {
++    #[ts(type = "number")]
++    pub seq: i64,
++    pub server: String,
++    pub turn_id: String,
++    pub path: ChannelInFlightPath,
++}
++
++/// Notifications dropped since the thread started.
++#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ChannelDropped {
++    #[ts(type = "number")]
++    pub queue_full: i64,
++    #[ts(type = "number")]
++    pub invalid: i64,
++}
+diff --git a/codex-rs/app-server/src/extensions.rs b/codex-rs/app-server/src/extensions.rs
+index 138e6d931b..77d9803b09 100644
+--- a/codex-rs/app-server/src/extensions.rs
++++ b/codex-rs/app-server/src/extensions.rs
+@@ -47,6 +47,8 @@ pub(crate) struct ThreadExtensionDependencies {
+     /// Process-scoped queue shared by idle dispatch and app-server requests.
+     pub(crate) queue_service: Option<Arc<QueuedItemService>>,
+     pub(crate) turn_start_admission: Option<Arc<dyn TurnStartAdmission>>,
++    /// Channel delivery, shared with the `thread/channels/*` requests.
++    pub(crate) channels: Arc<codex_channels_extension::ChannelsExtension>,
+ }
+ 
+ pub(crate) fn thread_extensions(
+@@ -68,6 +70,7 @@ pub(crate) fn thread_extensions(
+         http_client_factory,
+         queue_service,
+         turn_start_admission,
++        channels,
+     } = dependencies;
+     let mut builder = ExtensionRegistryBuilder::<Config>::with_event_sink(Arc::clone(&event_sink));
+     if config
+@@ -84,7 +87,8 @@ pub(crate) fn thread_extensions(
+     }
+     codex_history_notes_extension::install(&mut builder, auth_manager.clone());
+     crate::install_agent_message_board(&mut builder, thread_manager.clone());
+-    codex_channels_extension::install(&mut builder, thread_manager.clone());
++    channels.attach(thread_manager.clone());
++    codex_channels_extension::register(&mut builder, channels);
+     if let Some(state_db) = state_db {
+         codex_goal_extension::install_with_backend(
+             &mut builder,
+diff --git a/codex-rs/app-server/src/mcp_refresh.rs b/codex-rs/app-server/src/mcp_refresh.rs
+index 4a6e7daae2..2740935da9 100644
+--- a/codex-rs/app-server/src/mcp_refresh.rs
++++ b/codex-rs/app-server/src/mcp_refresh.rs
+@@ -564,6 +564,7 @@ enabled = false
+                         http_client_factory: good_config.http_client_factory(),
+                         queue_service: None,
+                         turn_start_admission: None,
++                        channels: Arc::default(),
+                     },
+                 ),
+                 Arc::new(CodexHomeUserInstructionsProvider::new(
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 4bf10fc6cc..345dcf2af7 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -44,6 +44,7 @@ use crate::request_processors::ProcessExecRequestProcessor;
+ use crate::request_processors::ProjectRequestProcessor;
+ use crate::request_processors::RemoteControlRequestProcessor;
+ use crate::request_processors::SearchRequestProcessor;
++use crate::request_processors::ThreadChannelsRequestProcessor;
+ use crate::request_processors::ThreadGoalRequestProcessor;
+ use crate::request_processors::ThreadQueueRequestProcessor;
+ use crate::request_processors::ThreadRequestProcessor;
+@@ -177,6 +178,7 @@ pub(crate) struct MessageProcessor {
+     search_processor: SearchRequestProcessor,
+     thread_goal_processor: ThreadGoalRequestProcessor,
+     thread_queue_processor: ThreadQueueRequestProcessor,
++    thread_channels_processor: ThreadChannelsRequestProcessor,
+     thread_processor: ThreadRequestProcessor,
+     turn_processor: TurnRequestProcessor,
+     windows_sandbox_processor: WindowsSandboxRequestProcessor,
+@@ -366,6 +368,7 @@ impl MessageProcessor {
+         let extension_event_sink =
+             app_server_extension_event_sink(outgoing.clone(), thread_state_manager.clone());
+         let mut queue_service = None;
++        let channels = Arc::new(codex_channels_extension::ChannelsExtension::default());
+         let sample_responses = Arc::new(crate::thread_sample::SampleResponseRegistry::default());
+         let thread_manager = Arc::new_cyclic(|thread_manager| {
+             queue_service = queue_store.map(|queue| {
+@@ -404,6 +407,7 @@ impl MessageProcessor {
+                         http_client_factory: config.http_client_factory(),
+                         queue_service: queue_service.clone(),
+                         turn_start_admission: Some(Arc::clone(&turn_start_admission)),
++                        channels: Arc::clone(&channels),
+                     },
+                 ),
+                 Arc::new(CodexHomeUserInstructionsProvider::new(
+@@ -553,6 +557,8 @@ impl MessageProcessor {
+             config_manager.clone(),
+             queue_service,
+         );
++        let thread_channels_processor =
++            ThreadChannelsRequestProcessor::new(Arc::clone(&thread_manager), channels);
+         let project_processor = ProjectRequestProcessor::new(
+             Arc::clone(&thread_store),
+             outgoing.clone(),
+@@ -672,6 +678,7 @@ impl MessageProcessor {
+             search_processor,
+             thread_goal_processor,
+             thread_queue_processor,
++            thread_channels_processor,
+             thread_processor,
+             turn_processor,
+             windows_sandbox_processor,
+@@ -1490,6 +1497,21 @@ impl MessageProcessor {
+                 .start(&request_id, params)
+                 .await
+                 .map(|response| Some(response.into())),
++            ClientRequest::ThreadChannelsFence { params, .. } => self
++                .thread_channels_processor
++                .fence(params)
++                .await
++                .map(|response| Some(response.into())),
++            ClientRequest::ThreadChannelsRead { params, .. } => self
++                .thread_channels_processor
++                .read(params)
++                .await
++                .map(|response| Some(response.into())),
++            ClientRequest::ThreadChannelsRelease { params, .. } => self
++                .thread_channels_processor
++                .release(params)
++                .await
++                .map(|response| Some(response.into())),
+             ClientRequest::ThreadMetadataUpdate { params, .. } => {
+                 self.thread_processor.thread_metadata_update(params).await
+             }
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index 82dbae7584..b7fd710a3d 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -573,6 +573,7 @@ mod thread_fork_goal;
+ mod thread_input;
+ mod thread_memory;
+ mod thread_processor;
++mod thread_channels_processor;
+ mod thread_queue_processor;
+ mod thread_read_state;
+ mod thread_sections;
+@@ -603,6 +604,7 @@ pub(crate) use search::SearchRequestProcessor;
+ pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
+ pub(crate) use thread_processor::ThreadRequestProcessor;
+ pub(crate) use thread_processor::ThreadResumeTarget;
++pub(crate) use thread_channels_processor::ThreadChannelsRequestProcessor;
+ pub(crate) use thread_queue_processor::ThreadQueueRequestProcessor;
+ pub(crate) use turn_processor::TurnRequestProcessor;
+ pub(crate) use windows_sandbox_processor::WindowsSandboxRequestProcessor;
+diff --git a/codex-rs/app-server/src/request_processors/thread_channels_processor.rs b/codex-rs/app-server/src/request_processors/thread_channels_processor.rs
+new file mode 100644
+index 0000000000..30426e4d8e
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/thread_channels_processor.rs
+@@ -0,0 +1,236 @@
++//! `thread/channels/*`: the channel input barrier of a loaded thread.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use codex_app_server_protocol::ChannelBarrier;
++use codex_app_server_protocol::ChannelBarrierBlock;
++use codex_app_server_protocol::ChannelBarrierServer;
++use codex_app_server_protocol::ChannelBarrierUncertainty;
++use codex_app_server_protocol::ChannelBlockReason;
++use codex_app_server_protocol::ChannelDropped;
++use codex_app_server_protocol::ChannelHeldInput;
++use codex_app_server_protocol::ChannelInFlightInput;
++use codex_app_server_protocol::ChannelInFlightPath;
++use codex_app_server_protocol::ChannelServerConnection;
++use codex_app_server_protocol::ChannelServerFence;
++use codex_app_server_protocol::ChannelUncertainReason;
++use codex_app_server_protocol::JSONRPCErrorError;
++use codex_app_server_protocol::ThreadChannelsFenceParams;
++use codex_app_server_protocol::ThreadChannelsFenceResponse;
++use codex_app_server_protocol::ThreadChannelsReadParams;
++use codex_app_server_protocol::ThreadChannelsReadResponse;
++use codex_app_server_protocol::ThreadChannelsReleaseParams;
++use codex_app_server_protocol::ThreadChannelsReleaseResponse;
++use codex_channels_extension::BarrierError;
++use codex_channels_extension::ChannelsExtension;
++use codex_channels_extension::barrier;
++use codex_core::ThreadManager;
++use codex_mcp::ChannelConnection;
++use codex_mcp::ServerFence;
++use codex_protocol::ThreadId;
++
++use crate::error_code::invalid_params;
++use crate::error_code::invalid_request;
++
++pub(crate) struct ThreadChannelsRequestProcessor {
++    thread_manager: Arc<ThreadManager>,
++    channels: Arc<ChannelsExtension>,
++}
++
++impl ThreadChannelsRequestProcessor {
++    pub(crate) fn new(
++        thread_manager: Arc<ThreadManager>,
++        channels: Arc<ChannelsExtension>,
++    ) -> Self {
++        Self {
++            thread_manager,
++            channels,
++        }
++    }
++
++    pub(crate) async fn fence(
++        &self,
++        params: ThreadChannelsFenceParams,
++    ) -> Result<ThreadChannelsFenceResponse, JSONRPCErrorError> {
++        let thread_id = self.loaded_thread(&params.thread_id).await?;
++        let barrier = self
++            .channels
++            .fence(thread_id, params.closed, params.expected_fence_id)
++            .await
++            .map_err(barrier_error)?;
++        Ok(ThreadChannelsFenceResponse {
++            barrier: api_barrier(barrier),
++        })
++    }
++
++    pub(crate) async fn read(
++        &self,
++        params: ThreadChannelsReadParams,
++    ) -> Result<ThreadChannelsReadResponse, JSONRPCErrorError> {
++        let thread_id = self.loaded_thread(&params.thread_id).await?;
++        let wait = params
++            .wait_drained_ms
++            .and_then(|ms| u64::try_from(ms).ok())
++            .map(Duration::from_millis);
++        let barrier = self
++            .channels
++            .read(thread_id, wait)
++            .await
++            .map_err(barrier_error)?;
++        Ok(ThreadChannelsReadResponse {
++            barrier: api_barrier(barrier),
++        })
++    }
++
++    pub(crate) async fn release(
++        &self,
++        params: ThreadChannelsReleaseParams,
++    ) -> Result<ThreadChannelsReleaseResponse, JSONRPCErrorError> {
++        let thread_id = self.loaded_thread(&params.thread_id).await?;
++        let through_seq = u64::try_from(params.through_seq)
++            .map_err(|_| invalid_params("throughSeq must not be negative"))?;
++        let barrier = self
++            .channels
++            .release(thread_id, params.fence_id, through_seq)
++            .await
++            .map_err(barrier_error)?;
++        Ok(ThreadChannelsReleaseResponse {
++            barrier: api_barrier(barrier),
++        })
++    }
++
++    async fn loaded_thread(&self, thread_id: &str) -> Result<ThreadId, JSONRPCErrorError> {
++        let parsed = ThreadId::from_string(thread_id).map_err(|_| {
++            reason_error("threadNotFound", format!("invalid thread id {thread_id}"))
++        })?;
++        self.thread_manager.get_thread(parsed).await.map_err(|_| {
++            reason_error(
++                "threadNotFound",
++                format!("thread {thread_id} is not loaded"),
++            )
++        })?;
++        Ok(parsed)
++    }
++}
++
++fn reason_error(reason: &str, message: impl Into<String>) -> JSONRPCErrorError {
++    let mut error = invalid_request(message);
++    error.data = Some(serde_json::json!({ "reason": reason }));
++    error
++}
++
++fn barrier_error(error: BarrierError) -> JSONRPCErrorError {
++    let reason = match &error {
++        BarrierError::NoChannels => "noChannels",
++        BarrierError::FenceMismatch { .. } => "fenceMismatch",
++        BarrierError::FenceOpen => "fenceOpen",
++    };
++    reason_error(reason, error.to_string())
++}
++
++fn number(value: u64) -> i64 {
++    i64::try_from(value).unwrap_or(i64::MAX)
++}
++
++fn api_barrier(barrier: barrier::ChannelBarrier) -> ChannelBarrier {
++    ChannelBarrier {
++        closed: barrier.closed,
++        fence_id: barrier.fence_id,
++        since: barrier.since_ms,
++        drained: barrier.drained,
++        blocked_by: barrier
++            .blocked_by
++            .into_iter()
++            .map(|block| ChannelBarrierBlock {
++                reason: match block.reason {
++                    barrier::BlockReason::MarkerPending => ChannelBlockReason::MarkerPending,
++                    barrier::BlockReason::Launching => ChannelBlockReason::Launching,
++                    barrier::BlockReason::Recovering => ChannelBlockReason::Recovering,
++                    barrier::BlockReason::GaveUp => ChannelBlockReason::GaveUp,
++                    barrier::BlockReason::Unsupported => ChannelBlockReason::Unsupported,
++                    barrier::BlockReason::Failed => ChannelBlockReason::Failed,
++                    barrier::BlockReason::InFlight => ChannelBlockReason::InFlight,
++                },
++                server: block.server,
++            })
++            .collect(),
++        uncertain: barrier
++            .uncertain
++            .into_iter()
++            .map(|uncertainty| ChannelBarrierUncertainty {
++                reason: match uncertainty.reason {
++                    barrier::UncertainReason::ExitedBeforeMarker => {
++                        ChannelUncertainReason::ExitedBeforeMarker
++                    }
++                    barrier::UncertainReason::LateAfterMarker => {
++                        ChannelUncertainReason::LateAfterMarker
++                    }
++                    barrier::UncertainReason::DroppedSinceClose => {
++                        ChannelUncertainReason::DroppedSinceClose
++                    }
++                },
++                server: uncertainty.server,
++                generation: uncertainty.generation.map(number),
++            })
++            .collect(),
++        servers: barrier
++            .servers
++            .into_iter()
++            .map(|server| {
++                let (fence, fence_error) = match server.fence {
++                    ServerFence::Open => (ChannelServerFence::Open, None),
++                    ServerFence::Requested => (ChannelServerFence::Requested, None),
++                    ServerFence::Acknowledged => (ChannelServerFence::Acknowledged, None),
++                    ServerFence::Unsupported => (ChannelServerFence::Unsupported, None),
++                    ServerFence::Failed(error) => (ChannelServerFence::Failed, Some(error)),
++                };
++                ChannelBarrierServer {
++                    name: server.name,
++                    generation: number(server.generation),
++                    pid: server.pid,
++                    connection: match server.connection {
++                        ChannelConnection::Launching => ChannelServerConnection::Launching,
++                        ChannelConnection::Ready => ChannelServerConnection::Ready,
++                        ChannelConnection::Recovering => ChannelServerConnection::Recovering,
++                        ChannelConnection::FencedWaiting => ChannelServerConnection::FencedWaiting,
++                        ChannelConnection::GaveUp => ChannelServerConnection::GaveUp,
++                        ChannelConnection::Closed => ChannelServerConnection::Closed,
++                    },
++                    fence,
++                    fence_error,
++                    marker_seen: server.marker_seen,
++                }
++            })
++            .collect(),
++        held: barrier
++            .held
++            .into_iter()
++            .map(|input| ChannelHeldInput {
++                seq: number(input.seq),
++                server: input.server,
++                generation: number(input.generation),
++                content: input.content,
++                meta: input.meta,
++                requeued: input.requeued,
++            })
++            .collect(),
++        in_flight: barrier
++            .in_flight
++            .into_iter()
++            .map(|input| ChannelInFlightInput {
++                seq: number(input.seq),
++                server: input.server,
++                turn_id: input.turn_id,
++                path: match input.path {
++                    barrier::InFlightPath::Steered => ChannelInFlightPath::Steered,
++                    barrier::InFlightPath::Started => ChannelInFlightPath::Started,
++                },
++            })
++            .collect(),
++        dropped: ChannelDropped {
++            queue_full: number(barrier.dropped.queue_full),
++            invalid: number(barrier.dropped.invalid),
++        },
++    }
++}
+-- 
+2.53.0
+

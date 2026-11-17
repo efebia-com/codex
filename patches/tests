@@ -51,3 +51,6 @@ mcp-fence: -p codex-mcp --lib restart::
 mcp-fence: -p codex-channels-extension
 mcp-fence: -p codex-app-server --test all suite::v2::mcp_restart::
 mcp-fence: -p codex-app-server --test all suite::v2::mcp_channels::
+
+channels-fence: -p codex-channels-extension
+channels-fence: -p codex-app-server --test all mcp_channels::fence

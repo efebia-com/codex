@@ -21,17 +21,15 @@ pending tool results, keep their server's FIFO order, and are visible in history
 resumed threads. No additional turn starts. Notifications from other servers wait for idle.
 Review, compact, finishing and other turns that reject steering use the existing idle path.
 
-A steered batch stays in memory until the core confirms that its user message was recorded.
-On interrupt, unconfirmed batches return to the head of the queue in order. Interrupt does not
+A batch stays in memory until the core confirms that its user message was recorded. This
+holds for batches steered into an active turn and for batches that start their own turn when
+the thread is idle, including the idle fallback when `channel_during_turn = true`. On
+interrupt, unconfirmed batches return to the head of the queue in order. A batch whose turn
+was cancelled before it started returns when the next regular turn starts. Interrupt does not
 restart work: they wait for a new notification, a completed turn or the next regular turn.
 A normal turn completion discards unconfirmed input with a warning, so an input hook that
 blocks a message cannot create a retry loop. The limit of 64 waiting events includes
-unconfirmed steered batches.
-
-Idle delivery removes a batch from the queue as soon as the thread accepts a new turn, without
-waiting for a recording confirmation. An abort before recording can therefore lose that batch.
-This also applies to the idle fallback when `channel_during_turn = true`; recovery applies only
-to batches accepted by steering an active turn.
+unconfirmed batches.
 
 Pending and unconfirmed events have no durability after process exit. A cancellation between
 recording and confirmation may cause a repeat. Recorded user input follows ordinary history,

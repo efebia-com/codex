@@ -1,0 +1,1692 @@
+From 94208a4660567f35dc7c01655dbd181af4c02478 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 19:49:51 +0100
+Subject: [PATCH 1/3] channels: hold channel input behind a per-thread barrier
+
+A host can close a thread's channel barrier before it captures the
+thread. While it is closed, no channel input reaches the model: input
+that reaches the thread is held in order with a sequence number, and
+input a turn did not record is held instead of discarded. Closing asks
+the servers to stop accepting input; each answers with a marker after
+the input it accepted before, which is never shown to the model.
+
+A snapshot reports the held and in-flight input, the servers' connection
+and fence state, what still blocks the drain and what may have been
+lost. The host releases held input it kept elsewhere, by sequence number,
+or opens the barrier, which delivers it.
+---
+ codex-rs/ext/channels/Cargo.toml            |   3 +-
+ codex-rs/ext/channels/README.md             |  24 ++
+ codex-rs/ext/channels/src/barrier.rs        | 351 +++++++++++++++++
+ codex-rs/ext/channels/src/barrier_tests.rs  | 273 +++++++++++++
+ codex-rs/ext/channels/src/delivery.rs       | 402 ++++++++++++++++++--
+ codex-rs/ext/channels/src/delivery_tests.rs | 204 +++++++++-
+ codex-rs/ext/channels/src/lib.rs            | 111 +++++-
+ 7 files changed, 1337 insertions(+), 31 deletions(-)
+ create mode 100644 codex-rs/ext/channels/src/barrier.rs
+ create mode 100644 codex-rs/ext/channels/src/barrier_tests.rs
+
+diff --git a/codex-rs/ext/channels/Cargo.toml b/codex-rs/ext/channels/Cargo.toml
+index f61871bc8e..c446bf0b6d 100644
+--- a/codex-rs/ext/channels/Cargo.toml
++++ b/codex-rs/ext/channels/Cargo.toml
+@@ -18,8 +18,9 @@ codex-extension-api = { workspace = true }
+ codex-mcp = { workspace = true }
+ codex-protocol = { workspace = true }
+ serde_json = { workspace = true }
+-tokio = { workspace = true, features = ["rt", "sync"] }
++tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+ tracing = { workspace = true }
++uuid = { workspace = true, features = ["v4"] }
+ 
+ [dev-dependencies]
+ anyhow = { workspace = true }
+diff --git a/codex-rs/ext/channels/README.md b/codex-rs/ext/channels/README.md
+index 81670f1bb6..6cb118985d 100644
+--- a/codex-rs/ext/channels/README.md
++++ b/codex-rs/ext/channels/README.md
+@@ -40,6 +40,30 @@ goes only to the root thread; channel servers are not started in sub-agents.
+ The server receives no delivery acknowledgement. Expose a reply tool when it needs a response.
+ Permission relay and channels contributed by plugins remain outside this extension.
+ 
++## Input barrier
++
++A host can stop channel input before it captures a thread, with the app-server requests
++`thread/channels/fence`, `thread/channels/read` and `thread/channels/release` (experimental).
++While the barrier is closed nothing reaches the model; user turns, steering and thread reads
++work as usual.
++
++Closing asks every channel server that declares the `channel/fence` experimental capability to
++stop accepting input. The server answers the `channel/fence` request `{closed, token}` after it
++has emitted every input it accepted before, followed by a marker: a channel notification with
++empty content and `meta.fence` set to the token. A marker is never shown to the model. Every
++`initialize` carries the current state as `experimental["channel/fence"] = {closed, token}`,
++so a server that restarts while the barrier is closed starts closed.
++
++Input that reaches the thread while the barrier is closed is held in order, with a sequence
++number. Input already handed to a turn stays in flight until recorded; if the turn does not
++record it, it is held too. A read reports the held and in-flight input, each server's
++connection and fence state, what still blocks the drain and what may have been lost:
++a connection that ended before its marker, input after a marker, or drops since closing.
++The barrier is drained when it is closed and nothing blocks it. The host then keeps the held
++input and releases it by sequence number, or opens the barrier, which delivers it.
++
++Held input lives in memory: it is lost if the process exits or the thread stops first.
++
+ Validation commands:
+ 
+ ```sh
+diff --git a/codex-rs/ext/channels/src/barrier.rs b/codex-rs/ext/channels/src/barrier.rs
+new file mode 100644
+index 0000000000..fb1a5adbd7
+--- /dev/null
++++ b/codex-rs/ext/channels/src/barrier.rs
+@@ -0,0 +1,351 @@
++//! The channel input barrier of a thread.
++//!
++//! A host closes the barrier before it captures a thread's state. From then on no channel input
++//! reaches the model: each server is asked to stop accepting input, to emit what it already
++//! accepted and then a marker notification carrying the fence id. Input that reaches the thread
++//! meanwhile is held, in order, until the host releases it (after keeping it elsewhere) or opens
++//! the barrier again, which delivers it. A snapshot says what still blocks the drain and what may
++//! have been lost on the way, so the host can tell a certain outcome from an indeterminate one.
++
++use std::collections::BTreeMap;
++use std::collections::BTreeSet;
++use std::collections::HashMap;
++use std::fmt;
++
++use codex_mcp::ChannelConnection;
++use codex_mcp::ChannelServerState;
++use codex_mcp::ServerFence;
++use serde_json::Value;
++
++/// `meta` key of the marker notification that ends a server's input before a fence.
++pub const FENCE_META_KEY: &str = "fence";
++
++/// A snapshot of a thread's channel barrier.
++#[derive(Clone, Debug, PartialEq)]
++pub struct ChannelBarrier {
++    pub closed: bool,
++    pub fence_id: Option<String>,
++    /// Unix time in milliseconds when the barrier closed.
++    pub since_ms: Option<i64>,
++    /// Closed, and nothing in `blocked_by`.
++    pub drained: bool,
++    pub blocked_by: Vec<Block>,
++    pub uncertain: Vec<Uncertainty>,
++    pub servers: Vec<ServerBarrier>,
++    /// Input that reached the thread and was not handed to the model, oldest first.
++    pub held: Vec<HeldInput>,
++    /// Input handed to a turn and not yet recorded.
++    pub in_flight: Vec<InFlightInput>,
++    pub dropped: Dropped,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum BlockReason {
++    MarkerPending,
++    Launching,
++    Recovering,
++    GaveUp,
++    Unsupported,
++    Failed,
++    InFlight,
++}
++
++/// Why the barrier is not drained yet.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Block {
++    pub reason: BlockReason,
++    pub server: Option<String>,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum UncertainReason {
++    /// A connection that could accept input ended before emitting its marker.
++    ExitedBeforeMarker,
++    /// A server sent input after its marker.
++    LateAfterMarker,
++    /// Input was dropped by a full queue or for invalid content after the barrier closed.
++    DroppedSinceClose,
++}
++
++/// Why the outcome may be incomplete even when the barrier is drained.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Uncertainty {
++    pub reason: UncertainReason,
++    pub server: Option<String>,
++    pub generation: Option<u64>,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct ServerBarrier {
++    pub name: String,
++    pub generation: u64,
++    pub pid: Option<u32>,
++    pub connection: ChannelConnection,
++    pub fence: ServerFence,
++    pub marker_seen: bool,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct HeldInput {
++    pub seq: u64,
++    pub server: String,
++    pub generation: u64,
++    /// The notification's content and meta, as the server sent them.
++    pub content: String,
++    pub meta: Option<Value>,
++    /// Returned to the queue after a turn that did not record it.
++    pub requeued: bool,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum InFlightPath {
++    /// Steered into an active turn.
++    Steered,
++    /// Started its own turn.
++    Started,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct InFlightInput {
++    pub seq: u64,
++    pub server: String,
++    pub turn_id: String,
++    pub path: InFlightPath,
++}
++
++/// Notifications dropped since the thread started.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct Dropped {
++    pub queue_full: u64,
++    pub invalid: u64,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum BarrierError {
++    /// The thread has no channel servers, or is gone.
++    NoChannels,
++    /// The barrier is closed under another fence id.
++    FenceMismatch { current: Option<String> },
++    /// The request needs a closed barrier.
++    FenceOpen,
++}
++
++impl fmt::Display for BarrierError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::NoChannels => write!(f, "the thread has no channel servers"),
++            Self::FenceMismatch {
++                current: Some(current),
++            } => write!(f, "the channel barrier is closed under fence {current}"),
++            Self::FenceMismatch { current: None } => write!(f, "the channel barrier is open"),
++            Self::FenceOpen => write!(f, "the channel barrier is open"),
++        }
++    }
++}
++
++impl std::error::Error for BarrierError {}
++
++/// The state of a closed barrier, kept by the thread's channel worker.
++pub(crate) struct Fence {
++    pub(crate) id: String,
++    since_ms: i64,
++    /// Drops counted when the barrier closed.
++    dropped_at_close: u64,
++    /// The generation of each server when the barrier closed.
++    generation_at_close: HashMap<String, u64>,
++    /// For each server and generation seen while closed: whether its initialize carried this
++    /// fence closed, so that connection never accepted input.
++    started_closed: HashMap<String, BTreeMap<u64, bool>>,
++    /// Generations whose marker for this fence arrived.
++    markers: BTreeSet<(String, u64)>,
++    /// Generations that sent input after their marker.
++    late: BTreeSet<(String, u64)>,
++}
++
++impl Fence {
++    pub(crate) fn new(
++        id: String,
++        since_ms: i64,
++        servers: &[ChannelServerState],
++        dropped_at_close: u64,
++    ) -> Self {
++        let mut fence = Self {
++            id,
++            since_ms,
++            dropped_at_close,
++            generation_at_close: servers
++                .iter()
++                .map(|server| (server.server.clone(), server.generation))
++                .collect(),
++            started_closed: HashMap::new(),
++            markers: BTreeSet::new(),
++            late: BTreeSet::new(),
++        };
++        fence.observe(servers);
++        fence
++    }
++
++    /// Records the connections in `servers`. A connection is recorded once, when first seen.
++    pub(crate) fn observe(&mut self, servers: &[ChannelServerState]) {
++        for server in servers.iter().filter(|server| server.generation > 0) {
++            let started_closed = server
++                .init_fence
++                .as_ref()
++                .is_some_and(|init| init.closed && init.token.as_deref() == Some(self.id.as_str()));
++            self.started_closed
++                .entry(server.server.clone())
++                .or_default()
++                .entry(server.generation)
++                .or_insert(started_closed);
++        }
++    }
++
++    /// A marker for `token` from `server` over connection `generation`.
++    pub(crate) fn marker(&mut self, server: &str, generation: u64, token: &str) {
++        if token == self.id {
++            self.markers.insert((server.to_string(), generation));
++        }
++    }
++
++    /// Input from `server` over connection `generation`; notes it when it follows the marker.
++    pub(crate) fn input(&mut self, server: &str, generation: u64) {
++        let key = (server.to_string(), generation);
++        if self.markers.contains(&key) {
++            self.late.insert(key);
++        }
++    }
++
++    fn marker_seen(&self, server: &ChannelServerState) -> bool {
++        self.markers
++            .contains(&(server.server.clone(), server.generation))
++    }
++
++    fn blocks(&self, server: &ChannelServerState) -> Option<BlockReason> {
++        if server.generation == 0 {
++            return None;
++        }
++        match server.connection {
++            ChannelConnection::Launching => Some(BlockReason::Launching),
++            ChannelConnection::Recovering => Some(BlockReason::Recovering),
++            ChannelConnection::GaveUp => Some(BlockReason::GaveUp),
++            ChannelConnection::FencedWaiting | ChannelConnection::Closed => None,
++            ChannelConnection::Ready => match server.fence {
++                ServerFence::Failed(_) => Some(BlockReason::Failed),
++                ServerFence::Unsupported => Some(BlockReason::Unsupported),
++                _ if !self.marker_seen(server) => Some(BlockReason::MarkerPending),
++                _ => None,
++            },
++        }
++    }
++
++    /// Connections of `server`, since the barrier closed, that ended without their marker and
++    /// may have accepted input.
++    fn ended_without_marker(&self, server: &ChannelServerState) -> Vec<u64> {
++        let first = self
++            .generation_at_close
++            .get(&server.server)
++            .copied()
++            .unwrap_or(0)
++            .max(1);
++        let started_closed = self.started_closed.get(&server.server);
++        (first..=server.generation)
++            .filter(|generation| {
++                *generation < server.generation || server.connection != ChannelConnection::Ready
++            })
++            .filter(|generation| {
++                !self.markers.contains(&(server.server.clone(), *generation))
++                    && !started_closed
++                        .and_then(|generations| generations.get(generation))
++                        .copied()
++                        .unwrap_or(false)
++            })
++            .collect()
++    }
++}
++
++/// What the worker knows besides the servers: its queues and drop counters.
++pub(crate) struct QueueView {
++    pub(crate) held: Vec<HeldInput>,
++    pub(crate) in_flight: Vec<InFlightInput>,
++    pub(crate) dropped: Dropped,
++}
++
++/// Builds the snapshot. `dropped_upstream` counts drops before the worker's queue.
++pub(crate) fn snapshot(
++    fence: Option<&Fence>,
++    servers: &[ChannelServerState],
++    queue: QueueView,
++    dropped_upstream: u64,
++) -> ChannelBarrier {
++    let dropped = Dropped {
++        queue_full: queue.dropped.queue_full + dropped_upstream,
++        invalid: queue.dropped.invalid,
++    };
++    let server_barriers = servers
++        .iter()
++        .map(|server| ServerBarrier {
++            name: server.server.clone(),
++            generation: server.generation,
++            pid: server.pid,
++            connection: server.connection,
++            fence: server.fence.clone(),
++            marker_seen: fence.is_some_and(|fence| fence.marker_seen(server)),
++        })
++        .collect();
++    let mut blocked_by = Vec::new();
++    let mut uncertain = Vec::new();
++    if let Some(fence) = fence {
++        for server in servers {
++            if let Some(reason) = fence.blocks(server) {
++                blocked_by.push(Block {
++                    reason,
++                    server: Some(server.server.clone()),
++                });
++            }
++            uncertain.extend(
++                fence
++                    .ended_without_marker(server)
++                    .into_iter()
++                    .map(|generation| Uncertainty {
++                        reason: UncertainReason::ExitedBeforeMarker,
++                        server: Some(server.server.clone()),
++                        generation: Some(generation),
++                    }),
++            );
++        }
++        uncertain.extend(fence.late.iter().map(|(server, generation)| Uncertainty {
++            reason: UncertainReason::LateAfterMarker,
++            server: Some(server.clone()),
++            generation: Some(*generation),
++        }));
++        if dropped.queue_full + dropped.invalid > fence.dropped_at_close {
++            uncertain.push(Uncertainty {
++                reason: UncertainReason::DroppedSinceClose,
++                server: None,
++                generation: None,
++            });
++        }
++        if !queue.in_flight.is_empty() {
++            blocked_by.push(Block {
++                reason: BlockReason::InFlight,
++                server: None,
++            });
++        }
++    }
++    ChannelBarrier {
++        closed: fence.is_some(),
++        fence_id: fence.map(|fence| fence.id.clone()),
++        since_ms: fence.map(|fence| fence.since_ms),
++        drained: fence.is_some() && blocked_by.is_empty(),
++        blocked_by,
++        uncertain,
++        servers: server_barriers,
++        held: queue.held,
++        in_flight: queue.in_flight,
++        dropped,
++    }
++}
++
++#[cfg(test)]
++#[path = "barrier_tests.rs"]
++mod tests;
+diff --git a/codex-rs/ext/channels/src/barrier_tests.rs b/codex-rs/ext/channels/src/barrier_tests.rs
+new file mode 100644
+index 0000000000..c94d41415e
+--- /dev/null
++++ b/codex-rs/ext/channels/src/barrier_tests.rs
+@@ -0,0 +1,273 @@
++use codex_mcp::ChannelConnection;
++use codex_mcp::ChannelServerState;
++use codex_mcp::InitFence;
++use codex_mcp::ServerFence;
++use pretty_assertions::assert_eq;
++
++use super::Block;
++use super::BlockReason;
++use super::Dropped;
++use super::Fence;
++use super::InFlightInput;
++use super::InFlightPath;
++use super::QueueView;
++use super::UncertainReason;
++use super::Uncertainty;
++use super::snapshot;
++
++const ID: &str = "fence-1";
++
++fn server(
++    generation: u64,
++    connection: ChannelConnection,
++    fence: ServerFence,
++    started_closed: bool,
++) -> ChannelServerState {
++    ChannelServerState {
++        server: "srv".to_string(),
++        generation,
++        pid: Some(42),
++        connection,
++        init_fence: Some(InitFence {
++            closed: started_closed,
++            token: started_closed.then(|| ID.to_string()),
++        }),
++        fence,
++    }
++}
++
++fn ready(generation: u64) -> ChannelServerState {
++    server(
++        generation,
++        ChannelConnection::Ready,
++        ServerFence::Acknowledged,
++        false,
++    )
++}
++
++fn empty() -> QueueView {
++    QueueView {
++        held: Vec::new(),
++        in_flight: Vec::new(),
++        dropped: Dropped::default(),
++    }
++}
++
++fn blocked(reason: BlockReason) -> Vec<Block> {
++    vec![Block {
++        reason,
++        server: Some("srv".to_string()),
++    }]
++}
++
++fn exited(generation: u64) -> Uncertainty {
++    Uncertainty {
++        reason: UncertainReason::ExitedBeforeMarker,
++        server: Some("srv".to_string()),
++        generation: Some(generation),
++    }
++}
++
++#[test]
++fn an_open_barrier_blocks_nothing_and_is_not_drained() {
++    let barrier = snapshot(None, &[ready(1)], empty(), 0);
++    assert!(!barrier.closed);
++    assert!(!barrier.drained);
++    assert_eq!(barrier.fence_id, None);
++    assert!(barrier.blocked_by.is_empty());
++    assert!(barrier.uncertain.is_empty());
++    assert!(!barrier.servers[0].marker_seen);
++}
++
++#[test]
++fn the_current_connection_drains_with_its_own_marker_for_this_fence() {
++    let servers = [ready(1)];
++    let mut fence = Fence::new(ID.to_string(), 7, &servers, 0);
++    let barrier = snapshot(Some(&fence), &servers, empty(), 0);
++    assert_eq!(barrier.blocked_by, blocked(BlockReason::MarkerPending));
++    assert!(!barrier.drained);
++
++    fence.marker("srv", 1, "fence-other");
++    fence.marker("srv", 0, ID);
++    let barrier = snapshot(Some(&fence), &servers, empty(), 0);
++    assert_eq!(barrier.blocked_by, blocked(BlockReason::MarkerPending));
++
++    fence.marker("srv", 1, ID);
++    let barrier = snapshot(Some(&fence), &servers, empty(), 0);
++    assert!(barrier.closed);
++    assert!(barrier.drained);
++    assert_eq!(barrier.fence_id.as_deref(), Some(ID));
++    assert_eq!(barrier.since_ms, Some(7));
++    assert!(barrier.servers[0].marker_seen);
++    assert!(barrier.uncertain.is_empty());
++}
++
++#[test]
++fn a_connection_that_ended_without_its_marker_makes_the_outcome_uncertain() {
++    let mut fence = Fence::new(ID.to_string(), 0, &[ready(1)], 0);
++    let restarted = server(2, ChannelConnection::Ready, ServerFence::Acknowledged, true);
++    fence.observe(&[restarted.clone()]);
++    fence.marker("srv", 2, ID);
++
++    let barrier = snapshot(Some(&fence), &[restarted], empty(), 0);
++    assert!(barrier.drained);
++    assert_eq!(barrier.uncertain, vec![exited(1)]);
++}
++
++#[test]
++fn connections_started_closed_need_no_marker_and_unseen_ones_are_uncertain() {
++    let mut fence = Fence::new(ID.to_string(), 0, &[ready(1)], 0);
++    fence.marker("srv", 1, ID);
++    fence.observe(&[server(
++        2,
++        ChannelConnection::Ready,
++        ServerFence::Requested,
++        true,
++    )]);
++    fence.marker("srv", 4, ID);
++
++    let barrier = snapshot(Some(&fence), &[ready(4)], empty(), 0);
++    assert!(barrier.drained);
++    assert_eq!(barrier.uncertain, vec![exited(3)]);
++}
++
++#[test]
++fn a_live_unsupported_server_blocks_and_a_gone_one_is_uncertain() {
++    let live = server(1, ChannelConnection::Ready, ServerFence::Unsupported, false);
++    let fence = Fence::new(ID.to_string(), 0, &[live.clone()], 0);
++    let barrier = snapshot(Some(&fence), &[live], empty(), 0);
++    assert_eq!(barrier.blocked_by, blocked(BlockReason::Unsupported));
++    assert!(barrier.uncertain.is_empty());
++
++    let gone = server(
++        1,
++        ChannelConnection::FencedWaiting,
++        ServerFence::Unsupported,
++        false,
++    );
++    let barrier = snapshot(Some(&fence), &[gone], empty(), 0);
++    assert!(barrier.drained);
++    assert_eq!(barrier.uncertain, vec![exited(1)]);
++}
++
++#[test]
++fn connection_states_that_may_still_admit_input_block_the_drain() {
++    for (connection, fence_state, reason) in [
++        (
++            ChannelConnection::Launching,
++            ServerFence::Requested,
++            Some(BlockReason::Launching),
++        ),
++        (
++            ChannelConnection::Recovering,
++            ServerFence::Requested,
++            Some(BlockReason::Recovering),
++        ),
++        (
++            ChannelConnection::GaveUp,
++            ServerFence::Requested,
++            Some(BlockReason::GaveUp),
++        ),
++        (
++            ChannelConnection::Ready,
++            ServerFence::Failed("closed".to_string()),
++            Some(BlockReason::Failed),
++        ),
++        (ChannelConnection::Closed, ServerFence::Acknowledged, None),
++        (
++            ChannelConnection::FencedWaiting,
++            ServerFence::Acknowledged,
++            None,
++        ),
++    ] {
++        let state = server(1, connection, fence_state, false);
++        let mut fence = Fence::new(ID.to_string(), 0, &[state.clone()], 0);
++        fence.marker("srv", 1, ID);
++        let barrier = snapshot(Some(&fence), &[state], empty(), 0);
++        assert_eq!(
++            barrier.blocked_by,
++            reason.map(blocked).unwrap_or_default(),
++            "{connection:?}"
++        );
++    }
++}
++
++#[test]
++fn a_server_that_never_connected_is_ignored() {
++    let never = server(
++        0,
++        ChannelConnection::FencedWaiting,
++        ServerFence::Open,
++        false,
++    );
++    let fence = Fence::new(ID.to_string(), 0, &[never.clone()], 0);
++    let barrier = snapshot(Some(&fence), &[never], empty(), 0);
++    assert!(barrier.drained);
++    assert!(barrier.uncertain.is_empty());
++}
++
++#[test]
++fn input_after_the_marker_and_new_drops_are_uncertain() {
++    let servers = [ready(1)];
++    let mut fence = Fence::new(ID.to_string(), 0, &servers, 3);
++    fence.input("srv", 1);
++    fence.marker("srv", 1, ID);
++    fence.input("srv", 1);
++
++    let view = QueueView {
++        dropped: Dropped {
++            queue_full: 1,
++            invalid: 1,
++        },
++        ..empty()
++    };
++    let barrier = snapshot(Some(&fence), &servers, view, 2);
++    assert!(barrier.drained);
++    assert_eq!(
++        barrier.dropped,
++        Dropped {
++            queue_full: 3,
++            invalid: 1,
++        }
++    );
++    assert_eq!(
++        barrier.uncertain,
++        vec![
++            Uncertainty {
++                reason: UncertainReason::LateAfterMarker,
++                server: Some("srv".to_string()),
++                generation: Some(1),
++            },
++            Uncertainty {
++                reason: UncertainReason::DroppedSinceClose,
++                server: None,
++                generation: None,
++            },
++        ]
++    );
++}
++
++#[test]
++fn unrecorded_input_blocks_the_drain() {
++    let servers = [ready(1)];
++    let mut fence = Fence::new(ID.to_string(), 0, &servers, 0);
++    fence.marker("srv", 1, ID);
++    let view = QueueView {
++        in_flight: vec![InFlightInput {
++            seq: 0,
++            server: "srv".to_string(),
++            turn_id: "turn".to_string(),
++            path: InFlightPath::Steered,
++        }],
++        ..empty()
++    };
++    let barrier = snapshot(Some(&fence), &servers, view, 0);
++    assert_eq!(
++        barrier.blocked_by,
++        vec![Block {
++            reason: BlockReason::InFlight,
++            server: None,
++        }]
++    );
++    assert!(!barrier.drained);
++}
+diff --git a/codex-rs/ext/channels/src/delivery.rs b/codex-rs/ext/channels/src/delivery.rs
+index d4d240a596..01930a5079 100644
+--- a/codex-rs/ext/channels/src/delivery.rs
++++ b/codex-rs/ext/channels/src/delivery.rs
+@@ -5,6 +5,8 @@ use std::collections::VecDeque;
+ use std::sync::Arc;
+ use std::sync::OnceLock;
+ use std::sync::Weak;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
+ 
+ use codex_core::StartIfIdleSubmission;
+ use codex_core::SteerSubmission;
+@@ -13,15 +15,31 @@ use codex_core::TurnInput;
+ use codex_core::TurnInputRequest;
+ use codex_core::TurnStartOptions;
+ use codex_extension_api::ExtensionFuture;
++use codex_mcp::ChannelFence;
+ use codex_mcp::ChannelNotification;
++use codex_mcp::ChannelServerState;
+ use codex_protocol::ThreadId;
+ use codex_protocol::user_input::UserInput;
++use serde_json::Value;
+ use tokio::sync::mpsc;
++use tokio::sync::oneshot;
++use tokio::sync::watch;
+ use tokio::task::JoinHandle;
+ use tracing::debug;
+ use tracing::warn;
++use uuid::Uuid;
+ 
+ use crate::CHANNEL_TURN_TRIGGER;
++use crate::barrier;
++use crate::barrier::BarrierError;
++use crate::barrier::ChannelBarrier;
++use crate::barrier::Dropped;
++use crate::barrier::FENCE_META_KEY;
++use crate::barrier::Fence;
++use crate::barrier::HeldInput;
++use crate::barrier::InFlightInput;
++use crate::barrier::InFlightPath;
++use crate::barrier::QueueView;
+ use crate::render::Rejected;
+ use crate::render::render;
+ 
+@@ -176,11 +194,31 @@ pub(crate) enum WorkerEvent {
+     TurnStarted(String),
+     Confirmed(u64),
+     TurnEnded { turn_id: String, aborted: bool },
++    Barrier(BarrierRequest),
++}
++
++/// A host request about the thread's channel barrier, answered by the worker.
++#[derive(Debug)]
++pub(crate) enum BarrierRequest {
++    Fence {
++        closed: bool,
++        expected_fence_id: Option<String>,
++        reply: oneshot::Sender<Result<ChannelBarrier, BarrierError>>,
++    },
++    Read {
++        reply: oneshot::Sender<ChannelBarrier>,
++    },
++    Release {
++        fence_id: String,
++        through_seq: u64,
++        reply: oneshot::Sender<Result<ChannelBarrier, BarrierError>>,
++    },
+ }
+ 
+ /// The task that queues a thread's notifications and delivers them; it ends when dropped.
+ pub(crate) struct Worker {
+     events: mpsc::UnboundedSender<WorkerEvent>,
++    revision: watch::Receiver<u64>,
+     task: JoinHandle<()>,
+ }
+ 
+@@ -189,10 +227,23 @@ impl Worker {
+         notifications: mpsc::Receiver<ChannelNotification>,
+         delivery: Arc<dyn Delivery>,
+         during_turn: HashSet<String>,
++        fence: Option<ChannelFence>,
+     ) -> Self {
+         let (events, receiver) = mpsc::unbounded_channel();
+-        let task = tokio::spawn(run(notifications, receiver, delivery, during_turn));
+-        Self { events, task }
++        let (revision_sender, revision) = watch::channel(0);
++        let task = tokio::spawn(run(
++            notifications,
++            receiver,
++            delivery,
++            during_turn,
++            fence,
++            revision_sender,
++        ));
++        Self {
++            events,
++            revision,
++            task,
++        }
+     }
+ 
+     pub(crate) fn event(&self, event: WorkerEvent) {
+@@ -203,6 +254,14 @@ impl Worker {
+     pub(crate) fn wake(&self) {
+         self.event(WorkerEvent::Wake);
+     }
++
++    /// A handle for barrier requests, valid while the worker runs.
++    pub(crate) fn handle(&self) -> WorkerHandle {
++        WorkerHandle {
++            events: self.events.clone(),
++            revision: self.revision.clone(),
++        }
++    }
+ }
+ 
+ impl Drop for Worker {
+@@ -211,44 +270,143 @@ impl Drop for Worker {
+     }
+ }
+ 
++#[derive(Clone)]
++pub(crate) struct WorkerHandle {
++    events: mpsc::UnboundedSender<WorkerEvent>,
++    revision: watch::Receiver<u64>,
++}
++
++impl WorkerHandle {
++    /// Sends a barrier request; `None` once the worker has stopped.
++    pub(crate) async fn request<T>(
++        &self,
++        request: impl FnOnce(oneshot::Sender<T>) -> BarrierRequest,
++    ) -> Option<T> {
++        let (reply, answer) = oneshot::channel();
++        self.events
++            .send(WorkerEvent::Barrier(request(reply)))
++            .ok()?;
++        answer.await.ok()
++    }
++
++    /// Changes whenever the worker handled something that may change the barrier.
++    pub(crate) fn revision(&self) -> watch::Receiver<u64> {
++        self.revision.clone()
++    }
++
++    pub(crate) fn belongs_to(&self, worker: &Worker) -> bool {
++        self.events.same_channel(&worker.events)
++    }
++}
++
++enum Step {
++    Event(Option<WorkerEvent>),
++    FenceChanged(bool),
++    Notification(Option<ChannelNotification>),
++}
++
+ async fn run(
+     mut notifications: mpsc::Receiver<ChannelNotification>,
+     mut events: mpsc::UnboundedReceiver<WorkerEvent>,
+     delivery: Arc<dyn Delivery>,
+     during_turn: HashSet<String>,
++    fence: Option<ChannelFence>,
++    revision: watch::Sender<u64>,
+ ) {
+     let mut queue = Queue::default();
+     let mut open = true;
++    let mut fence_changes = fence.as_ref().map(ChannelFence::subscribe);
+     loop {
+-        let attempt = tokio::select! {
++        let step = tokio::select! {
+             // A recording confirmation or abort queued during submission must be handled before
+             // accepting newer notifications. This also preserves the lifecycle event order.
+             biased;
+-            event = events.recv() => match event {
+-                Some(event) => queue.event(event),
+-                None => break,
+-            },
+-            notification = notifications.recv(), if open => match notification {
+-                Some(notification) => {
+-                    queue.push(&notification, during_turn.contains(&notification.server));
+-                    true
+-                }
+-                None => {
+-                    open = false;
+-                    false
+-                }
+-            },
++            event = events.recv() => Step::Event(event),
++            changed = fence_changed(&mut fence_changes), if queue.fence.is_some() => {
++                Step::FenceChanged(changed)
++            }
++            notification = notifications.recv(), if open => Step::Notification(notification),
++        };
++        // A read changes nothing, and must not wake readers waiting for a change.
++        let read = matches!(
++            step,
++            Step::Event(Some(WorkerEvent::Barrier(BarrierRequest::Read { .. })))
++        );
++        let attempt = match step {
++            Step::Event(None) => break,
++            Step::Event(Some(WorkerEvent::Barrier(request))) => {
++                queue.barrier_request(fence.as_ref(), request).await
++            }
++            Step::Event(Some(event)) => queue.event(event),
++            Step::FenceChanged(true) => {
++                let servers = servers(fence.as_ref()).await;
++                queue.observe(&servers);
++                false
++            }
++            Step::FenceChanged(false) => {
++                fence_changes = None;
++                false
++            }
++            Step::Notification(Some(notification)) => {
++                queue.push(&notification, during_turn.contains(&notification.server));
++                true
++            }
++            Step::Notification(None) => {
++                open = false;
++                false
++            }
+         };
+         if attempt {
+             queue.deliver(delivery.as_ref()).await;
+         }
++        if !read {
++            revision.send_modify(|revision| *revision += 1);
++        }
++    }
++}
++
++/// Waits for a change of the servers' fence state; pending forever without a fence.
++async fn fence_changed(changes: &mut Option<watch::Receiver<u64>>) -> bool {
++    match changes {
++        Some(changes) => changes.changed().await.is_ok(),
++        None => std::future::pending().await,
++    }
++}
++
++async fn servers(fence: Option<&ChannelFence>) -> Vec<ChannelServerState> {
++    match fence {
++        Some(fence) => fence.servers().await,
++        None => Vec::new(),
+     }
+ }
+ 
++fn now_ms() -> i64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
++        .unwrap_or_default()
++}
++
++/// The fence id of a marker notification, which is never shown to the model.
++fn fence_marker(notification: &ChannelNotification) -> Option<&str> {
++    notification
++        .params
++        .as_ref()?
++        .get("meta")?
++        .get(FENCE_META_KEY)?
++        .as_str()
++}
++
+ #[derive(Clone)]
+ struct Item {
++    seq: u64,
++    server: String,
++    generation: u64,
++    content: String,
++    meta: Option<Value>,
+     rendered: String,
+     during_turn: bool,
++    requeued: bool,
+ }
+ 
+ struct Batch {
+@@ -258,6 +416,7 @@ struct Batch {
+     turn: String,
+     /// Whether that turn has started. A turn started for an idle batch reports its start later.
+     started: bool,
++    path: InFlightPath,
+ }
+ 
+ #[derive(Default)]
+@@ -266,6 +425,10 @@ struct Queue {
+     in_flight: Vec<Batch>,
+     next_id: u64,
+     active_turn: Option<String>,
++    next_seq: u64,
++    dropped: Dropped,
++    /// Set while the barrier is closed: nothing is delivered.
++    fence: Option<Fence>,
+ }
+ 
+ impl Queue {
+@@ -280,18 +443,45 @@ impl Queue {
+ 
+     fn push(&mut self, notification: &ChannelNotification, during_turn: bool) {
+         let server = &notification.server;
++        if let Some(token) = fence_marker(notification) {
++            if let Some(fence) = &mut self.fence {
++                fence.marker(server, notification.generation, token);
++            }
++            return;
++        }
++        if let Some(fence) = &mut self.fence {
++            fence.input(server, notification.generation);
++        }
+         match render(notification) {
+             Ok(_) if self.len() >= MAX_PENDING => {
++                self.dropped.queue_full += 1;
+                 warn!(%server, "dropping MCP channel notification: {MAX_PENDING} are already waiting");
+             }
+-            Ok(rendered) => self.pending.push_back(Item {
+-                rendered,
+-                during_turn,
+-            }),
++            Ok(rendered) => {
++                let params = notification.params.as_ref();
++                let seq = self.next_seq;
++                self.next_seq += 1;
++                self.pending.push_back(Item {
++                    seq,
++                    server: server.clone(),
++                    generation: notification.generation,
++                    content: params
++                        .and_then(|params| params.get("content"))
++                        .and_then(Value::as_str)
++                        .unwrap_or_default()
++                        .to_string(),
++                    meta: params.and_then(|params| params.get("meta")).cloned(),
++                    rendered,
++                    during_turn,
++                    requeued: false,
++                });
++            }
+             Err(Rejected::NoContent) => {
++                self.dropped.invalid += 1;
+                 warn!(%server, "dropping MCP channel notification without a string content");
+             }
+             Err(Rejected::ContentTooLong(chars)) => {
++                self.dropped.invalid += 1;
+                 warn!(%server, chars, "dropping MCP channel notification: its content is too long");
+             }
+         }
+@@ -310,6 +500,8 @@ impl Queue {
+                 self.in_flight.retain(|batch| batch.id != id);
+                 false
+             }
++            // Barrier requests need the servers' state and are handled by the worker loop.
++            WorkerEvent::Barrier(_) => false,
+             WorkerEvent::TurnEnded { turn_id, aborted } => {
+                 if self.active_turn.as_ref() == Some(&turn_id) {
+                     self.active_turn = None;
+@@ -319,7 +511,7 @@ impl Queue {
+                 if aborted {
+                     self.requeue(ended);
+                 } else {
+-                    discard(ended);
++                    self.settle_completed(ended);
+                 }
+                 false
+             }
+@@ -338,7 +530,17 @@ impl Queue {
+         let (never_started, ended): (Vec<Batch>, Vec<Batch>) =
+             earlier.into_iter().partition(|batch| !batch.started);
+         self.requeue(never_started);
+-        discard(ended);
++        self.settle_completed(ended);
++    }
++
++    /// Unconfirmed batches of a completed turn. While the barrier is closed nothing is
++    /// redelivered, so they are held instead of discarded.
++    fn settle_completed(&mut self, batches: Vec<Batch>) {
++        if self.fence.is_some() {
++            self.requeue(batches);
++        } else {
++            discard(batches);
++        }
+     }
+ 
+     /// Splits the unconfirmed batches, in order, into those matching `select` and the rest.
+@@ -353,8 +555,14 @@ impl Queue {
+         if batches.is_empty() {
+             return;
+         }
+-        let mut recovered: VecDeque<Item> =
+-            batches.into_iter().flat_map(|batch| batch.items).collect();
++        let mut recovered: VecDeque<Item> = batches
++            .into_iter()
++            .flat_map(|batch| batch.items)
++            .map(|item| Item {
++                requeued: true,
++                ..item
++            })
++            .collect();
+         recovered.append(&mut self.pending);
+         self.pending = recovered;
+     }
+@@ -366,7 +574,7 @@ impl Queue {
+     }
+ 
+     async fn deliver(&mut self, delivery: &dyn Delivery) {
+-        if self.pending.is_empty() {
++        if self.fence.is_some() || self.pending.is_empty() {
+             return;
+         }
+         if let Some(active_turn) = self.active_turn.clone() {
+@@ -389,6 +597,7 @@ impl Queue {
+                         items,
+                         turn: turn_id,
+                         started: true,
++                        path: InFlightPath::Steered,
+                     });
+                     return;
+                 }
+@@ -408,9 +617,150 @@ impl Queue {
+                 items,
+                 turn: turn_id,
+                 started: false,
++                path: InFlightPath::Started,
+             });
+         }
+     }
++
++    fn observe(&mut self, servers: &[ChannelServerState]) {
++        if let Some(fence) = &mut self.fence {
++            fence.observe(servers);
++        }
++    }
++
++    fn dropped_total(&self, fence: Option<&ChannelFence>) -> u64 {
++        self.dropped.queue_full + self.dropped.invalid + fence.map_or(0, ChannelFence::dropped)
++    }
++
++    async fn snapshot(&mut self, fence: Option<&ChannelFence>) -> ChannelBarrier {
++        let servers = servers(fence).await;
++        self.observe(&servers);
++        let view = QueueView {
++            held: self
++                .pending
++                .iter()
++                .map(|item| HeldInput {
++                    seq: item.seq,
++                    server: item.server.clone(),
++                    generation: item.generation,
++                    content: item.content.clone(),
++                    meta: item.meta.clone(),
++                    requeued: item.requeued,
++                })
++                .collect(),
++            in_flight: self
++                .in_flight
++                .iter()
++                .flat_map(|batch| {
++                    batch.items.iter().map(|item| InFlightInput {
++                        seq: item.seq,
++                        server: item.server.clone(),
++                        turn_id: batch.turn.clone(),
++                        path: batch.path,
++                    })
++                })
++                .collect(),
++            dropped: self.dropped,
++        };
++        barrier::snapshot(
++            self.fence.as_ref(),
++            &servers,
++            view,
++            fence.map_or(0, ChannelFence::dropped),
++        )
++    }
++
++    /// Answers a barrier request; returns whether delivery should be attempted.
++    async fn barrier_request(
++        &mut self,
++        fence: Option<&ChannelFence>,
++        request: BarrierRequest,
++    ) -> bool {
++        let current = self.fence.as_ref().map(|fence| fence.id.clone());
++        match request {
++            BarrierRequest::Read { reply } => {
++                let _ = reply.send(self.snapshot(fence).await);
++                false
++            }
++            BarrierRequest::Fence {
++                closed: true,
++                expected_fence_id,
++                reply,
++            } => {
++                let result = match current {
++                    Some(current)
++                        if expected_fence_id
++                            .as_ref()
++                            .is_some_and(|expected| *expected != current) =>
++                    {
++                        Err(BarrierError::FenceMismatch {
++                            current: Some(current),
++                        })
++                    }
++                    Some(_) => Ok(self.snapshot(fence).await),
++                    None => {
++                        self.close(fence).await;
++                        Ok(self.snapshot(fence).await)
++                    }
++                };
++                let _ = reply.send(result);
++                false
++            }
++            BarrierRequest::Fence {
++                closed: false,
++                expected_fence_id,
++                reply,
++            } => {
++                let (result, reopened) = match current {
++                    None => (Ok(self.snapshot(fence).await), false),
++                    Some(current) if expected_fence_id.as_deref() != Some(current.as_str()) => (
++                        Err(BarrierError::FenceMismatch {
++                            current: Some(current),
++                        }),
++                        false,
++                    ),
++                    Some(_) => {
++                        self.fence = None;
++                        if let Some(fence) = fence {
++                            fence.set(None);
++                        }
++                        (Ok(self.snapshot(fence).await), true)
++                    }
++                };
++                let _ = reply.send(result);
++                reopened
++            }
++            BarrierRequest::Release {
++                fence_id,
++                through_seq,
++                reply,
++            } => {
++                let result = match current {
++                    None => Err(BarrierError::FenceOpen),
++                    Some(current) if current != fence_id => Err(BarrierError::FenceMismatch {
++                        current: Some(current),
++                    }),
++                    Some(_) => {
++                        self.pending.retain(|item| item.seq > through_seq);
++                        Ok(self.snapshot(fence).await)
++                    }
++                };
++                let _ = reply.send(result);
++                false
++            }
++        }
++    }
++
++    /// Closes the barrier under a new fence id and asks the servers to stop accepting input.
++    async fn close(&mut self, fence: Option<&ChannelFence>) {
++        let id = format!("fence-{}", Uuid::new_v4());
++        let servers = servers(fence).await;
++        let dropped = self.dropped_total(fence);
++        self.fence = Some(Fence::new(id.clone(), now_ms(), &servers, dropped));
++        if let Some(fence) = fence {
++            fence.set(Some(id));
++        }
++    }
+ }
+ 
+ /// A completed turn that did not record its input (for example, an input hook blocked it)
+diff --git a/codex-rs/ext/channels/src/delivery_tests.rs b/codex-rs/ext/channels/src/delivery_tests.rs
+index 457fc00e27..d749b223c6 100644
+--- a/codex-rs/ext/channels/src/delivery_tests.rs
++++ b/codex-rs/ext/channels/src/delivery_tests.rs
+@@ -65,6 +65,7 @@ fn harness(outcomes: Vec<DeliveryOutcome>) -> Harness {
+             attempts: attempts_sender,
+         }),
+         HashSet::new(),
++        None,
+     );
+     Harness {
+         notifications,
+@@ -196,7 +197,12 @@ async fn dropping_the_worker_stops_delivery() {
+ 
+     drop(std::mem::replace(
+         worker,
+-        Worker::spawn(mpsc::channel(1).1, Arc::new(NeverDelivery), HashSet::new()),
++        Worker::spawn(
++            mpsc::channel(1).1,
++            Arc::new(NeverDelivery),
++            HashSet::new(),
++            None,
++        ),
+     ));
+     let _ = notifications.send(event("late")).await;
+     let next = timeout(Duration::from_millis(200), attempts.recv()).await;
+@@ -487,6 +493,7 @@ async fn confirmation_during_submission_is_processed_before_abort_and_new_delive
+             attempts,
+         }),
+         HashSet::from(["srv".to_string()]),
++        None,
+     );
+     assert!(events.set(worker.events.clone()).is_ok());
+     worker.event(WorkerEvent::TurnStarted("turn".to_string()));
+@@ -601,3 +608,198 @@ fn both_paths_tag_the_recorded_message_with_the_batch_id() {
+         Some(&json!(7))
+     );
+ }
++
++async fn ask<T>(
++    queue: &mut super::Queue,
++    request: impl FnOnce(tokio::sync::oneshot::Sender<T>) -> super::BarrierRequest,
++) -> (T, bool) {
++    let (reply, answer) = tokio::sync::oneshot::channel();
++    let attempt = queue.barrier_request(None, request(reply)).await;
++    (answer.await.expect("an answer"), attempt)
++}
++
++async fn close(queue: &mut super::Queue) -> String {
++    let (barrier, _) = ask(queue, |reply| super::BarrierRequest::Fence {
++        closed: true,
++        expected_fence_id: None,
++        reply,
++    })
++    .await;
++    barrier.expect("closed").fence_id.expect("a fence id")
++}
++
++async fn held(queue: &mut super::Queue) -> Vec<(u64, String, bool)> {
++    let (barrier, _) = ask(queue, |reply| super::BarrierRequest::Read { reply }).await;
++    barrier
++        .held
++        .into_iter()
++        .map(|input| (input.seq, input.content, input.requeued))
++        .collect()
++}
++
++#[tokio::test]
++async fn a_closed_barrier_holds_input_in_order_and_opening_delivers_it() {
++    use crate::barrier::BarrierError;
++
++    let delivery = steering(true);
++    let mut queue = super::Queue::default();
++    let id = close(&mut queue).await;
++    assert!(id.starts_with("fence-"));
++    queue.push(&event("one"), false);
++    queue.push(&event("two"), true);
++    queue.deliver(&delivery).await;
++    assert!(delivery.attempts.lock().expect("attempts").is_empty());
++    assert_eq!(
++        held(&mut queue).await,
++        vec![(0, "one".to_string(), false), (1, "two".to_string(), false)]
++    );
++
++    let (refused, attempt) = ask(&mut queue, |reply| super::BarrierRequest::Fence {
++        closed: false,
++        expected_fence_id: Some("fence-stale".to_string()),
++        reply,
++    })
++    .await;
++    assert_eq!(
++        refused,
++        Err(BarrierError::FenceMismatch {
++            current: Some(id.clone()),
++        })
++    );
++    assert!(!attempt);
++
++    let (opened, attempt) = ask(&mut queue, |reply| super::BarrierRequest::Fence {
++        closed: false,
++        expected_fence_id: Some(id),
++        reply,
++    })
++    .await;
++    assert!(!opened.expect("opened").closed);
++    assert!(attempt);
++    queue.deliver(&delivery).await;
++    assert_eq!(
++        *delivery.attempts.lock().expect("attempts"),
++        vec![Attempt::Idle(vec![rendered("one"), rendered("two")])]
++    );
++}
++
++#[tokio::test]
++async fn closing_again_keeps_the_fence_and_refuses_another_id() {
++    use crate::barrier::BarrierError;
++
++    let mut queue = super::Queue::default();
++    let id = close(&mut queue).await;
++    assert_eq!(close(&mut queue).await, id);
++    let (refused, _) = ask(&mut queue, |reply| super::BarrierRequest::Fence {
++        closed: true,
++        expected_fence_id: Some("fence-other".to_string()),
++        reply,
++    })
++    .await;
++    assert_eq!(
++        refused,
++        Err(BarrierError::FenceMismatch { current: Some(id) })
++    );
++}
++
++#[tokio::test]
++async fn release_drops_held_input_through_a_sequence_number_once() {
++    use crate::barrier::BarrierError;
++
++    let mut queue = super::Queue::default();
++    let id = close(&mut queue).await;
++    for text in ["a", "b", "c"] {
++        queue.push(&event(text), false);
++    }
++    for _ in 0..2 {
++        let (released, _) = ask(&mut queue, |reply| super::BarrierRequest::Release {
++            fence_id: id.clone(),
++            through_seq: 1,
++            reply,
++        })
++        .await;
++        let held: Vec<u64> = released
++            .expect("released")
++            .held
++            .iter()
++            .map(|input| input.seq)
++            .collect();
++        assert_eq!(held, vec![2]);
++    }
++    let (refused, _) = ask(&mut queue, |reply| super::BarrierRequest::Release {
++        fence_id: "fence-other".to_string(),
++        through_seq: 2,
++        reply,
++    })
++    .await;
++    assert_eq!(
++        refused,
++        Err(BarrierError::FenceMismatch {
++            current: Some(id.clone()),
++        })
++    );
++    ask(&mut queue, |reply| super::BarrierRequest::Fence {
++        closed: false,
++        expected_fence_id: Some(id.clone()),
++        reply,
++    })
++    .await;
++    let (refused, _) = ask(&mut queue, |reply| super::BarrierRequest::Release {
++        fence_id: id,
++        through_seq: 2,
++        reply,
++    })
++    .await;
++    assert_eq!(refused, Err(BarrierError::FenceOpen));
++}
++
++#[tokio::test]
++async fn markers_never_reach_the_model() {
++    let delivery = steering(true);
++    let mut queue = super::Queue::default();
++    let marker = ChannelNotification {
++        server: "srv".to_string(),
++        generation: 1,
++        params: Some(json!({ "content": "", "meta": { "fence": "fence-any" } })),
++    };
++    queue.push(&marker, false);
++    queue.deliver(&delivery).await;
++    close(&mut queue).await;
++    queue.push(&marker, false);
++    assert_eq!(queue.len(), 0);
++    assert!(delivery.attempts.lock().expect("attempts").is_empty());
++}
++
++#[tokio::test]
++async fn a_closed_barrier_holds_input_a_completed_turn_did_not_record() {
++    use super::WorkerEvent;
++
++    let delivery = steering(true);
++    let mut queue = super::Queue::default();
++    queue.event(WorkerEvent::TurnStarted("turn".to_string()));
++    queue.push(&event("steered"), true);
++    queue.deliver(&delivery).await;
++    let (barrier, _) = ask(&mut queue, |reply| super::BarrierRequest::Read { reply }).await;
++    assert_eq!(barrier.in_flight.len(), 1);
++    close(&mut queue).await;
++    queue.event(WorkerEvent::TurnEnded {
++        turn_id: "turn".to_string(),
++        aborted: false,
++    });
++    assert_eq!(
++        held(&mut queue).await,
++        vec![(0, "steered".to_string(), true)]
++    );
++}
++
++#[tokio::test]
++async fn the_worker_answers_barrier_requests_through_its_handle() {
++    let harness = harness(Vec::new());
++    let handle = harness.worker.handle();
++    let barrier = handle
++        .request(|reply| super::BarrierRequest::Read { reply })
++        .await
++        .expect("the worker answers");
++    assert!(!barrier.closed);
++    assert!(barrier.servers.is_empty());
++}
+diff --git a/codex-rs/ext/channels/src/lib.rs b/codex-rs/ext/channels/src/lib.rs
+index 7001833134..9122b51143 100644
+--- a/codex-rs/ext/channels/src/lib.rs
++++ b/codex-rs/ext/channels/src/lib.rs
+@@ -14,11 +14,18 @@
+ //! an interrupt returns unrecorded input to the queue without restarting work.
+ //! Sub-agent and other non-root threads do not start channel servers at all, so a server never
+ //! runs twice for one chat.
++//!
++//! A host can close a thread's channel barrier (see [`barrier`]): channel input then stops
++//! reaching the model and is held until the host releases it or opens the barrier again.
+ 
+ use std::collections::BTreeMap;
++use std::collections::HashMap;
+ use std::sync::Arc;
++use std::sync::Mutex;
+ use std::sync::OnceLock;
++use std::sync::PoisonError;
+ use std::sync::Weak;
++use std::time::Duration;
+ 
+ use codex_core::ThreadManager;
+ use codex_core::config::Config;
+@@ -44,15 +51,23 @@ use codex_protocol::items::TurnItem;
+ use codex_protocol::protocol::SessionSource;
+ use tracing::warn;
+ 
++pub mod barrier;
+ mod delivery;
+ pub mod render;
+ 
++pub use barrier::BarrierError;
++pub use barrier::ChannelBarrier;
++use delivery::BarrierRequest;
+ pub use delivery::Delivery;
+ pub use delivery::DeliveryOutcome;
+ pub use delivery::MAX_PENDING;
+ use delivery::ThreadDelivery;
+ use delivery::Worker;
+ use delivery::WorkerEvent;
++use delivery::WorkerHandle;
++
++/// The longest wait a barrier read accepts.
++pub const MAX_BARRIER_WAIT: Duration = Duration::from_secs(60);
+ 
+ /// Recorded as the trigger of the turns that channel notifications start.
+ pub const CHANNEL_TURN_TRIGGER: &str = "channel";
+@@ -78,6 +93,8 @@ pub fn register(builder: &mut ExtensionRegistryBuilder<Config>, extension: Arc<C
+ #[derive(Default)]
+ pub struct ChannelsExtension {
+     thread_manager: Arc<OnceLock<Weak<ThreadManager>>>,
++    /// The channel workers of running threads, for barrier requests.
++    workers: Mutex<HashMap<ThreadId, WorkerHandle>>,
+ }
+ 
+ impl ChannelsExtension {
+@@ -86,6 +103,77 @@ impl ChannelsExtension {
+     pub fn attach(&self, thread_manager: Weak<ThreadManager>) {
+         let _ = self.thread_manager.set(thread_manager);
+     }
++
++    /// Closes (`closed`) or opens the thread's channel barrier. Closing an open barrier picks a
++    /// new fence id; closing a closed one changes nothing. Opening needs the current fence id
++    /// and delivers the held input. Returns at once with the resulting state.
++    pub async fn fence(
++        &self,
++        thread_id: ThreadId,
++        closed: bool,
++        expected_fence_id: Option<String>,
++    ) -> Result<ChannelBarrier, BarrierError> {
++        self.worker(thread_id)?
++            .request(|reply| BarrierRequest::Fence {
++                closed,
++                expected_fence_id,
++                reply,
++            })
++            .await
++            .ok_or(BarrierError::NoChannels)?
++    }
++
++    /// The thread's barrier. With `wait`, a closed barrier is read again as it changes until it
++    /// is drained, it opens or `wait` (at most [`MAX_BARRIER_WAIT`]) elapses.
++    pub async fn read(
++        &self,
++        thread_id: ThreadId,
++        wait: Option<Duration>,
++    ) -> Result<ChannelBarrier, BarrierError> {
++        let worker = self.worker(thread_id)?;
++        let mut revision = worker.revision();
++        let deadline = tokio::time::Instant::now() + wait.unwrap_or_default().min(MAX_BARRIER_WAIT);
++        loop {
++            revision.mark_unchanged();
++            let barrier = worker
++                .request(|reply| BarrierRequest::Read { reply })
++                .await
++                .ok_or(BarrierError::NoChannels)?;
++            if !barrier.closed || barrier.drained {
++                return Ok(barrier);
++            }
++            match tokio::time::timeout_at(deadline, revision.changed()).await {
++                Ok(Ok(())) => {}
++                Ok(Err(_)) | Err(_) => return Ok(barrier),
++            }
++        }
++    }
++
++    /// Drops held input up to `through_seq`, which the host has kept elsewhere.
++    pub async fn release(
++        &self,
++        thread_id: ThreadId,
++        fence_id: String,
++        through_seq: u64,
++    ) -> Result<ChannelBarrier, BarrierError> {
++        self.worker(thread_id)?
++            .request(|reply| BarrierRequest::Release {
++                fence_id,
++                through_seq,
++                reply,
++            })
++            .await
++            .ok_or(BarrierError::NoChannels)?
++    }
++
++    fn worker(&self, thread_id: ThreadId) -> Result<WorkerHandle, BarrierError> {
++        self.workers
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .get(&thread_id)
++            .cloned()
++            .ok_or(BarrierError::NoChannels)
++    }
+ }
+ 
+ impl McpServerContributor<Config> for ChannelsExtension {
+@@ -141,11 +229,17 @@ impl ThreadLifecycleContributor<Config> for ChannelsExtension {
+                     codex_mcp::channel_during_turn(&input.config.config_layer_stack, name)
+                 })
+                 .collect();
+-            input.thread_store.insert(Worker::spawn(
++            let worker = Worker::spawn(
+                 notifications,
+                 Arc::new(delivery),
+                 during_turn,
+-            ));
++                client.channel_fence(),
++            );
++            self.workers
++                .lock()
++                .unwrap_or_else(PoisonError::into_inner)
++                .insert(thread_id, worker.handle());
++            input.thread_store.insert(worker);
+         })
+     }
+ 
+@@ -167,7 +261,18 @@ impl ThreadLifecycleContributor<Config> for ChannelsExtension {
+ 
+     fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
+         Box::pin(async move {
+-            input.thread_store.remove::<Worker>();
++            // A thread resumed under the same id may already have registered its own worker.
++            if let Some(worker) = input.thread_store.remove::<Worker>()
++                && let Ok(thread_id) = ThreadId::from_string(input.thread_store.level_id())
++            {
++                let mut workers = self.workers.lock().unwrap_or_else(PoisonError::into_inner);
++                if workers
++                    .get(&thread_id)
++                    .is_some_and(|handle| handle.belongs_to(&worker))
++                {
++                    workers.remove(&thread_id);
++                }
++            }
+         })
+     }
+ }
+-- 
+2.53.0
+
