@@ -1,12 +1,13 @@
-From 6671a864df8e33a4dfed5e7f6c8175d3c8f4773e Mon Sep 17 00:00:00 2001
+From 1a5419ffff16e7b009ce9e7bd195b61d993f6701 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 14:15:35 +0100
 Subject: [PATCH 3/3] core: raise the recursion limit for MCP recovery futures
 
-Release builds exceed rustc's default query depth when laying out async MCP tool refresh futures that include stdio server recovery. Use the same limit as other crates in the workspace.
+Builds exceed rustc's default query depth when laying out async MCP tool refresh futures that include stdio server recovery: the library in release builds, and the core integration test binary that drives sessions in non-incremental test builds. Use the same limit as other crates in the workspace.
 ---
- codex-rs/core/src/lib.rs | 3 +++
- 1 file changed, 3 insertions(+)
+ codex-rs/core/src/lib.rs   | 3 +++
+ codex-rs/core/tests/all.rs | 3 +++
+ 2 files changed, 6 insertions(+)
 
 diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
 index d684b39426..6c170ff260 100644
@@ -22,6 +23,18 @@ index d684b39426..6c170ff260 100644
  
  mod apply_patch;
  mod apps;
+diff --git a/codex-rs/core/tests/all.rs b/codex-rs/core/tests/all.rs
+index 0ee0cd986a..7fac133fd8 100644
+--- a/codex-rs/core/tests/all.rs
++++ b/codex-rs/core/tests/all.rs
+@@ -1,4 +1,7 @@
+ #![allow(clippy::expect_used)]
++// Laying out the async session futures that include stdio MCP server recovery
++// exceeds rustc's default query depth in this test binary.
++#![recursion_limit = "256"]
+ 
+ // Single integration test binary that aggregates all test modules.
+ // The submodules live in `tests/all/`.
 -- 
 2.53.0
 

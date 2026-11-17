@@ -2,7 +2,8 @@
 
 Apply these three patches after channels-inject through `3520f1ce49`.
 Source commits: `97ecc5e620` (implementation and unit tests), `8ce22362e4` (integration tests),
-`6671a864df` (`codex-core` recursion limit of 256 for release builds, as in other workspace crates).
+`1a5419ffff` (`codex-core` recursion limit of 256 in the library and in the `all` integration test
+binary, as in other workspace crates; replaces `6671a864df`, which covered only the library).
 
 These replace `bb516a1538`/`b5f7857095` after the first integrated verification. Service selection
 checks the recovery state while holding the client state lock. Tests wait for the catalog revision
