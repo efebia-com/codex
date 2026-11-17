@@ -13,7 +13,9 @@ installer="${root}/install.sh"
 work="$(mktemp -d)"
 server_pid=""
 cleanup() {
-  [[ -n "$server_pid" ]] && kill "$server_pid" 2>/dev/null || true
+  if [[ -n "$server_pid" ]]; then
+    kill "$server_pid" 2>/dev/null || true
+  fi
   rm -rf "$work"
 }
 trap cleanup EXIT
