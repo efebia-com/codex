@@ -145,6 +145,31 @@ Running it by hand with `force` publishes a new revision of an upstream version
 that is already published; `targets` (e.g. `x86_64-unknown-linux-musl`) limits
 it to some packages, and a later forced run adds the others.
 
+## Releases built on a build machine
+
+[`scripts/release-local.sh`](scripts/release-local.sh) makes the same release
+as the workflow, for `x86_64-unknown-linux-musl` only, on a Linux x86_64
+machine: version check, patches, extension tests, release build with the
+upstream build settings, packaging, `install.sh` smoke tests, and publication
+with `gh`. The release notes name the machine it was built on. From a clean
+clone at the tip of `main`:
+
+```sh
+scripts/release-local.sh --dry-run efebia-com/codex   # every step except the publication
+scripts/release-local.sh efebia-com/codex             # newest stable upstream release
+scripts/release-local.sh --force efebia-com/codex     # new revision of a published version
+```
+
+It does not start while a `release.yml` run is queued or in progress or while
+another run holds its lock, and it checks the version again right before
+publishing. Every cargo step runs with `CARGO_INCREMENTAL=0` in an emptied
+target directory under `.work/release-local`; the release build runs one cargo
+job at a time unless `--release-jobs` says otherwise, because the largest crates
+need several GB of memory each. It never uses sudo: the musl toolchain that the
+workflow installs with apt is taken from the system or set up under
+`.work/release-local/cache/tools` (Debian or Ubuntu). The header of the script
+lists every option and requirement.
+
 ## Build locally
 
 ```sh
@@ -155,7 +180,8 @@ scripts/build.sh --source .work/src --out .work/pkg # debug build for this machi
 ```
 
 `build.sh --release --target <triple>` is the release build used by CI; the
-Linux musl targets need the toolchain that the workflow installs. The scripts
+Linux musl targets need the toolchain that the workflow installs (and that
+`release-local.sh` sets up). The scripts
 need bash 4 or newer, git, curl, jq, python3 and the Rust toolchain pinned by
 the upstream source.
 

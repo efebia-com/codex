@@ -1,16 +1,31 @@
 #!/usr/bin/env bash
 # Publish a GitHub release from the archives built by the release workflow.
 #
-# Usage: scripts/publish.sh <owner/repo> <version> <upstream-tag> <assets-dir> <commit>
+# Usage: scripts/publish.sh [--dry-run] [--built-on <host>] <owner/repo> <version>
+#                           <upstream-tag> <assets-dir> <commit>
 #
 # <assets-dir> holds codex-<target>.tar.gz and .sha256 files for every target.
 # Creates tag v<version> on <commit>, uploads the archives, SHA256SUMS and
 # install.sh, and closes the release-failure issues of this upstream tag.
+#
+#   --built-on  the release was built on <host> by release-local.sh, not by the
+#               release workflow; the release notes say so
+#   --dry-run   write SHA256SUMS and the release notes (release-notes.md) into
+#               <assets-dir> and print them, but publish nothing
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 require gh tar
 
-[[ $# -eq 5 ]] || die "usage: $0 <owner/repo> <version> <upstream-tag> <assets-dir> <commit>"
+dry_run=false
+built_on=""
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --dry-run) dry_run=true; shift ;;
+    --built-on) built_on="${2:?}"; shift 2 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+[[ $# -eq 5 ]] || die "usage: $0 [--dry-run] [--built-on <host>] <owner/repo> <version> <upstream-tag> <assets-dir> <commit>"
 repo="$1"
 version="$2"
 tag="$3"
@@ -34,11 +49,19 @@ platforms=Linux
 for archive in "${archives[@]}"; do
   if [[ "$archive" == *-apple-darwin.tar.gz ]]; then platforms="Linux and macOS"; fi
 done
-notes="$(mktemp)"
-trap 'rm -f "$notes"' EXIT
+if [[ "$dry_run" == true ]]; then
+  notes="${assets}/release-notes.md"
+else
+  notes="$(mktemp)"
+  trap 'rm -f "$notes"' EXIT
+fi
 {
   echo "Codex ${version}: upstream [${tag}](https://github.com/${UPSTREAM_REPO}/releases/tag/${tag}) with the extensions below."
   echo
+  if [[ -n "$built_on" ]]; then
+    echo "Built on \`${built_on}\` with \`scripts/release-local.sh\` from commit ${commit}, not by the release workflow."
+    echo
+  fi
   echo "Install or update (${platforms}):"
   echo
   echo '```sh'
@@ -63,9 +86,16 @@ if [[ -n "$current_latest" ]] &&
   latest_flag=(--latest=false)
 fi
 
-gh release create "$release_tag" --repo "$repo" --target "$commit" \
-  --title "Codex ${version}" --notes-file "$notes" "${latest_flag[@]}" \
-  "${archives[@]}" "${assets}/SHA256SUMS" "${assets}/install.sh"
+create=(gh release create "$release_tag" --repo "$repo" --target "$commit"
+  --title "Codex ${version}" --notes-file "$notes" "${latest_flag[@]}"
+  "${archives[@]}" "${assets}/SHA256SUMS" "${assets}/install.sh")
+if [[ "$dry_run" == true ]]; then
+  log "Dry run: ${release_tag} not published. Release notes (${notes}):"
+  cat "$notes"
+  log "Would run: ${create[*]}"
+  exit 0
+fi
+"${create[@]}"
 log "Published ${release_tag}"
 
 gh issue list --repo "$repo" --state open --label release-failure \
