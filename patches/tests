@@ -28,3 +28,5 @@ channels-inject: -p codex-rmcp-client --lib custom_notifications
 channels-inject: -p codex-mcp --lib channel
 channels-inject: -p codex-channels-extension
 channels-inject: -p codex-app-server --test all mcp_channels
+
+channels-inject-tests: -p codex-app-server --test all mcp_channels::during_turn

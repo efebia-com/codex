@@ -1,0 +1,516 @@
+From 2ac0e4e9ddc8fcbc20fff3cb74cc136da642e957 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 11:51:32 +0100
+Subject: [PATCH] app-server: test channel delivery during active turns
+
+---
+ .../app-server/tests/suite/v2/mcp_channels.rs |   3 +
+ .../suite/v2/mcp_channels_during_turn.rs      | 485 ++++++++++++++++++
+ 2 files changed, 488 insertions(+)
+ create mode 100644 codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs
+
+diff --git a/codex-rs/app-server/tests/suite/v2/mcp_channels.rs b/codex-rs/app-server/tests/suite/v2/mcp_channels.rs
+index 3a5712e297..640b4afacc 100644
+--- a/codex-rs/app-server/tests/suite/v2/mcp_channels.rs
++++ b/codex-rs/app-server/tests/suite/v2/mcp_channels.rs
+@@ -1002,3 +1002,6 @@ fn subagent_requests(requests: &[ResponsesRequest], child_prompt: &str) -> usize
+         })
+         .count()
+ }
++
++#[path = "mcp_channels_during_turn.rs"]
++mod during_turn;
+diff --git a/codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs b/codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs
+new file mode 100644
+index 0000000000..6ab6a2991d
+--- /dev/null
++++ b/codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs
+@@ -0,0 +1,485 @@
++//! The additional per-server opt-in delivers channel input into the active root turn.
++
++use super::*;
++use codex_app_server_protocol::ThreadResumeParams;
++use codex_app_server_protocol::ThreadResumeResponse;
++
++async fn start(specs: &[ServerSpec]) -> Result<Harness> {
++    let names: Vec<&str> = specs.iter().map(|spec| spec.name).collect();
++    start_with_opt_in(specs, &names).await
++}
++
++async fn start_with_opt_in(specs: &[ServerSpec], during_turn: &[&str]) -> Result<Harness> {
++    let model = responses::start_mock_server().await;
++    Mock::given(method("POST"))
++        .and(path_regex(".*/responses$"))
++        .respond_with(
++            responses::sse_response(responses::sse(vec![
++                responses::ev_response_created("resp-default"),
++                responses::ev_assistant_message("msg-default", "ok"),
++                responses::ev_completed("resp-default"),
++            ]))
++            .set_delay(Duration::from_millis(300)),
++        )
++        .with_priority(u8::MAX)
++        .mount(&model)
++        .await;
++    let home = TempDir::new()?;
++    let script = home.path().join("mcp_channels_server.py");
++    std::fs::write(&script, SERVER_SCRIPT)?;
++    let mut servers = BTreeMap::new();
++    let mut config = String::new();
++    for spec in specs {
++        let server = FakeServer {
++            name: spec.name,
++            inbox: home.path().join(format!("{}.inbox", spec.name)),
++            record: home.path().join(format!("{}.record", spec.name)),
++        };
++        config.push_str(&server_toml(spec, &script, &server)?);
++        if during_turn.contains(&spec.name) {
++            config.push_str("channel_during_turn = true\n");
++        }
++        servers.insert(spec.name, server);
++    }
++    MockResponsesConfig::new(&model.uri())
++        .with_extra_config(&config)
++        .write(home.path())?;
++    let mut app = TestAppServer::builder()
++        .with_codex_home(home.path())
++        .build_initialized()
++        .await?;
++    let ThreadStartResponse { thread, .. } = app
++        .start_thread(ThreadStartParams {
++            model: Some("mock-model".to_string()),
++            ..Default::default()
++        })
++        .await?;
++    let mut harness = Harness {
++        model,
++        app,
++        thread_id: thread.id,
++        servers,
++        _home: home,
++    };
++    for spec in specs {
++        harness.wait_for_server_ready(spec.name).await?;
++    }
++    Ok(harness)
++}
++
++async fn start_turn(harness: &mut Harness, text: &str) -> Result<String> {
++    let thread_id = harness.thread_id.clone();
++    let TurnStartResponse { turn } = harness
++        .app
++        .request(|request_id| ClientRequest::TurnStart {
++            request_id,
++            params: TurnStartParams {
++                thread_id,
++                input: vec![V2UserInput::Text {
++                    text: text.to_string(),
++                    text_elements: Vec::new(),
++                }],
++                ..Default::default()
++            },
++        })
++        .await?;
++    Ok(turn.id)
++}
++
++async fn completed(harness: &mut Harness, turn_id: &str) -> Result<()> {
++    let thread_id = harness.thread_id.clone();
++    timeout(
++        READ_TIMEOUT,
++        harness.app.read_stream_until_matching_notification(
++            "the requested turn completed",
++            |notification| {
++                notification.method == "turn/completed"
++                    && notification.params.as_ref().is_some_and(|params| {
++                        params["threadId"] == thread_id && params["turn"]["id"] == turn_id
++                    })
++            },
++        ),
++    )
++    .await??;
++    Ok(())
++}
++
++async fn wait_for_requests(harness: &Harness, count: usize) -> Result<()> {
++    timeout(READ_TIMEOUT, async {
++        while harness.requests().await.len() < count {
++            sleep(POLL_INTERVAL).await;
++        }
++    })
++    .await
++    .context("model did not receive the expected request")?;
++    Ok(())
++}
++
++async fn emit(model: &MockServer, call_id: &str, messages: &[Value]) {
++    responses::mount_sse_once(
++        model,
++        responses::sse(vec![
++            responses::ev_response_created(call_id),
++            responses::ev_function_call_with_namespace(
++                call_id,
++                "mcp__chan",
++                "emit",
++                &json!({"messages": messages}).to_string(),
++            ),
++            responses::ev_completed(call_id),
++        ]),
++    )
++    .await;
++}
++
++async fn delay_first_response(harness: &Harness, delay: Duration) {
++    Mock::given(method("POST"))
++        .and(path_regex(".*/responses$"))
++        .respond_with(
++            responses::sse_response(responses::sse(vec![
++                responses::ev_response_created("resp-sampling"),
++                responses::ev_assistant_message("msg-sampling", "sampling complete"),
++                responses::ev_completed("resp-sampling"),
++            ]))
++            .set_delay(delay),
++        )
++        .up_to_n_times(1)
++        .mount(&harness.model)
++        .await;
++}
++
++fn assert_bodies(request: &ResponsesRequest, expected: &[&str]) {
++    assert_eq!(
++        channel_elements(request)
++            .iter()
++            .map(ChannelElement::body)
++            .collect::<Vec<_>>(),
++        expected,
++        "the full history must contain every channel input exactly once and in order"
++    );
++}
++
++async fn assert_same_turn(harness: &mut Harness, turn_id: &str, expected: &[&str]) -> Result<()> {
++    harness.wait_for_deliveries("chan", expected).await?;
++    completed(harness, turn_id).await?;
++    // Include an accidental queued turn in the observations, rather than deduplicating it.
++    sleep(QUIET_PERIOD).await;
++    let requests = harness.requests().await;
++    assert!(
++        requests.len() >= 2,
++        "delivery must cause a follow-up request"
++    );
++    assert!(channel_elements(&requests[0]).is_empty());
++    for request in &requests {
++        assert_eq!(
++            request.body_json()["client_metadata"]["turn_id"].as_str(),
++            Some(turn_id),
++            "a during-turn notification must not start a new turn"
++        );
++    }
++    assert_bodies(requests.last().context("last model request")?, expected);
++    // Every started event is retained by the typed request/notification helpers.
++    let started = timeout(
++        READ_TIMEOUT,
++        harness
++            .app
++            .read_stream_until_notification_message("turn/started"),
++    )
++    .await??;
++    assert_eq!(
++        started.params.context("turn/started params")?["turn"]["id"],
++        turn_id
++    );
++    assert!(
++        !harness
++            .app
++            .pending_notification_methods()
++            .iter()
++            .any(|method| method == "turn/started"),
++        "only the user turn may have started"
++    );
++    Ok(())
++}
++
++fn assert_after_output(request: &ResponsesRequest, call_id: &str, body: &str) {
++    let json = request.body_json();
++    let input = json["input"].as_array().expect("model input array");
++    let output = input
++        .iter()
++        .position(|item| item["type"] == "function_call_output" && item["call_id"] == call_id)
++        .expect("tool output in history");
++    let channel = input
++        .iter()
++        .position(|item| {
++            item["role"] == "user"
++                && item["content"].as_array().is_some_and(|parts| {
++                    parts.iter().any(|part| {
++                        part["text"].as_str().is_some_and(|text| {
++                            ChannelElement::parse(text)
++                                .is_some_and(|element| element.body() == body)
++                        })
++                    })
++                })
++        })
++        .expect("separate user message containing the channel input");
++    assert!(
++        output < channel,
++        "channel input must follow the tool output"
++    );
++}
++
++#[test_case::test_case(None; "channel_absent")]
++#[test_case::test_case(Some(false); "channel_false")]
++#[tokio::test]
++async fn during_turn_option_requires_channel_opt_in(channel: Option<bool>) -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let specs = [
++        ServerSpec {
++            name: "plain",
++            channel,
++            capability: true,
++        },
++        CHANNEL,
++    ];
++    let harness = start(&specs).await?;
++    harness
++        .server("plain")
++        .push(&[json!({"content": "ignored during-turn-only"})])?;
++    harness
++        .server("chan")
++        .push(&[json!({"content": "control"})])?;
++    harness.wait_for_delivery("chan", "control").await?;
++    sleep(QUIET_PERIOD).await;
++    assert_eq!(harness.server("plain").sent_notifications()?.len(), 1);
++    harness
++        .assert_never_delivered("ignored during-turn-only")
++        .await;
++    Ok(())
++}
++
++#[tokio::test]
++async fn during_turn_opt_in_is_per_server_and_idle_delivery_still_works() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let queued = ServerSpec {
++        name: "queued",
++        ..CHANNEL
++    };
++    let mut harness = start_with_opt_in(&[CHANNEL, queued], &["chan"]).await?;
++    delay_first_response(&harness, Duration::from_secs(3)).await;
++    let turn = start_turn(&mut harness, "mixed channel configuration").await?;
++    wait_for_requests(&harness, 1).await?;
++    harness
++        .server("chan")
++        .push(&[json!({"content": "active input"})])?;
++    harness
++        .server("queued")
++        .push(&[json!({"content": "queued input"})])?;
++    harness
++        .wait_for_deliveries("chan", &["active input", "queued input"])
++        .await?;
++    completed(&mut harness, &turn).await?;
++    let requests = harness.requests().await;
++    let active = requests
++        .iter()
++        .find(|request| {
++            channel_elements(request)
++                .iter()
++                .any(|element| element.body() == "active input")
++        })
++        .context("active delivery")?;
++    assert_eq!(active.body_json()["client_metadata"]["turn_id"], turn);
++    assert!(
++        !channel_elements(active)
++            .iter()
++            .any(|element| element.body() == "queued input")
++    );
++    let queued_request = requests
++        .iter()
++        .find(|request| {
++            channel_elements(request)
++                .iter()
++                .any(|element| element.body() == "queued input")
++        })
++        .context("queued delivery")?;
++    let queued_turn = queued_request.body_json()["client_metadata"]["turn_id"]
++        .as_str()
++        .context("queued turn id")?
++        .to_string();
++    assert_ne!(
++        queued_turn, turn,
++        "the server without the extra opt-in must wait for a new turn"
++    );
++    completed(&mut harness, &queued_turn).await?;
++    assert_bodies(
++        harness.requests().await.last().context("latest request")?,
++        &["active input", "queued input"],
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn tool_notification_reaches_the_same_turn_after_its_output() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let mut harness = start(&[CHANNEL]).await?;
++    emit(
++        &harness.model,
++        "emit-one",
++        &[json!({"content": "during tool", "meta": {"chat_id": "x"}})],
++    )
++    .await;
++    let turn = start_turn(&mut harness, "emit a notification").await?;
++    assert_same_turn(&mut harness, &turn, &["during tool"]).await?;
++    let requests = harness.requests().await;
++    let first = requests
++        .iter()
++        .find(|request| !channel_elements(request).is_empty())
++        .context("channel request")?;
++    assert_after_output(first, "emit-one", "during tool");
++    assert!(
++        first.message_input_texts("user").contains(
++            &"<channel source=\"chan\" chat_id=\"x\">\nduring tool\n</channel>".to_string()
++        )
++    );
++    assert_eq!(harness.server("chan").records("tool_call")?.len(), 1);
++    Ok(())
++}
++
++#[tokio::test]
++async fn notification_during_sampling_continues_the_active_turn() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let mut harness = start(&[CHANNEL]).await?;
++    delay_first_response(&harness, Duration::from_secs(3)).await;
++    let turn = start_turn(&mut harness, "wait for a notification").await?;
++    wait_for_requests(&harness, 1).await?;
++    harness
++        .server("chan")
++        .push(&[json!({"content": "during sampling"})])?;
++    assert_same_turn(&mut harness, &turn, &["during sampling"]).await?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn notifications_from_one_tool_call_keep_fifo_order() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let mut harness = start(&[CHANNEL]).await?;
++    emit(
++        &harness.model,
++        "emit-three",
++        &[
++            json!({"content": "first"}),
++            json!({"content": "second"}),
++            json!({"content": "third"}),
++        ],
++    )
++    .await;
++    let turn = start_turn(&mut harness, "emit three notifications").await?;
++    assert_same_turn(&mut harness, &turn, &["first", "second", "third"]).await?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn notifications_from_successive_tool_calls_keep_fifo_order() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let mut harness = start(&[CHANNEL]).await?;
++    emit(&harness.model, "emit-a", &[json!({"content": "A"})]).await;
++    emit(&harness.model, "emit-b", &[json!({"content": "B"})]).await;
++    let turn = start_turn(&mut harness, "emit twice").await?;
++    assert_same_turn(&mut harness, &turn, &["A", "B"]).await?;
++    assert_eq!(harness.server("chan").records("tool_call")?.len(), 2);
++    Ok(())
++}
++
++#[tokio::test]
++async fn interrupted_unconfirmed_input_is_delivered_once_on_continue() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let mut harness = start(&[CHANNEL]).await?;
++    delay_first_response(&harness, Duration::from_secs(20)).await;
++    let turn = start_turn(&mut harness, "start sampling").await?;
++    wait_for_requests(&harness, 1).await?;
++    harness
++        .server("chan")
++        .push(&[json!({"content": "survives interrupt"})])?;
++    timeout(READ_TIMEOUT, async {
++        while harness.server("chan").sent_notifications()?.is_empty() {
++            sleep(POLL_INTERVAL).await;
++        }
++        Ok::<_, anyhow::Error>(())
++    })
++    .await??;
++    // Allow the live server's input to reach steer while sampling is still blocked.
++    sleep(Duration::from_millis(500)).await;
++    harness
++        .app
++        .interrupt_turn_and_wait_for_aborted(harness.thread_id.clone(), turn, READ_TIMEOUT)
++        .await?;
++    assert!(
++        harness
++            .requests()
++            .await
++            .iter()
++            .all(|request| channel_elements(request).is_empty()),
++        "the input must still be unconfirmed at interrupt"
++    );
++    let next_turn = start_turn(&mut harness, "continue").await?;
++    harness
++        .wait_for_delivery("chan", "survives interrupt")
++        .await?;
++    completed(&mut harness, &next_turn).await?;
++    sleep(QUIET_PERIOD).await;
++    let requests = harness.requests().await;
++    let last = requests.last().context("continued request")?;
++    assert_bodies(last, &["survives interrupt"]);
++    assert!(
++        last.message_input_texts("user")
++            .contains(&"continue".to_string())
++    );
++    assert_eq!(last.body_json()["client_metadata"]["turn_id"], next_turn);
++    Ok(())
++}
++
++#[tokio::test]
++async fn during_turn_input_survives_app_server_restart_and_thread_resume() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let mut harness = start(&[CHANNEL]).await?;
++    emit(
++        &harness.model,
++        "emit-persist",
++        &[json!({"content": "persisted input"})],
++    )
++    .await;
++    let turn = start_turn(&mut harness, "emit persistent input").await?;
++    assert_same_turn(&mut harness, &turn, &["persisted input"]).await?;
++    let status = timeout(READ_TIMEOUT, harness.app.shutdown_gracefully()).await??;
++    assert!(status.success(), "app-server shutdown: {status}");
++    harness.app = TestAppServer::builder()
++        .with_codex_home(harness._home.path())
++        .build_initialized()
++        .await?;
++    let resume_id = harness
++        .app
++        .send_thread_resume_request(ThreadResumeParams {
++            thread_id: harness.thread_id.clone(),
++            ..Default::default()
++        })
++        .await?;
++    let response: ThreadResumeResponse =
++        timeout(READ_TIMEOUT, harness.app.read_response(resume_id)).await??;
++    assert_eq!(response.thread.id, harness.thread_id);
++    harness.wait_for_server_ready("chan").await?;
++    let turn = start_turn(&mut harness, "after resume").await?;
++    completed(&mut harness, &turn).await?;
++    let requests = harness.requests().await;
++    let last = requests.last().context("request after resume")?;
++    assert_bodies(last, &["persisted input"]);
++    assert_after_output(last, "emit-persist", "persisted input");
++    assert!(
++        last.message_input_texts("user")
++            .contains(&"after resume".to_string())
++    );
++    assert_eq!(
++        harness.server("chan").sent_notifications()?.len(),
++        1,
++        "resume must not replay server notifications"
++    );
++    Ok(())
++}
+-- 
+2.53.0
+

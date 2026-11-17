@@ -8,3 +8,4 @@ channels-tests
 mcp-session-env
 status-line-file
 channels-inject
+channels-inject-tests
