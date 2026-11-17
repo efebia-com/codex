@@ -1,0 +1,1151 @@
+From 5a00475871a0e3e9541eae5fc14141700f2329b5 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 11:49:41 +0100
+Subject: [PATCH 4/4] channels: steer opted-in notifications with recording
+ confirmation
+
+---
+ codex-rs/ext/channels/README.md             |  51 ++++
+ codex-rs/ext/channels/src/delivery.rs       | 261 ++++++++++++++----
+ codex-rs/ext/channels/src/delivery_tests.rs | 287 +++++++++++++++++++-
+ codex-rs/ext/channels/src/lib.rs            |  85 +++++-
+ codex-rs/ext/channels/tests/lifecycle.rs    | 189 +++++++++++--
+ 5 files changed, 806 insertions(+), 67 deletions(-)
+ create mode 100644 codex-rs/ext/channels/README.md
+
+diff --git a/codex-rs/ext/channels/README.md b/codex-rs/ext/channels/README.md
+new file mode 100644
+index 0000000000..6e918e19f4
+--- /dev/null
++++ b/codex-rs/ext/channels/README.md
+@@ -0,0 +1,51 @@
++# Channel delivery during an active turn
++
++Channel servers can opt in to delivery while the main thread is working:
++
++```toml
++[mcp_servers.events]
++command = "event-server"
++channel = true
++channel_during_turn = true
++```
++
++`channel_during_turn` is a per-server boolean, defaults to false and is ignored without
++`channel = true`. Servers with only `channel = true` keep their existing behavior: events wait
++for the active turn to finish, then start a channel turn. Servers must declare the
++`claude/channel` experimental capability over a protocol with an initialize handshake.
++The capability is checked separately on every connection, including reconnects.
++
++For opted-in servers, notifications become ordinary user input in the active regular turn,
++using the same `<channel source="events">` format. They appear in the next model request after
++pending tool results, keep their server's FIFO order, and are visible in history, the UI and
++resumed threads. No additional turn starts. Notifications from other servers wait for idle.
++Review, compact, finishing and other turns that reject steering use the existing idle path.
++
++A steered batch stays in memory until the core confirms that its user message was recorded.
++On interrupt, unconfirmed batches return to the head of the queue in order. Interrupt does not
++restart work: they wait for a new notification, a completed turn or the next regular turn.
++A normal turn completion discards unconfirmed input with a warning, so an input hook that
++blocks a message cannot create a retry loop. The limit of 64 waiting events includes
++unconfirmed batches. Idle delivery retains its original acceptance behavior.
++
++Pending and unconfirmed events have no durability after process exit. A cancellation between
++recording and confirmation may cause a repeat. Recorded user input follows ordinary history,
++resume, rollback and compaction rules. If multi-agent mailbox policy defers model sampling to
++the next turn, steered input can be recorded now and answered in the next turn. Channel input
++goes only to the root thread; channel servers are not started in sub-agents.
++
++The server receives no delivery acknowledgement. Expose a reply tool when it needs a response.
++Permission relay and channels contributed by plugins remain outside this extension.
++
++Validation commands:
++
++```sh
++cargo test -p codex-config channel_during_turn
++cargo test -p codex-core --lib config::schema::tests
++cargo test -p codex-rmcp-client --lib custom_notifications
++cargo test -p codex-mcp --lib channel
++cargo test -p codex-channels-extension
++cargo test -p codex-app-server --test all mcp_channels
++```
++
++Apply this series after the base channel, channel test, MCP environment and status line series.
+diff --git a/codex-rs/ext/channels/src/delivery.rs b/codex-rs/ext/channels/src/delivery.rs
+index 84c8b53ee8..ba9d9bcc38 100644
+--- a/codex-rs/ext/channels/src/delivery.rs
++++ b/codex-rs/ext/channels/src/delivery.rs
+@@ -1,11 +1,13 @@
+ //! The per-thread queue between channel notifications and the model.
+ 
++use std::collections::HashSet;
+ use std::collections::VecDeque;
+ use std::sync::Arc;
+ use std::sync::OnceLock;
+ use std::sync::Weak;
+ 
+ use codex_core::StartIfIdleSubmission;
++use codex_core::SteerSubmission;
+ use codex_core::ThreadManager;
+ use codex_core::TurnInput;
+ use codex_core::TurnInputRequest;
+@@ -14,7 +16,6 @@ use codex_extension_api::ExtensionFuture;
+ use codex_mcp::ChannelNotification;
+ use codex_protocol::ThreadId;
+ use codex_protocol::user_input::UserInput;
+-use tokio::sync::Notify;
+ use tokio::sync::mpsc;
+ use tokio::task::JoinHandle;
+ use tracing::debug;
+@@ -24,27 +25,34 @@ use crate::CHANNEL_TURN_TRIGGER;
+ use crate::render::Rejected;
+ use crate::render::render;
+ 
+-/// Notifications waiting for the model, per thread; a notification that finds the queue full is
+-/// dropped.
++/// Notifications waiting for the model, including unconfirmed steered input, per thread.
++/// A notification that finds the queue full is dropped.
+ pub const MAX_PENDING: usize = 64;
+ 
+-/// What became of an attempt to hand the waiting notifications to the model.
++/// What became of an attempt to hand the waiting notifications to the thread.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum DeliveryOutcome {
+-    /// The model has them all; the queue is emptied.
++    /// The thread accepted them. Steered batches still need a recording confirmation.
+     Delivered,
+-    /// Nothing was handed over; they are tried again, with any newer ones, at the next wake.
++    /// Nothing was handed over; retry at the next wake.
+     Later,
+ }
+ 
+-/// How rendered notifications reach a thread, oldest first. This is the one place that decides:
+-/// delivery into a running turn is a further branch of an implementation, not a change of the
+-/// queue.
++/// How rendered notifications reach a thread, oldest first.
+ pub trait Delivery: Send + Sync + 'static {
+     fn deliver<'a>(&'a self, notifications: &'a [String]) -> ExtensionFuture<'a, DeliveryOutcome>;
++
++    fn steer<'a>(
++        &'a self,
++        _notifications: &'a [String],
++        _turn_id: &'a str,
++        _batch_id: u64,
++    ) -> ExtensionFuture<'a, DeliveryOutcome> {
++        Box::pin(async { DeliveryOutcome::Later })
++    }
+ }
+ 
+-/// Starts a turn with the notifications when the thread is idle.
++/// Uses the public thread submission API without replacing active work.
+ pub(crate) struct ThreadDelivery {
+     thread_id: ThreadId,
+     thread_manager: Arc<OnceLock<Weak<ThreadManager>>>,
+@@ -62,6 +70,19 @@ impl ThreadDelivery {
+     }
+ }
+ 
++fn request(notifications: &[String]) -> TurnInputRequest {
++    TurnInputRequest::new(TurnInput::UserInput {
++        content: notifications
++            .iter()
++            .map(|text| UserInput::Text {
++                text: text.clone(),
++                text_elements: Vec::new(),
++            })
++            .collect(),
++        client_id: None,
++    })
++}
++
+ impl Delivery for ThreadDelivery {
+     fn deliver<'a>(&'a self, notifications: &'a [String]) -> ExtensionFuture<'a, DeliveryOutcome> {
+         Box::pin(async move {
+@@ -72,17 +93,7 @@ impl Delivery for ThreadDelivery {
+                 debug!(thread_id = %self.thread_id, "MCP channel delivery waits for its thread");
+                 return DeliveryOutcome::Later;
+             };
+-            let input = TurnInput::UserInput {
+-                content: notifications
+-                    .iter()
+-                    .map(|text| UserInput::Text {
+-                        text: text.clone(),
+-                        text_elements: Vec::new(),
+-                    })
+-                    .collect(),
+-                client_id: None,
+-            };
+-            let request = TurnInputRequest::new(input).on_start(TurnStartOptions {
++            let request = request(notifications).on_start(TurnStartOptions {
+                 turn_trigger: Some(CHANNEL_TURN_TRIGGER.to_string()),
+                 ..Default::default()
+             });
+@@ -99,11 +110,50 @@ impl Delivery for ThreadDelivery {
+             }
+         })
+     }
++
++    fn steer<'a>(
++        &'a self,
++        notifications: &'a [String],
++        turn_id: &'a str,
++        batch_id: u64,
++    ) -> ExtensionFuture<'a, DeliveryOutcome> {
++        Box::pin(async move {
++            let Some(manager) = self.thread_manager.get().and_then(Weak::upgrade) else {
++                return DeliveryOutcome::Later;
++            };
++            let Ok(thread) = manager.get_thread(self.thread_id).await else {
++                return DeliveryOutcome::Later;
++            };
++            let mut request = request(notifications);
++            request
++                .user_input_extension_data
++                .insert("channels".to_string(), batch_id.into());
++            match thread.steer_turn(request, turn_id.to_string()).await {
++                Ok(SteerSubmission::Steered { .. }) => DeliveryOutcome::Delivered,
++                Ok(SteerSubmission::NotSubmitted { reason }) => {
++                    debug!(thread_id = %self.thread_id, ?reason, "MCP channel steer declined; trying idle delivery");
++                    DeliveryOutcome::Later
++                }
++                Err(error) => {
++                    warn!(thread_id = %self.thread_id, %error, "MCP channel steer failed; trying idle delivery");
++                    DeliveryOutcome::Later
++                }
++            }
++        })
++    }
++}
++
++#[derive(Debug)]
++pub(crate) enum WorkerEvent {
++    Wake,
++    TurnStarted(String),
++    Confirmed(u64),
++    TurnEnded { turn_id: String, aborted: bool },
+ }
+ 
+ /// The task that queues a thread's notifications and delivers them; it ends when dropped.
+ pub(crate) struct Worker {
+-    wake: Arc<Notify>,
++    events: mpsc::UnboundedSender<WorkerEvent>,
+     task: JoinHandle<()>,
+ }
+ 
+@@ -111,15 +161,20 @@ impl Worker {
+     pub(crate) fn spawn(
+         notifications: mpsc::Receiver<ChannelNotification>,
+         delivery: Arc<dyn Delivery>,
++        during_turn: HashSet<String>,
+     ) -> Self {
+-        let wake = Arc::new(Notify::new());
+-        let task = tokio::spawn(run(notifications, Arc::clone(&wake), delivery));
+-        Self { wake, task }
++        let (events, receiver) = mpsc::unbounded_channel();
++        let task = tokio::spawn(run(notifications, receiver, delivery, during_turn));
++        Self { events, task }
++    }
++
++    pub(crate) fn event(&self, event: WorkerEvent) {
++        let _ = self.events.send(event);
+     }
+ 
+     /// Tries the waiting notifications again.
+     pub(crate) fn wake(&self) {
+-        self.wake.notify_one();
++        self.event(WorkerEvent::Wake);
+     }
+ }
+ 
+@@ -131,40 +186,77 @@ impl Drop for Worker {
+ 
+ async fn run(
+     mut notifications: mpsc::Receiver<ChannelNotification>,
+-    wake: Arc<Notify>,
++    mut events: mpsc::UnboundedReceiver<WorkerEvent>,
+     delivery: Arc<dyn Delivery>,
++    during_turn: HashSet<String>,
+ ) {
+-    let mut pending = Pending::default();
++    let mut queue = Queue::default();
+     let mut open = true;
+     loop {
+-        tokio::select! {
++        let attempt = tokio::select! {
++            // A recording confirmation or abort queued during submission must be handled before
++            // accepting newer notifications. This also preserves the lifecycle event order.
++            biased;
++            event = events.recv() => match event {
++                Some(event) => queue.event(event),
++                None => break,
++            },
+             notification = notifications.recv(), if open => match notification {
+-                Some(notification) => pending.push(&notification),
+-                None => open = false,
++                Some(notification) => {
++                    queue.push(&notification, during_turn.contains(&notification.server));
++                    true
++                }
++                None => {
++                    open = false;
++                    false
++                }
+             },
+-            () = wake.notified() => {}
+-        }
+-        if pending.0.is_empty() {
+-            continue;
+-        }
+-        if delivery.deliver(pending.0.make_contiguous()).await == DeliveryOutcome::Delivered {
+-            pending.0.clear();
++        };
++        if attempt {
++            queue.deliver(delivery.as_ref()).await;
+         }
+     }
+ }
+ 
+-/// Rendered notifications, oldest first.
++#[derive(Clone)]
++struct Item {
++    rendered: String,
++    during_turn: bool,
++}
++
++struct Batch {
++    id: u64,
++    items: Vec<Item>,
++}
++
+ #[derive(Default)]
+-struct Pending(VecDeque<String>);
++struct Queue {
++    pending: VecDeque<Item>,
++    in_flight: Vec<Batch>,
++    next_id: u64,
++    active_turn: Option<String>,
++}
++
++impl Queue {
++    fn len(&self) -> usize {
++        self.pending.len()
++            + self
++                .in_flight
++                .iter()
++                .map(|batch| batch.items.len())
++                .sum::<usize>()
++    }
+ 
+-impl Pending {
+-    fn push(&mut self, notification: &ChannelNotification) {
++    fn push(&mut self, notification: &ChannelNotification, during_turn: bool) {
+         let server = &notification.server;
+         match render(notification) {
+-            Ok(_) if self.0.len() >= MAX_PENDING => {
++            Ok(_) if self.len() >= MAX_PENDING => {
+                 warn!(%server, "dropping MCP channel notification: {MAX_PENDING} are already waiting");
+             }
+-            Ok(rendered) => self.0.push_back(rendered),
++            Ok(rendered) => self.pending.push_back(Item {
++                rendered,
++                during_turn,
++            }),
+             Err(Rejected::NoContent) => {
+                 warn!(%server, "dropping MCP channel notification without a string content");
+             }
+@@ -173,13 +265,88 @@ impl Pending {
+             }
+         }
+     }
++
++    /// Returns whether this event should attempt delivery. Interrupts never restart work.
++    fn event(&mut self, event: WorkerEvent) -> bool {
++        match event {
++            WorkerEvent::Wake => true,
++            WorkerEvent::TurnStarted(id) => {
++                self.active_turn = Some(id);
++                true
++            }
++            WorkerEvent::Confirmed(id) => {
++                self.in_flight.retain(|batch| batch.id != id);
++                false
++            }
++            WorkerEvent::TurnEnded { turn_id, aborted } => {
++                if self.active_turn.as_ref() != Some(&turn_id) {
++                    return false;
++                }
++                self.active_turn = None;
++                if aborted {
++                    let mut recovered: VecDeque<Item> = self
++                        .in_flight
++                        .drain(..)
++                        .flat_map(|batch| batch.items)
++                        .collect();
++                    recovered.append(&mut self.pending);
++                    self.pending = recovered;
++                } else {
++                    let count: usize = self.in_flight.iter().map(|batch| batch.items.len()).sum();
++                    if count > 0 {
++                        warn!(
++                            count,
++                            "discarding unconfirmed MCP channel input after turn completion"
++                        );
++                    }
++                    self.in_flight.clear();
++                }
++                false
++            }
++        }
++    }
++
++    async fn deliver(&mut self, delivery: &dyn Delivery) {
++        if self.pending.is_empty() {
++            return;
++        }
++        if let Some(turn_id) = &self.active_turn {
++            let items: Vec<Item> = self
++                .pending
++                .iter()
++                .filter(|item| item.during_turn)
++                .cloned()
++                .collect();
++            if !items.is_empty() {
++                let rendered: Vec<String> =
++                    items.iter().map(|item| item.rendered.clone()).collect();
++                let id = self.next_id;
++                self.next_id += 1;
++                if delivery.steer(&rendered, turn_id, id).await == DeliveryOutcome::Delivered {
++                    self.pending.retain(|item| !item.during_turn);
++                    self.in_flight.push(Batch { id, items });
++                    return;
++                }
++            }
++        }
++        // Preserve the original idle path: acceptance empties pending without confirmation.
++        let rendered: Vec<String> = self
++            .pending
++            .iter()
++            .map(|item| item.rendered.clone())
++            .collect();
++        if delivery.deliver(&rendered).await == DeliveryOutcome::Delivered {
++            self.pending.clear();
++        }
++    }
+ }
+ 
+-impl Drop for Pending {
++impl Drop for Queue {
+     fn drop(&mut self) {
+-        if !self.0.is_empty() {
++        let count = self.len();
++        if count > 0 {
+             warn!(
+-                count = self.0.len(),
++                count,
+                 "MCP channel notifications were not delivered before their thread stopped"
+             );
+         }
+diff --git a/codex-rs/ext/channels/src/delivery_tests.rs b/codex-rs/ext/channels/src/delivery_tests.rs
+index f2ff8456e2..3cfff9e0f6 100644
+--- a/codex-rs/ext/channels/src/delivery_tests.rs
++++ b/codex-rs/ext/channels/src/delivery_tests.rs
+@@ -1,3 +1,4 @@
++use std::collections::HashSet;
+ use std::collections::VecDeque;
+ use std::sync::Arc;
+ use std::sync::Mutex;
+@@ -53,6 +54,7 @@ fn harness(outcomes: Vec<DeliveryOutcome>) -> Harness {
+             outcomes: Mutex::new(outcomes.into()),
+             attempts: attempts_sender,
+         }),
++        HashSet::new(),
+     );
+     Harness {
+         notifications,
+@@ -182,7 +184,7 @@ async fn dropping_the_worker_stops_delivery() {
+ 
+     drop(std::mem::replace(
+         worker,
+-        Worker::spawn(mpsc::channel(1).1, Arc::new(NeverDelivery)),
++        Worker::spawn(mpsc::channel(1).1, Arc::new(NeverDelivery), HashSet::new()),
+     ));
+     let _ = notifications.send(event("late")).await;
+     let next = timeout(Duration::from_millis(200), attempts.recv()).await;
+@@ -196,3 +198,286 @@ impl Delivery for NeverDelivery {
+         Box::pin(async { DeliveryOutcome::Later })
+     }
+ }
++
++#[derive(Debug, PartialEq, Eq)]
++enum Attempt {
++    Idle(Vec<String>),
++    Steer {
++        texts: Vec<String>,
++        turn: String,
++        batch: u64,
++    },
++}
++
++struct SteeringDelivery {
++    accepted: bool,
++    idle: DeliveryOutcome,
++    attempts: Mutex<Vec<Attempt>>,
++}
++
++impl Delivery for SteeringDelivery {
++    fn deliver<'a>(&'a self, texts: &'a [String]) -> ExtensionFuture<'a, DeliveryOutcome> {
++        Box::pin(async move {
++            self.attempts
++                .lock()
++                .expect("attempts")
++                .push(Attempt::Idle(texts.to_vec()));
++            self.idle
++        })
++    }
++
++    fn steer<'a>(
++        &'a self,
++        texts: &'a [String],
++        turn: &'a str,
++        batch: u64,
++    ) -> ExtensionFuture<'a, DeliveryOutcome> {
++        Box::pin(async move {
++            self.attempts
++                .lock()
++                .expect("attempts")
++                .push(Attempt::Steer {
++                    texts: texts.to_vec(),
++                    turn: turn.to_string(),
++                    batch,
++                });
++            if self.accepted {
++                DeliveryOutcome::Delivered
++            } else {
++                DeliveryOutcome::Later
++            }
++        })
++    }
++}
++
++fn steering(accepted: bool) -> SteeringDelivery {
++    SteeringDelivery {
++        accepted,
++        idle: DeliveryOutcome::Later,
++        attempts: Mutex::new(Vec::new()),
++    }
++}
++
++#[tokio::test]
++async fn active_turn_only_takes_opted_in_notifications_and_confirmation_releases_capacity() {
++    use super::Queue;
++    use super::WorkerEvent;
++
++    let delivery = steering(true);
++    let mut queue = Queue::default();
++    queue.event(WorkerEvent::TurnStarted("turn".to_string()));
++    queue.push(&event("queued"), false);
++    queue.push(&event("first"), true);
++    queue.push(&event("second"), true);
++    queue.deliver(&delivery).await;
++
++    assert_eq!(
++        *delivery.attempts.lock().expect("attempts"),
++        vec![Attempt::Steer {
++            texts: vec![rendered("first"), rendered("second")],
++            turn: "turn".to_string(),
++            batch: 0,
++        }]
++    );
++    assert_eq!(queue.pending.len(), 1);
++    assert_eq!(queue.len(), 3);
++    queue.event(WorkerEvent::Confirmed(99));
++    assert_eq!(queue.len(), 3);
++    queue.event(WorkerEvent::Confirmed(0));
++    assert_eq!(queue.len(), 1);
++    assert!(!queue.event(WorkerEvent::TurnEnded {
++        turn_id: "turn".to_string(),
++        aborted: true
++    }));
++    assert_eq!(queue.pending[0].rendered, rendered("queued"));
++}
++
++#[tokio::test]
++async fn abort_recovers_unconfirmed_batches_before_newer_input_in_fifo_order() {
++    use super::Queue;
++    use super::WorkerEvent;
++
++    let delivery = steering(true);
++    let mut queue = Queue::default();
++    queue.event(WorkerEvent::TurnStarted("old".to_string()));
++    queue.push(&event("confirmed"), true);
++    queue.deliver(&delivery).await;
++    queue.event(WorkerEvent::Confirmed(0));
++    for text in ["first", "second"] {
++        queue.push(&event(text), true);
++        queue.deliver(&delivery).await;
++    }
++    queue.push(&event("newest"), true);
++    assert!(!queue.event(WorkerEvent::TurnEnded {
++        turn_id: "old".to_string(),
++        aborted: true
++    }));
++    assert!(queue.in_flight.is_empty());
++    assert!(queue.active_turn.is_none());
++    assert_eq!(queue.len(), 3);
++    queue.event(WorkerEvent::TurnStarted("next".to_string()));
++    queue.deliver(&delivery).await;
++    assert_eq!(
++        delivery.attempts.lock().expect("attempts").last(),
++        Some(&Attempt::Steer {
++            texts: vec![rendered("first"), rendered("second"), rendered("newest")],
++            turn: "next".to_string(),
++            batch: 3,
++        })
++    );
++}
++
++#[tokio::test]
++async fn normal_completion_discards_blocked_batches_without_replaying_them() {
++    use super::Queue;
++    use super::WorkerEvent;
++
++    let delivery = steering(true);
++    let mut queue = Queue::default();
++    queue.event(WorkerEvent::TurnStarted("turn".to_string()));
++    queue.push(&event("blocked"), true);
++    queue.deliver(&delivery).await;
++    queue.event(WorkerEvent::TurnEnded {
++        turn_id: "turn".to_string(),
++        aborted: false,
++    });
++    assert_eq!(queue.len(), 0);
++    queue.deliver(&delivery).await;
++    assert_eq!(delivery.attempts.lock().expect("attempts").len(), 1);
++}
++
++#[tokio::test]
++async fn rejected_steer_falls_back_to_the_original_idle_batch_without_losing_input() {
++    use super::Queue;
++    use super::WorkerEvent;
++
++    let mut delivery = steering(false);
++    let mut queue = Queue::default();
++    queue.event(WorkerEvent::TurnStarted("finishing".to_string()));
++    queue.push(&event("queued"), false);
++    queue.push(&event("active"), true);
++    queue.deliver(&delivery).await;
++    assert_eq!(
++        *delivery.attempts.lock().expect("attempts"),
++        vec![
++            Attempt::Steer {
++                texts: vec![rendered("active")],
++                turn: "finishing".to_string(),
++                batch: 0
++            },
++            Attempt::Idle(vec![rendered("queued"), rendered("active")]),
++        ]
++    );
++    assert_eq!(queue.len(), 2);
++    assert!(queue.in_flight.is_empty());
++    delivery.idle = DeliveryOutcome::Delivered;
++    queue.deliver(&delivery).await;
++    assert_eq!(queue.len(), 0);
++}
++
++#[tokio::test]
++async fn the_queue_limit_includes_unconfirmed_steered_notifications() {
++    use super::Queue;
++    use super::WorkerEvent;
++
++    let delivery = steering(true);
++    let mut queue = Queue::default();
++    queue.event(WorkerEvent::TurnStarted("turn".to_string()));
++    for n in 0..MAX_PENDING {
++        queue.push(&event(&n.to_string()), true);
++    }
++    queue.deliver(&delivery).await;
++    assert_eq!(queue.len(), MAX_PENDING);
++    queue.push(&event("overflow"), true);
++    assert!(queue.pending.is_empty());
++    queue.event(WorkerEvent::Confirmed(0));
++    queue.push(&event("fits"), true);
++    assert_eq!(queue.len(), 1);
++}
++
++#[tokio::test]
++async fn stale_turn_end_does_not_clear_the_current_turn() {
++    use super::Queue;
++    use super::WorkerEvent;
++
++    let delivery = steering(true);
++    let mut queue = Queue::default();
++    queue.event(WorkerEvent::TurnStarted("new".to_string()));
++    queue.push(&event("current"), true);
++    queue.deliver(&delivery).await;
++    queue.event(WorkerEvent::TurnEnded {
++        turn_id: "old".to_string(),
++        aborted: true,
++    });
++    assert_eq!(queue.active_turn.as_deref(), Some("new"));
++    assert_eq!(queue.in_flight.len(), 1);
++}
++
++/// Confirmation can be emitted by the core before the steer submission returns to the worker.
++struct ConfirmingDelivery {
++    events: Arc<std::sync::OnceLock<mpsc::UnboundedSender<super::WorkerEvent>>>,
++    attempts: mpsc::UnboundedSender<&'static str>,
++}
++
++impl Delivery for ConfirmingDelivery {
++    fn deliver<'a>(&'a self, _texts: &'a [String]) -> ExtensionFuture<'a, DeliveryOutcome> {
++        Box::pin(async move {
++            self.attempts.send("idle").expect("attempts");
++            DeliveryOutcome::Delivered
++        })
++    }
++
++    fn steer<'a>(
++        &'a self,
++        _texts: &'a [String],
++        _turn: &'a str,
++        batch: u64,
++    ) -> ExtensionFuture<'a, DeliveryOutcome> {
++        Box::pin(async move {
++            self.events
++                .get()
++                .expect("events")
++                .send(super::WorkerEvent::Confirmed(batch))
++                .expect("worker alive");
++            self.attempts.send("steer").expect("attempts");
++            DeliveryOutcome::Delivered
++        })
++    }
++}
++
++#[tokio::test]
++async fn confirmation_during_submission_is_processed_before_abort_and_new_delivery() {
++    use super::WorkerEvent;
++
++    let events = Arc::new(std::sync::OnceLock::new());
++    let (sender, notifications) = mpsc::channel(4);
++    let (attempts, mut receiver) = mpsc::unbounded_channel();
++    let worker = Worker::spawn(
++        notifications,
++        Arc::new(ConfirmingDelivery {
++            events: Arc::clone(&events),
++            attempts,
++        }),
++        HashSet::from(["srv".to_string()]),
++    );
++    assert!(events.set(worker.events.clone()).is_ok());
++    worker.event(WorkerEvent::TurnStarted("turn".to_string()));
++    sender
++        .send(event("already recorded"))
++        .await
++        .expect("notification");
++    assert_eq!(
++        timeout(WAIT, receiver.recv()).await.expect("attempt"),
++        Some("steer")
++    );
++    worker.event(WorkerEvent::TurnEnded {
++        turn_id: "turn".to_string(),
++        aborted: true,
++    });
++    worker.wake();
++    assert!(
++        timeout(Duration::from_millis(200), receiver.recv())
++            .await
++            .is_err()
++    );
++}
+diff --git a/codex-rs/ext/channels/src/lib.rs b/codex-rs/ext/channels/src/lib.rs
+index 2cff70d569..2d7c877444 100644
+--- a/codex-rs/ext/channels/src/lib.rs
++++ b/codex-rs/ext/channels/src/lib.rs
+@@ -9,15 +9,20 @@
+ //! Delivery: an idle thread starts a turn for the notification at once. Notifications that
+ //! arrive during a turn wait, in order, and start one turn together when the thread is next
+ //! idle; after an interrupted turn they wait for the next notification or completed turn.
++//! With `channel_during_turn = true`, a server's events instead steer the active regular turn.
++//! Steered input is retained until recorded; an interrupt returns unrecorded input to the queue
++//! without restarting work. Other turn kinds retain the idle behavior.
+ //! Sub-agent and other non-root threads do not start channel servers at all, so a server never
+ //! runs twice for one chat.
+ 
++use std::collections::BTreeMap;
+ use std::sync::Arc;
+ use std::sync::OnceLock;
+ use std::sync::Weak;
+ 
+ use codex_core::ThreadManager;
+ use codex_core::config::Config;
++use codex_extension_api::ExtensionData;
+ use codex_extension_api::ExtensionFuture;
+ use codex_extension_api::ExtensionRegistryBuilder;
+ use codex_extension_api::McpServerContribution;
+@@ -29,7 +34,13 @@ use codex_extension_api::ThreadLifecycleContributor;
+ use codex_extension_api::ThreadReadyInput;
+ use codex_extension_api::ThreadStartInput;
+ use codex_extension_api::ThreadStopInput;
++use codex_extension_api::TurnAbortInput;
++use codex_extension_api::TurnLifecycleContributor;
++use codex_extension_api::TurnStartInput;
++use codex_extension_api::TurnStartPhase;
++use codex_extension_api::TurnStopInput;
+ use codex_protocol::ThreadId;
++use codex_protocol::items::TurnItem;
+ use codex_protocol::protocol::SessionSource;
+ use tracing::warn;
+ 
+@@ -41,6 +52,7 @@ pub use delivery::DeliveryOutcome;
+ pub use delivery::MAX_PENDING;
+ use delivery::ThreadDelivery;
+ use delivery::Worker;
++use delivery::WorkerEvent;
+ 
+ /// Recorded as the trigger of the turns that channel notifications start.
+ pub const CHANNEL_TURN_TRIGGER: &str = "channel";
+@@ -58,6 +70,7 @@ pub fn install(
+ /// Registers `extension`, for hosts that create the thread manager after the registry.
+ pub fn register(builder: &mut ExtensionRegistryBuilder<Config>, extension: Arc<ChannelsExtension>) {
+     builder.mcp_server_contributor(extension.clone());
++    builder.turn_lifecycle_contributor(extension.clone());
+     builder.thread_lifecycle_contributor(extension);
+ }
+ 
+@@ -122,9 +135,17 @@ impl ThreadLifecycleContributor<Config> for ChannelsExtension {
+                 }
+             };
+             let delivery = ThreadDelivery::new(thread_id, Arc::clone(&self.thread_manager));
+-            input
+-                .thread_store
+-                .insert(Worker::spawn(notifications, Arc::new(delivery)));
++            let during_turn = codex_mcp::channel_servers(&input.config.config_layer_stack)
++                .into_iter()
++                .filter(|name| {
++                    codex_mcp::channel_during_turn(&input.config.config_layer_stack, name)
++                })
++                .collect();
++            input.thread_store.insert(Worker::spawn(
++                notifications,
++                Arc::new(delivery),
++                during_turn,
++            ));
+         })
+     }
+ 
+@@ -151,6 +172,64 @@ impl ThreadLifecycleContributor<Config> for ChannelsExtension {
+     }
+ }
+ 
++// Stop/abort inputs have no turn id. Keep it in the turn store to ignore stale callbacks.
++struct ChannelTurn(String);
++
++impl TurnLifecycleContributor for ChannelsExtension {
++    fn turn_start_phase(&self, _thread_store: &ExtensionData) -> TurnStartPhase {
++        TurnStartPhase::RegularTaskStart
++    }
++
++    fn on_turn_start<'a>(&'a self, input: TurnStartInput<'a>) -> ExtensionFuture<'a, ()> {
++        Box::pin(async move {
++            if let Some(worker) = input.thread_store.get::<Worker>() {
++                input
++                    .turn_store
++                    .insert(ChannelTurn(input.turn_id.to_string()));
++                worker.event(WorkerEvent::TurnStarted(input.turn_id.to_string()));
++            }
++        })
++    }
++
++    fn on_item_completed_with_metadata<'a>(
++        &'a self,
++        thread_store: &'a ExtensionData,
++        _turn_store: &'a ExtensionData,
++        item: &'a TurnItem,
++        metadata: Option<&'a BTreeMap<String, serde_json::Value>>,
++    ) -> ExtensionFuture<'a, ()> {
++        Box::pin(async move {
++            if matches!(item, TurnItem::UserMessage(_))
++                && let Some(id) = metadata
++                    .and_then(|data| data.get("channels"))
++                    .and_then(serde_json::Value::as_u64)
++                && let Some(worker) = thread_store.get::<Worker>()
++            {
++                worker.event(WorkerEvent::Confirmed(id));
++            }
++        })
++    }
++
++    fn on_turn_stop<'a>(&'a self, input: TurnStopInput<'a>) -> ExtensionFuture<'a, ()> {
++        Box::pin(async move { end_turn(input.thread_store, input.turn_store, false) })
++    }
++
++    fn on_turn_abort<'a>(&'a self, input: TurnAbortInput<'a>) -> ExtensionFuture<'a, ()> {
++        Box::pin(async move { end_turn(input.thread_store, input.turn_store, true) })
++    }
++}
++
++fn end_turn(thread_store: &ExtensionData, turn_store: &ExtensionData, aborted: bool) {
++    if let Some(turn) = turn_store.get::<ChannelTurn>()
++        && let Some(worker) = thread_store.get::<Worker>()
++    {
++        worker.event(WorkerEvent::TurnEnded {
++            turn_id: turn.0.clone(),
++            aborted,
++        });
++    }
++}
++
+ fn wake(thread_store: &codex_extension_api::ExtensionData) {
+     if let Some(worker) = thread_store.get::<Worker>() {
+         worker.wake();
+diff --git a/codex-rs/ext/channels/tests/lifecycle.rs b/codex-rs/ext/channels/tests/lifecycle.rs
+index e2dc6b87a2..c32baa70a6 100644
+--- a/codex-rs/ext/channels/tests/lifecycle.rs
++++ b/codex-rs/ext/channels/tests/lifecycle.rs
+@@ -8,6 +8,8 @@ use std::process::Stdio;
+ use std::sync::Arc;
+ use std::sync::Mutex;
+ use std::sync::PoisonError;
++use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::Ordering;
+ use std::time::Duration;
+ use std::time::Instant;
+ 
+@@ -21,13 +23,16 @@ use codex_core::config::Config;
+ use codex_extension_api::ExtensionRegistryBuilder;
+ use codex_protocol::mcp::ClientMcpExtensions;
+ use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::Op;
+ use codex_protocol::user_input::UserInput;
+ use core_test_support::responses::ResponseMock;
+ use core_test_support::responses::ev_assistant_message;
+ use core_test_support::responses::ev_completed;
+ use core_test_support::responses::ev_response_created;
++use core_test_support::responses::mount_response_handler;
+ use core_test_support::responses::mount_sse_sequence;
+ use core_test_support::responses::sse;
++use core_test_support::responses::sse_response;
+ use core_test_support::responses::start_mock_server;
+ use core_test_support::test_codex::TestCodex;
+ use core_test_support::test_codex::run_test_with_large_stack;
+@@ -103,23 +108,46 @@ struct Fixture {
+ impl Fixture {
+     /// One Codex thread with the channel server enabled, and `turns` scripted model answers.
+     async fn start(turns: usize) -> Result<Self> {
++        Self::start_with(turns, None).await
++    }
++
++    /// Opt-in scenarios keep the first sampling request open while a notification arrives.
++    async fn start_with(turns: usize, during_turn: Option<Duration>) -> Result<Self> {
+         let dir = TempDir::new()?;
+         std::fs::write(dir.path().join("server.py"), SERVER)?;
+         std::fs::create_dir(dir.path().join("outbox"))?;
+         let server = start_mock_server().await;
+-        let responses = mount_sse_sequence(
+-            &server,
+-            (0..turns)
+-                .map(|n| {
+-                    sse(vec![
+-                        ev_response_created(&format!("resp-{n}")),
+-                        ev_assistant_message(&format!("msg-{n}"), "ok"),
+-                        ev_completed(&format!("resp-{n}")),
+-                    ])
+-                })
+-                .collect(),
+-        )
+-        .await;
++        let responses = if let Some(delay) = during_turn {
++            let count = AtomicUsize::new(0);
++            mount_response_handler(&server, move |_| {
++                let n = count.fetch_add(1, Ordering::SeqCst);
++                let response = sse_response(sse(vec![
++                    ev_response_created(&format!("resp-{n}")),
++                    ev_assistant_message(&format!("msg-{n}"), "ok"),
++                    ev_completed(&format!("resp-{n}")),
++                ]));
++                if n == 0 {
++                    response.set_delay(delay)
++                } else {
++                    response
++                }
++            })
++            .await
++        } else {
++            mount_sse_sequence(
++                &server,
++                (0..turns)
++                    .map(|n| {
++                        sse(vec![
++                            ev_response_created(&format!("resp-{n}")),
++                            ev_assistant_message(&format!("msg-{n}"), "ok"),
++                            ev_completed(&format!("resp-{n}")),
++                        ])
++                    })
++                    .collect(),
++            )
++            .await
++        };
+         let extension = Arc::new(ChannelsExtension::default());
+         let mut extensions = ExtensionRegistryBuilder::new();
+         codex_channels_extension::register(&mut extensions, Arc::clone(&extension));
+@@ -136,7 +164,7 @@ impl Fixture {
+         let test = test_codex()
+             .with_extensions(Arc::new(extensions.build()))
+             .with_config(move |config| {
+-                let result = enable_channel_server(config, paths);
++                let result = enable_channel_server(config, paths, during_turn.is_some());
+                 *outcome.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
+             })
+             .build(&server)
+@@ -196,13 +224,13 @@ impl Fixture {
+ 
+ /// Enables the channel server in `config`, as `mcp_servers.chan` with `channel = true` in a
+ /// config file would.
+-fn enable_channel_server(config: &mut Config, args: [String; 4]) -> Result<()> {
++fn enable_channel_server(config: &mut Config, args: [String; 4], during_turn: bool) -> Result<()> {
+     config.mcp_servers.set(serde_json::from_value(json!({
+         SERVER_NAME: { "command": "python3", "args": args },
+     }))?)?;
+     // The typed server config has no `channel`; the extension reads it from the layers.
+     let layer: TomlValue = serde_json::from_value(json!({
+-        "mcp_servers": { SERVER_NAME: { "channel": true } },
++        "mcp_servers": { SERVER_NAME: { "channel": true, "channel_during_turn": during_turn } },
+     }))?;
+     config.config_layer_stack = config
+         .config_layer_stack
+@@ -401,3 +429,132 @@ async fn a_dead_server_stays_dead_scenario() -> Result<()> {
+     assert_eq!(fixture.pids(), vec![pid]);
+     Ok(())
+ }
++
++#[test]
++fn active_turn_receives_the_notification_without_starting_a_second_turn() -> Result<()> {
++    run_test_with_large_stack("channel-active-turn", active_turn_delivery_scenario)
++}
++
++async fn active_turn_delivery_scenario() -> Result<()> {
++    let fixture = Fixture::start_with(0, Some(Duration::from_secs(3))).await?;
++    let pid = fixture.wait_for_pids(1).await?[0];
++    fixture
++        .test
++        .codex
++        .start_turn_if_idle(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: "hold".to_string(),
++            text_elements: Vec::new(),
++        }]))
++        .await?;
++    fixture.request_user_texts(0).await?;
++    fixture
++        .notify(pid, "1", json!({ "content": "during sampling" }))
++        .await?;
++    wait_for_event(&fixture.test.codex, |event| {
++        matches!(event, EventMsg::TurnComplete(_))
++    })
++    .await;
++
++    let requests = fixture.responses.requests();
++    assert!(requests.len() >= 2);
++    let first = requests[0].body_json();
++    let turn_id = first["client_metadata"]["turn_id"]
++        .as_str()
++        .context("turn id")?;
++    for request in &requests[1..] {
++        assert_eq!(request.body_json()["client_metadata"]["turn_id"], turn_id);
++    }
++    assert_eq!(
++        requests
++            .last()
++            .context("last request")?
++            .message_input_texts("user")
++            .iter()
++            .filter(|text| **text == rendered("during sampling"))
++            .count(),
++        1
++    );
++    // Once recorded, the batch is not requeued when the turn completes.
++    user_turn(&fixture.test.codex, "after confirmation").await?;
++    let requests = fixture.responses.requests();
++    assert_eq!(
++        requests
++            .last()
++            .context("last request")?
++            .message_input_texts("user")
++            .iter()
++            .filter(|text| **text == rendered("during sampling"))
++            .count(),
++        1
++    );
++    Ok(())
++}
++
++#[test]
++fn interrupted_turn_requeues_unrecorded_channel_input_for_the_next_user_turn() -> Result<()> {
++    run_test_with_large_stack("channel-interrupt-requeue", interrupted_delivery_scenario)
++}
++
++async fn interrupted_delivery_scenario() -> Result<()> {
++    let fixture = Fixture::start_with(0, Some(Duration::from_secs(20))).await?;
++    let pid = fixture.wait_for_pids(1).await?[0];
++    fixture
++        .test
++        .codex
++        .start_turn_if_idle(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: "hold".to_string(),
++            text_elements: Vec::new(),
++        }]))
++        .await?;
++    fixture.request_user_texts(0).await?;
++    fixture
++        .notify(pid, "1", json!({ "content": "recover me" }))
++        .await?;
++    let sent = fixture
++        .dir
++        .path()
++        .join("outbox")
++        .join(pid.to_string())
++        .join("1.json");
++    wait_until(|| !sent.exists()).await?;
++    // Sampling stays blocked; give the asynchronous forwarder time to steer the pending input.
++    tokio::time::sleep(Duration::from_millis(500)).await;
++    fixture.test.codex.submit(Op::Interrupt).await?;
++    wait_for_event(&fixture.test.codex, |event| {
++        matches!(event, EventMsg::TurnAborted(_))
++    })
++    .await;
++    tokio::time::sleep(Duration::from_millis(200)).await;
++    assert_eq!(
++        fixture.responses.requests().len(),
++        1,
++        "interrupt must not restart work"
++    );
++
++    user_turn(&fixture.test.codex, "continue").await?;
++    // Delivery may race the next turn's first sampling request, but must remain in that turn.
++    let requests = fixture.responses.requests();
++    let next = requests
++        .get(1)
++        .context("next user turn request")?
++        .body_json();
++    let turn_id = next["client_metadata"]["turn_id"]
++        .as_str()
++        .context("next turn id")?;
++    for request in &requests[1..] {
++        assert_eq!(request.body_json()["client_metadata"]["turn_id"], turn_id);
++    }
++    let texts = requests
++        .last()
++        .context("last request")?
++        .message_input_texts("user");
++    assert_eq!(
++        texts
++            .iter()
++            .filter(|text| **text == rendered("recover me"))
++            .count(),
++        1
++    );
++    assert!(texts.iter().any(|text| text == "continue"));
++    Ok(())
++}
+-- 
+2.53.0
+

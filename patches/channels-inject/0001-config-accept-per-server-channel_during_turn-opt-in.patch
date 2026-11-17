@@ -1,0 +1,87 @@
+From f54bc0db058a4e09b2551a60271458ef5015d251 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 11:42:15 +0100
+Subject: [PATCH 1/4] config: accept per-server channel_during_turn opt-in
+
+---
+ codex-rs/config/src/mcp_types.rs       |  5 +++++
+ codex-rs/config/src/mcp_types_tests.rs | 16 ++++++++++++++++
+ codex-rs/core/config.schema.json       |  7 ++++++-
+ 3 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/codex-rs/config/src/mcp_types.rs b/codex-rs/config/src/mcp_types.rs
+index 56f38a302b..7c4c77051d 100644
+--- a/codex-rs/config/src/mcp_types.rs
++++ b/codex-rs/config/src/mcp_types.rs
+@@ -449,6 +449,10 @@ pub struct RawMcpServerConfig {
+     // The MCP runtime reads this from the layered config; it is not part of `McpServerConfig`.
+     #[serde(default)]
+     pub channel: Option<bool>,
++    /// Deliver channel notifications into an active regular turn. Requires `channel = true`.
++    // The extension reads this from the layered config; it is not part of `McpServerConfig`.
++    #[serde(default)]
++    pub channel_during_turn: Option<bool>,
+     /// Whether startup requires a live connection or can use a valid cached tool catalog.
+     #[serde(default)]
+     pub startup_readiness: Option<McpStartupReadiness>,
+@@ -505,6 +509,7 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
+             enabled,
+             required,
+             channel: _,
++            channel_during_turn: _,
+             startup_readiness,
+             supports_parallel_tool_calls,
+             tool_input_schema_max_bytes,
+diff --git a/codex-rs/config/src/mcp_types_tests.rs b/codex-rs/config/src/mcp_types_tests.rs
+index baae2e8549..5f5aa15707 100644
+--- a/codex-rs/config/src/mcp_types_tests.rs
++++ b/codex-rs/config/src/mcp_types_tests.rs
+@@ -4,6 +4,22 @@ use pretty_assertions::assert_eq;
+ use std::collections::HashMap;
+ use std::path::Path;
+ 
++#[test]
++fn channel_during_turn_accepts_only_booleans_and_is_optional() {
++    for extra in [
++        "",
++        "channel_during_turn = true",
++        "channel_during_turn = false",
++    ] {
++        let config = format!("command = 'server'\nchannel = true\n{extra}");
++        assert!(toml::from_str::<McpServerConfig>(&config).is_ok());
++    }
++    assert!(
++        toml::from_str::<McpServerConfig>("command = 'server'\nchannel_during_turn = 'true'")
++            .is_err()
++    );
++}
++
+ #[test]
+ fn app_tool_approval_restrictions_never_weaken_either_policy() {
+     use AppToolApproval::Approve;
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index 48fcd4252e..05346c48c5 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -4345,6 +4345,11 @@
+           "description": "Pass this server's `notifications/claude/channel` notifications to the chat as input. Takes effect only when the server also declares the `claude/channel` experimental capability.",
+           "type": "boolean"
+         },
++        "channel_during_turn": {
++          "default": null,
++          "description": "Deliver channel notifications into an active regular turn. Requires `channel = true`.",
++          "type": "boolean"
++        },
+         "command": {
+           "type": "string"
+         },
+@@ -9058,4 +9063,4 @@
+   },
+   "title": "ConfigToml",
+   "type": "object"
+-}
+\ No newline at end of file
++}
+-- 
+2.53.0
+

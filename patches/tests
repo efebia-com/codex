@@ -21,3 +21,10 @@ channels-tests: -p codex-app-server --test all mcp_channels
 
 status-line-file: -p codex-tui status_line
 status-line-file: -p codex-core --lib config::schema::tests
+
+channels-inject: -p codex-config channel_during_turn
+channels-inject: -p codex-core --lib config::schema::tests
+channels-inject: -p codex-rmcp-client --lib custom_notifications
+channels-inject: -p codex-mcp --lib channel
+channels-inject: -p codex-channels-extension
+channels-inject: -p codex-app-server --test all mcp_channels

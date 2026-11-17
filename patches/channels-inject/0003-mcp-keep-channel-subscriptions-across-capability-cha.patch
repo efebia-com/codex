@@ -1,0 +1,130 @@
+From 0278e1c50d66a37e78b7644ee9480b15ac377c7c Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 11:43:23 +0100
+Subject: [PATCH 3/4] mcp: keep channel subscriptions across capability changes
+
+---
+ codex-rs/codex-mcp/src/channel.rs       | 25 ++++++++++++++++------
+ codex-rs/codex-mcp/src/channel_tests.rs | 28 ++++++++++++++++++++++++-
+ codex-rs/codex-mcp/src/lib.rs           |  1 +
+ 3 files changed, 47 insertions(+), 7 deletions(-)
+
+diff --git a/codex-rs/codex-mcp/src/channel.rs b/codex-rs/codex-mcp/src/channel.rs
+index 2d32eb1c7e..3fba9aa16d 100644
+--- a/codex-rs/codex-mcp/src/channel.rs
++++ b/codex-rs/codex-mcp/src/channel.rs
+@@ -51,6 +51,18 @@ pub fn channel_enabled(config_layer_stack: &ConfigLayerStack, server: &str) -> b
+         .unwrap_or(false)
+ }
+ 
++/// Whether `server` explicitly enables channel delivery into an active turn.
++pub fn channel_during_turn(config_layer_stack: &ConfigLayerStack, server: &str) -> bool {
++    channel_enabled(config_layer_stack, server)
++        && config_layer_stack
++            .effective_config()
++            .get("mcp_servers")
++            .and_then(|servers| servers.get(server))
++            .and_then(|server| server.get("channel_during_turn"))
++            .and_then(TomlValue::as_bool)
++            .unwrap_or(false)
++}
++
+ /// Names of the servers for which the layered config enables channel delivery, sorted.
+ pub fn channel_servers(config_layer_stack: &ConfigLayerStack) -> Vec<String> {
+     let config = config_layer_stack.effective_config();
+@@ -117,27 +129,28 @@ impl ChannelSubscription {
+             .experimental
+             .get_or_insert_default()
+             .insert(CHANNEL_CAPABILITY.to_string(), Default::default());
+-        let notifications = client
+-            .subscribe_custom_notifications(CHANNEL_NOTIFICATION_METHOD, CHANNEL_QUEUE_CAPACITY);
++        let notifications = client.subscribe_custom_notifications(
++            CHANNEL_NOTIFICATION_METHOD,
++            CHANNEL_CAPABILITY,
++            CHANNEL_QUEUE_CAPACITY,
++        );
+         Some(Self { hub, notifications })
+     }
+ 
+-    /// Forwards the server's notifications to the hub until its connection ends, if the
+-    /// server declared the capability over a session with an `initialize` handshake.
++    /// Forwards notifications across connections of this client. The transport checks the
++    /// capability on every connection, including any later reconnect.
+     pub(crate) fn connect(self, server: String, initialize_result: &ServerPeerInfo) {
+         if !initialize_result.protocol_version.has_initialize() {
+             info!(
+                 server = %server,
+                 "MCP channel disabled: the server uses a protocol version without sessions"
+             );
+-            return;
+         }
+         if !declares_channel(&initialize_result.capabilities) {
+             info!(
+                 server = %server,
+                 "MCP channel disabled: the server does not declare {CHANNEL_CAPABILITY}"
+             );
+-            return;
+         }
+         let Self {
+             hub,
+diff --git a/codex-rs/codex-mcp/src/channel_tests.rs b/codex-rs/codex-mcp/src/channel_tests.rs
+index 4bb85a0709..944a64abf8 100644
+--- a/codex-rs/codex-mcp/src/channel_tests.rs
++++ b/codex-rs/codex-mcp/src/channel_tests.rs
+@@ -61,6 +61,32 @@ fn a_later_layer_overrides_the_channel_setting() {
+     assert!(channel_enabled(&stack, "srv"));
+ }
+ 
++#[test]
++fn during_turn_requires_both_explicit_flags_and_respects_layers() {
++    let config = stack(vec![json!({ "mcp_servers": {
++        "enabled": { "channel": true, "channel_during_turn": true },
++        "queued": { "channel": true },
++        "disabled": { "channel": true, "channel_during_turn": false },
++        "missing_channel": { "channel_during_turn": true },
++        "wrong_type": { "channel": true, "channel_during_turn": "true" },
++    }})]);
++    assert!(channel_during_turn(&config, "enabled"));
++    for name in [
++        "queued",
++        "disabled",
++        "missing_channel",
++        "wrong_type",
++        "missing",
++    ] {
++        assert!(!channel_during_turn(&config, name), "{name}");
++    }
++    let config = stack(vec![
++        json!({ "mcp_servers": { "srv": { "channel": true, "channel_during_turn": true } } }),
++        json!({ "mcp_servers": { "srv": { "channel_during_turn": false } } }),
++    ]);
++    assert!(!channel_during_turn(&config, "srv"));
++}
++
+ #[derive(Clone)]
+ struct ChannelServer {
+     declares_channel: bool,
+@@ -186,7 +212,7 @@ async fn server_without_the_capability_is_not_forwarded() -> anyhow::Result<()>
+ 
+     assert_eq!(seen["experimental"][CHANNEL_CAPABILITY], json!({}));
+     let next = timeout(Duration::from_millis(300), receiver.recv()).await;
+-    assert!(!matches!(next, Ok(Some(_))), "{next:?}");
++    assert!(next.is_err(), "forwarder should stay subscribed: {next:?}");
+     client.shutdown().await;
+     Ok(())
+ }
+diff --git a/codex-rs/codex-mcp/src/lib.rs b/codex-rs/codex-mcp/src/lib.rs
+index 84d9fc0722..50c3456430 100644
+--- a/codex-rs/codex-mcp/src/lib.rs
++++ b/codex-rs/codex-mcp/src/lib.rs
+@@ -9,6 +9,7 @@ pub use channel::CHANNEL_CAPABILITY;
+ pub use channel::CHANNEL_NOTIFICATION_METHOD;
+ pub use channel::CHANNEL_QUEUE_CAPACITY;
+ pub use channel::ChannelNotification;
++pub use channel::channel_during_turn;
+ pub use channel::channel_enabled;
+ pub use channel::channel_servers;
+ pub use client_capabilities::client_mcp_extensions;
+-- 
+2.53.0
+

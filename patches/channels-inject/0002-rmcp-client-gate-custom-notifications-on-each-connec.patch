@@ -1,0 +1,379 @@
+From 2295ef53ac48a27a6eb7a8dd0d2acfa80c36ed95 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 11:43:23 +0100
+Subject: [PATCH 2/4] rmcp-client: gate custom notifications on each connection
+ capability
+
+---
+ .../rmcp-client/src/custom_notifications.rs   |  48 ++++--
+ .../src/custom_notifications_tests.rs         | 137 ++++++++++++++----
+ codex-rs/rmcp-client/src/rmcp_client.rs       |   7 +-
+ 3 files changed, 155 insertions(+), 37 deletions(-)
+
+diff --git a/codex-rs/rmcp-client/src/custom_notifications.rs b/codex-rs/rmcp-client/src/custom_notifications.rs
+index b4da3cb9c0..f7078d83b3 100644
+--- a/codex-rs/rmcp-client/src/custom_notifications.rs
++++ b/codex-rs/rmcp-client/src/custom_notifications.rs
+@@ -10,9 +10,12 @@ use std::sync::Arc;
+ use std::sync::Mutex;
+ use std::sync::PoisonError;
+ 
++use rmcp::model::ClientRequest;
+ use rmcp::model::CustomNotification;
+ use rmcp::model::JsonRpcMessage;
++use rmcp::model::RequestId;
+ use rmcp::model::ServerNotification;
++use rmcp::model::ServerResult;
+ use rmcp::service::RoleClient;
+ use rmcp::service::RxJsonRpcMessage;
+ use rmcp::service::TxJsonRpcMessage;
+@@ -23,8 +26,8 @@ use tokio::sync::mpsc::error::TrySendError;
+ use tracing::debug;
+ use tracing::warn;
+ 
+-/// One subscriber: the notification method it takes and where those notifications go.
+-type Tap = (String, mpsc::Sender<CustomNotification>);
++/// One subscriber: notification method, required capability and destination.
++type Tap = (String, String, mpsc::Sender<CustomNotification>);
+ 
+ /// Subscribers by notification method. Clones share one set, so a subscription made before
+ /// `initialize` also covers every later connection of the same client.
+@@ -38,12 +41,13 @@ impl CustomNotificationTaps {
+     pub(crate) fn subscribe(
+         &self,
+         method: String,
++        capability: String,
+         capacity: usize,
+     ) -> mpsc::Receiver<CustomNotification> {
+         let (sender, receiver) = mpsc::channel(capacity.max(1));
+         let mut taps = self.taps.lock().unwrap_or_else(PoisonError::into_inner);
+-        taps.retain(|(subscribed, _)| *subscribed != method);
+-        taps.push((method, sender));
++        taps.retain(|(subscribed, _, _)| *subscribed != method);
++        taps.push((method, capability, sender));
+         receiver
+     }
+ 
+@@ -60,17 +64,18 @@ impl CustomNotificationTaps {
+         CustomNotificationTransport {
+             inner: transport.into_transport(),
+             taps: self.clone(),
++            initialize_id: None,
++            declared: Vec::new(),
+         }
+     }
+ 
+     /// Whether `notification` has a subscriber. Such a notification is consumed; when the
+     /// subscriber's queue is full it is dropped.
+-    pub(crate) fn offer(&self, notification: &CustomNotification) -> bool {
++    pub(crate) fn offer(&self, notification: &CustomNotification, declared: &[String]) -> bool {
+         let taps = self.taps.lock().unwrap_or_else(PoisonError::into_inner);
+-        let Some((_, sender)) = taps
+-            .iter()
+-            .find(|(method, _)| *method == notification.method)
+-        else {
++        let Some((_, _, sender)) = taps.iter().find(|(method, capability, _)| {
++            *method == notification.method && declared.contains(capability)
++        }) else {
+             return false;
+         };
+         match sender.try_send(notification.clone()) {
+@@ -91,6 +96,8 @@ impl CustomNotificationTaps {
+ struct CustomNotificationTransport<T> {
+     inner: T,
+     taps: CustomNotificationTaps,
++    initialize_id: Option<RequestId>,
++    declared: Vec<String>,
+ }
+ 
+ impl<T: Transport<RoleClient> + 'static> Transport<RoleClient> for CustomNotificationTransport<T> {
+@@ -100,15 +107,36 @@ impl<T: Transport<RoleClient> + 'static> Transport<RoleClient> for CustomNotific
+         &mut self,
+         message: TxJsonRpcMessage<RoleClient>,
+     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
++        if let JsonRpcMessage::Request(request) = &message
++            && matches!(request.request, ClientRequest::InitializeRequest(_))
++        {
++            self.initialize_id = Some(request.id.clone());
++            self.declared.clear();
++        }
+         self.inner.send(message)
+     }
+ 
+     async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+         loop {
+             let message = self.inner.receive().await?;
++            if let JsonRpcMessage::Response(response) = &message
++                && self.initialize_id.as_ref() == Some(&response.id)
++            {
++                self.initialize_id = None;
++                if let ServerResult::InitializeResult(result) = &response.result
++                    && result.protocol_version.has_initialize()
++                {
++                    self.declared = result
++                        .capabilities
++                        .experimental
++                        .as_ref()
++                        .map(|experimental| experimental.keys().cloned().collect())
++                        .unwrap_or_default();
++                }
++            }
+             if let JsonRpcMessage::Notification(envelope) = &message
+                 && let ServerNotification::CustomNotification(notification) = &envelope.notification
+-                && self.taps.offer(notification)
++                && self.taps.offer(notification, &self.declared)
+             {
+                 continue;
+             }
+diff --git a/codex-rs/rmcp-client/src/custom_notifications_tests.rs b/codex-rs/rmcp-client/src/custom_notifications_tests.rs
+index d84e1a132e..e0ea03696f 100644
+--- a/codex-rs/rmcp-client/src/custom_notifications_tests.rs
++++ b/codex-rs/rmcp-client/src/custom_notifications_tests.rs
+@@ -15,6 +15,7 @@ use serde_json::json;
+ use super::CustomNotificationTaps;
+ 
+ const EVENT: &str = "notifications/example/event";
++const CAPABILITY: &str = "example/events";
+ const OTHER: &str = "notifications/other";
+ 
+ fn notification(method: &str, n: u64) -> CustomNotification {
+@@ -22,7 +23,7 @@ fn notification(method: &str, n: u64) -> CustomNotification {
+ }
+ 
+ /// A transport that receives the given custom notifications, then ends.
+-struct Scripted(VecDeque<CustomNotification>);
++struct Scripted(VecDeque<RxJsonRpcMessage<RoleClient>>);
+ 
+ impl Transport<RoleClient> for Scripted {
+     type Error = std::io::Error;
+@@ -35,9 +36,7 @@ impl Transport<RoleClient> for Scripted {
+     }
+ 
+     async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+-        self.0.pop_front().map(|notification| {
+-            JsonRpcMessage::notification(ServerNotification::CustomNotification(notification))
+-        })
++        self.0.pop_front()
+     }
+ 
+     async fn close(&mut self) -> Result<(), Self::Error> {
+@@ -45,6 +44,79 @@ impl Transport<RoleClient> for Scripted {
+     }
+ }
+ 
++/// Includes the handshake response so capability checks run at the transport boundary.
++fn scripted(declares: bool, notifications: Vec<CustomNotification>) -> anyhow::Result<Scripted> {
++    let experimental = if declares {
++        json!({ CAPABILITY: {} })
++    } else {
++        json!({})
++    };
++    let response = serde_json::from_value(json!({
++        "jsonrpc": "2.0", "id": 1, "result": {
++            "protocolVersion": "2025-06-18",
++            "capabilities": { "experimental": experimental },
++            "serverInfo": { "name": "test", "version": "1" }
++        }
++    }))?;
++    let mut messages = VecDeque::from([response]);
++    messages.extend(notifications.into_iter().map(|notification| {
++        JsonRpcMessage::notification(ServerNotification::CustomNotification(notification))
++    }));
++    Ok(Scripted(messages))
++}
++
++async fn initialize_transport(
++    transport: &mut impl Transport<RoleClient, Error = std::io::Error>,
++) -> anyhow::Result<()> {
++    transport
++        .send(serde_json::from_value(json!({
++            "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
++                "protocolVersion": "2025-06-18", "capabilities": {},
++                "clientInfo": { "name": "test", "version": "1" }
++            }
++        }))?)
++        .await?;
++    assert!(matches!(
++        transport.receive().await,
++        Some(JsonRpcMessage::Response(_))
++    ));
++    Ok(())
++}
++
++#[tokio::test]
++async fn each_connection_requires_its_own_declared_capability() -> anyhow::Result<()> {
++    let taps = CustomNotificationTaps::default();
++    let mut receiver = taps.subscribe(EVENT.to_string(), CAPABILITY.to_string(), 4);
++    for declares in [true, false, true] {
++        let mut transport = taps.capture(scripted(declares, vec![notification(EVENT, 1)])?);
++        initialize_transport(&mut transport).await?;
++        let passed = transport.receive().await;
++        if declares {
++            assert!(passed.is_none());
++            assert_eq!(receiver.try_recv()?.params, Some(json!({ "n": 1 })));
++        } else {
++            assert_eq!(passed.and_then(custom_params), Some(json!({ "n": 1 })));
++            assert!(receiver.try_recv().is_err());
++        }
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn notification_before_initialize_is_not_claimed() {
++    let taps = CustomNotificationTaps::default();
++    let mut receiver = taps.subscribe(EVENT.to_string(), CAPABILITY.to_string(), 4);
++    let messages = VecDeque::from([JsonRpcMessage::notification(
++        ServerNotification::CustomNotification(notification(EVENT, 1)),
++    )]);
++    let mut transport = taps.capture(Scripted(messages));
++    assert_eq!(
++        transport.receive().await.and_then(custom_params),
++        Some(json!({ "n": 1 }))
++    );
++    assert!(receiver.try_recv().is_err());
++}
++
+ /// The params of a custom notification message.
+ fn custom_params(message: RxJsonRpcMessage<RoleClient>) -> Option<Value> {
+     let JsonRpcMessage::Notification(envelope) = message else {
+@@ -57,15 +129,19 @@ fn custom_params(message: RxJsonRpcMessage<RoleClient>) -> Option<Value> {
+ }
+ 
+ #[tokio::test]
+-async fn capture_takes_subscribed_notifications_in_transport_order() {
++async fn capture_takes_subscribed_notifications_in_transport_order() -> anyhow::Result<()> {
+     let taps = CustomNotificationTaps::default();
+-    let mut receiver = taps.subscribe(EVENT.to_string(), 8);
+-    let mut transport = taps.capture(Scripted(VecDeque::from([
+-        notification(EVENT, 1),
+-        notification(OTHER, 2),
+-        notification(EVENT, 3),
+-        notification(EVENT, 4),
+-    ])));
++    let mut receiver = taps.subscribe(EVENT.to_string(), CAPABILITY.to_string(), 8);
++    let mut transport = taps.capture(scripted(
++        true,
++        vec![
++            notification(EVENT, 1),
++            notification(OTHER, 2),
++            notification(EVENT, 3),
++            notification(EVENT, 4),
++        ],
++    )?);
++    initialize_transport(&mut transport).await?;
+ 
+     let passed = transport.receive().await.and_then(custom_params);
+     assert_eq!(passed, Some(json!({ "n": 2 })));
+@@ -83,16 +159,17 @@ async fn capture_takes_subscribed_notifications_in_transport_order() {
+             Some(json!({ "n": 4 })),
+         ]
+     );
++    Ok(())
+ }
+ 
+ #[tokio::test]
+ async fn subscribed_method_is_delivered_in_order_and_others_pass_through() {
+     let taps = CustomNotificationTaps::default();
+-    let mut receiver = taps.subscribe(EVENT.to_string(), 4);
++    let mut receiver = taps.subscribe(EVENT.to_string(), CAPABILITY.to_string(), 4);
+ 
+-    assert!(taps.offer(&notification(EVENT, 1)));
+-    assert!(taps.offer(&notification(EVENT, 2)));
+-    assert!(!taps.offer(&notification(OTHER, 3)));
++    assert!(taps.offer(&notification(EVENT, 1), &[CAPABILITY.to_string()]));
++    assert!(taps.offer(&notification(EVENT, 2), &[CAPABILITY.to_string()]));
++    assert!(!taps.offer(&notification(OTHER, 3), &[CAPABILITY.to_string()]));
+ 
+     let first = receiver.recv().await.expect("first notification");
+     let second = receiver.recv().await.expect("second notification");
+@@ -104,10 +181,10 @@ async fn subscribed_method_is_delivered_in_order_and_others_pass_through() {
+ #[tokio::test]
+ async fn full_queue_drops_new_notifications_but_still_claims_them() {
+     let taps = CustomNotificationTaps::default();
+-    let mut receiver = taps.subscribe(EVENT.to_string(), 1);
++    let mut receiver = taps.subscribe(EVENT.to_string(), CAPABILITY.to_string(), 1);
+ 
+-    assert!(taps.offer(&notification(EVENT, 1)));
+-    assert!(taps.offer(&notification(EVENT, 2)));
++    assert!(taps.offer(&notification(EVENT, 1), &[CAPABILITY.to_string()]));
++    assert!(taps.offer(&notification(EVENT, 2), &[CAPABILITY.to_string()]));
+ 
+     let kept = receiver.recv().await.expect("kept notification");
+     assert_eq!(kept.params, Some(json!({ "n": 1 })));
+@@ -117,18 +194,20 @@ async fn full_queue_drops_new_notifications_but_still_claims_them() {
+ #[tokio::test]
+ async fn closed_subscriber_still_claims_its_method() {
+     let taps = CustomNotificationTaps::default();
+-    drop(taps.subscribe(EVENT.to_string(), 1));
++    drop(taps.subscribe(EVENT.to_string(), CAPABILITY.to_string(), 1));
+ 
+-    assert!(taps.offer(&notification(EVENT, 1)));
++    assert!(taps.offer(&notification(EVENT, 1), &[CAPABILITY.to_string()]));
+ }
+ 
+ #[tokio::test]
+ async fn later_subscription_replaces_the_earlier_one() {
+     let taps = CustomNotificationTaps::default();
+-    let mut first = taps.subscribe(EVENT.to_string(), 1);
+-    let mut second = taps.clone().subscribe(EVENT.to_string(), 1);
++    let mut first = taps.subscribe(EVENT.to_string(), CAPABILITY.to_string(), 1);
++    let mut second = taps
++        .clone()
++        .subscribe(EVENT.to_string(), CAPABILITY.to_string(), 1);
+ 
+-    assert!(taps.offer(&notification(EVENT, 1)));
++    assert!(taps.offer(&notification(EVENT, 1), &[CAPABILITY.to_string()]));
+ 
+     assert!(first.recv().await.is_none());
+     let delivered = second.recv().await.expect("replacement subscriber");
+@@ -142,6 +221,14 @@ struct NotifyingServer {
+ }
+ 
+ impl rmcp::ServerHandler for NotifyingServer {
++    fn get_info(&self) -> rmcp::model::ServerConfig {
++        let capabilities = rmcp::model::ServerCapabilities {
++            experimental: Some([(CAPABILITY.to_string(), Default::default())].into()),
++            ..Default::default()
++        };
++        rmcp::model::ServerConfig::new(capabilities)
++    }
++
+     async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::RoleServer>) {
+         for &(method, n) in &self.notifications {
+             context
+@@ -191,7 +278,7 @@ async fn deliver_through_client(
+ 
+     let server = NotifyingServer { notifications };
+     let client = crate::RmcpClient::new_in_process_client(Arc::new(server)).await?;
+-    let mut receiver = client.subscribe_custom_notifications(EVENT, count + 1);
++    let mut receiver = client.subscribe_custom_notifications(EVENT, CAPABILITY, count + 1);
+     client
+         .initialize(
+             InitializeRequestParams::new(
+diff --git a/codex-rs/rmcp-client/src/rmcp_client.rs b/codex-rs/rmcp-client/src/rmcp_client.rs
+index b88c7e1ebe..1f4a273673 100644
+--- a/codex-rs/rmcp-client/src/rmcp_client.rs
++++ b/codex-rs/rmcp-client/src/rmcp_client.rs
+@@ -468,13 +468,16 @@ impl RmcpClient {
+     /// Delivers server notifications with `method`, which this client otherwise ignores, to the
+     /// returned receiver in the order the server sent them. Subscribe before `initialize` to
+     /// receive notifications sent right after it. When the receiver falls `capacity` behind, new
+-    /// notifications are dropped.
++    /// notifications are dropped. Each connection must declare `capability` in the experimental
++    /// capabilities of its initialize response; notifications before that are left to the SDK.
+     pub fn subscribe_custom_notifications(
+         &self,
+         method: impl Into<String>,
++        capability: impl Into<String>,
+         capacity: usize,
+     ) -> tokio::sync::mpsc::Receiver<CustomNotification> {
+-        self.custom_notifications.subscribe(method.into(), capacity)
++        self.custom_notifications
++            .subscribe(method.into(), capability.into(), capacity)
+     }
+ 
+     pub async fn new_in_process_client(
+-- 
+2.53.0
+
