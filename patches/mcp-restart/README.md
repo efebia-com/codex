@@ -40,6 +40,8 @@ Every replacement passes through the usual initialize and notification capture. 
 channels-inject series checks channel capabilities again for each connection and fails closed
 when they disappear. The tool catalog revision changes after a successful restart.
 
+Limitation: as upstream, the tool catalog is listed again after a restart only when the `mcp_tool_list_changed` feature is enabled; otherwise the cached tools may remain in use.
+
 Targeted checks (run in the integrated source tree):
 
 ```sh
