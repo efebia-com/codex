@@ -1,4 +1,4 @@
-From cdd7aa0e63a8b9f8e0da445453a32030ce65e5ba Mon Sep 17 00:00:00 2001
+From 1d0e2344c968db6754fe5f2213fcca42ffe85d83 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 19:49:51 +0100
 Subject: [PATCH 3/3] app-server: test the channel barrier
@@ -11,9 +11,10 @@ closed, check that a retried reopening has no effect, keep user turns
 working while closed, and check the errors.
 ---
  .../app-server/tests/suite/v2/mcp_channels.rs |  21 +-
+ .../suite/v2/mcp_channels_during_turn.rs      |   4 +-
  .../tests/suite/v2/mcp_channels_fence.rs      | 393 ++++++++++++++++++
  .../tests/suite/v2/mcp_channels_server.py     |  41 +-
- 3 files changed, 451 insertions(+), 4 deletions(-)
+ 4 files changed, 454 insertions(+), 5 deletions(-)
  create mode 100644 codex-rs/app-server/tests/suite/v2/mcp_channels_fence.rs
 
 diff --git a/codex-rs/app-server/tests/suite/v2/mcp_channels.rs b/codex-rs/app-server/tests/suite/v2/mcp_channels.rs
@@ -94,6 +95,21 @@ index 640b4afacc..6499847878 100644
 +
 +#[path = "mcp_channels_fence.rs"]
 +mod fence;
+diff --git a/codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs b/codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs
+index 8c40170253..62e0698d9f 100644
+--- a/codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs
++++ b/codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs
+@@ -36,7 +36,9 @@ async fn start_with_opt_in(specs: &[ServerSpec], during_turn: &[&str]) -> Result
+             inbox: home.path().join(format!("{}.inbox", spec.name)),
+             record: home.path().join(format!("{}.record", spec.name)),
+         };
+-        config.push_str(&server_toml(spec, &script, &server)?);
++        config.push_str(&server_toml(
++            spec, &script, &server, /*restart_on_exit*/ false,
++        )?);
+         if during_turn.contains(&spec.name) {
+             config.push_str("channel_during_turn = true\n");
+         }
 diff --git a/codex-rs/app-server/tests/suite/v2/mcp_channels_fence.rs b/codex-rs/app-server/tests/suite/v2/mcp_channels_fence.rs
 new file mode 100644
 index 0000000000..7b948c5d94
