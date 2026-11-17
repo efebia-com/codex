@@ -1,4 +1,4 @@
-From 7beee849c8c1d5b71567d9174e5184ec7c65259f Mon Sep 17 00:00:00 2001
+From 65b9f7f85062840a8f756f345c6959850b60442b Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 11:52:56 +0100
 Subject: [PATCH] app-server: test opted-in MCP process restarts
@@ -638,7 +638,7 @@ index 0000000000..53659903b9
 +}
 diff --git a/codex-rs/app-server/tests/suite/v2/mcp_restart_server.py b/codex-rs/app-server/tests/suite/v2/mcp_restart_server.py
 new file mode 100644
-index 0000000000..06af013bc9
+index 0000000000..4d63740e89
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/mcp_restart_server.py
 @@ -0,0 +1,175 @@
@@ -754,6 +754,9 @@ index 0000000000..06af013bc9
 +            if method == "notifications/initialized":
 +                self.log("initialized")
 +                self.initialized.set()
++                if self.crash_loop.exists():
++                    # Crash after the handshake even when the client reuses its cached tools.
++                    threading.Timer(EXIT_DELAY_SECONDS, self.exit).start()
 +            return
 +        result = self.result_for(method, message.get("params") or {})
 +        if result is None:
@@ -765,9 +768,6 @@ index 0000000000..06af013bc9
 +            )
 +            return
 +        self.send({"id": message["id"], "result": result})
-+        if method == "tools/list" and self.crash_loop.exists():
-+            # Finish startup before exiting so every replacement exercises post-initialize death.
-+            threading.Timer(EXIT_DELAY_SECONDS, self.exit).start()
 +
 +    def watch_inbox(self) -> None:
 +        self.initialized.wait()
