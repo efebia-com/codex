@@ -1,0 +1,30 @@
+From 3520f1ce49bece0e15368555a79a33b0f3e127fc Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 12:00:19 +0100
+Subject: [PATCH] rmcp-client: initialize non-exhaustive test capabilities via
+ default
+
+---
+ codex-rs/rmcp-client/src/custom_notifications_tests.rs | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/codex-rs/rmcp-client/src/custom_notifications_tests.rs b/codex-rs/rmcp-client/src/custom_notifications_tests.rs
+index e0ea03696f..8725f2730e 100644
+--- a/codex-rs/rmcp-client/src/custom_notifications_tests.rs
++++ b/codex-rs/rmcp-client/src/custom_notifications_tests.rs
+@@ -222,10 +222,8 @@ struct NotifyingServer {
+ 
+ impl rmcp::ServerHandler for NotifyingServer {
+     fn get_info(&self) -> rmcp::model::ServerConfig {
+-        let capabilities = rmcp::model::ServerCapabilities {
+-            experimental: Some([(CAPABILITY.to_string(), Default::default())].into()),
+-            ..Default::default()
+-        };
++        let mut capabilities = rmcp::model::ServerCapabilities::default();
++        capabilities.experimental = Some([(CAPABILITY.to_string(), Default::default())].into());
+         rmcp::model::ServerConfig::new(capabilities)
+     }
+ 
+-- 
+2.53.0
+
