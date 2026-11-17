@@ -166,6 +166,17 @@ jobs:
           echo "AWS_LC_SYS_NO_JITTER_ENTROPY=1" >>"$GITHUB_ENV"
           var="AWS_LC_SYS_NO_JITTER_ENTROPY_${TARGET//-/_}"
           echo "${var}=1" >>"$GITHUB_ENV"
+      - name: Add swap for the release links
+        # The x86_64 runner has 16 GB and lost contact while linking the LTO binaries.
+        if: runner.arch == 'X64'
+        run: |
+          sudo swapoff -a
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 16G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
       - name: Fetch the Codex-built V8 (checksums verified)
         run: scripts/fetch-v8.sh --source "$SOURCE_DIR" --target "$TARGET" --cache "${RUNNER_TEMP}/rusty_v8" >>"$GITHUB_ENV"
       - name: Build
@@ -181,8 +192,9 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    # macOS minutes are the expensive ones: start only after the tests pass.
-    needs: [plan, test]
+    # Runners are free for a public repository: build alongside the tests, which
+    # still gate the publish job.
+    needs: plan
     if: needs.plan.outputs.build == 'true'
     name: build (${{ matrix.target }})
     runs-on: macos-15
