@@ -1,0 +1,27 @@
+From 6671a864df8e33a4dfed5e7f6c8175d3c8f4773e Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 14:15:35 +0100
+Subject: [PATCH 3/3] core: raise the recursion limit for MCP recovery futures
+
+Release builds exceed rustc's default query depth when laying out async MCP tool refresh futures that include stdio server recovery. Use the same limit as other crates in the workspace.
+---
+ codex-rs/core/src/lib.rs | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index d684b39426..6c170ff260 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -4,6 +4,9 @@
+ // user-visible output must go through the appropriate abstraction (e.g.,
+ // the TUI or the tracing stack).
+ #![deny(clippy::print_stdout, clippy::print_stderr)]
++// Release builds exceed rustc's default query depth when laying out the async
++// MCP tool refresh futures that include stdio server recovery.
++#![recursion_limit = "256"]
+ 
+ mod apply_patch;
+ mod apps;
+-- 
+2.53.0
+

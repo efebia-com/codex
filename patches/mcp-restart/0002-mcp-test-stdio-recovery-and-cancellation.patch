@@ -1,7 +1,7 @@
 From 8ce22362e43e5d44df474a5e59744c9dae4cc9b6 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 11:55:16 +0100
-Subject: [PATCH 2/2] mcp: test stdio recovery and cancellation
+Subject: [PATCH 2/3] mcp: test stdio recovery and cancellation
 
 ---
  codex-rs/rmcp-client/tests/stdio_restart.rs | 487 ++++++++++++++++++++

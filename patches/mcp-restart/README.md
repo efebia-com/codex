@@ -1,7 +1,8 @@
 # Restart exited stdio MCP servers
 
-Apply these two patches after channels-inject through `3520f1ce49`.
-Source commits: `97ecc5e620` (implementation and unit tests), `8ce22362e4` (integration tests).
+Apply these three patches after channels-inject through `3520f1ce49`.
+Source commits: `97ecc5e620` (implementation and unit tests), `8ce22362e4` (integration tests),
+`6671a864df` (`codex-core` recursion limit of 256 for release builds, as in other workspace crates).
 
 These replace `bb516a1538`/`b5f7857095` after the first integrated verification. Service selection
 checks the recovery state while holding the client state lock. Tests wait for the catalog revision
