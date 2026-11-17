@@ -1,4 +1,4 @@
-From 7dcc010cf098aa73fbb9e019c31f14cbc0f8eca5 Mon Sep 17 00:00:00 2001
+From 4356d5aeafb2aa53f2b1b9c264fcfcc8a1058fe1 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 19:49:51 +0100
 Subject: [PATCH 2/3] app-server: expose the channel barrier as thread/channels

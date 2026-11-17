@@ -1,4 +1,4 @@
-From 39c94b2ce96999bcdbf718cb6b9e0d2870938a73 Mon Sep 17 00:00:00 2001
+From cdd7aa0e63a8b9f8e0da445453a32030ce65e5ba Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 19:49:51 +0100
 Subject: [PATCH 3/3] app-server: test the channel barrier
@@ -6,20 +6,88 @@ Subject: [PATCH 3/3] app-server: test the channel barrier
 The fake channel server supports channel/fence: while fenced it refuses
 new input, and a fence request emits its backlog, then the marker. The
 tests hold input accepted before the fence, release it or deliver on
-reopening what is not discarded, keep user turns working while closed,
-and check the errors.
+reopening what is not discarded, also when the server restarts while
+closed, check that a retried reopening has no effect, keep user turns
+working while closed, and check the errors.
 ---
- .../app-server/tests/suite/v2/mcp_channels.rs |   3 +
- .../tests/suite/v2/mcp_channels_fence.rs      | 293 ++++++++++++++++++
- .../tests/suite/v2/mcp_channels_server.py     |  41 ++-
- 3 files changed, 335 insertions(+), 2 deletions(-)
+ .../app-server/tests/suite/v2/mcp_channels.rs |  21 +-
+ .../tests/suite/v2/mcp_channels_fence.rs      | 393 ++++++++++++++++++
+ .../tests/suite/v2/mcp_channels_server.py     |  41 +-
+ 3 files changed, 451 insertions(+), 4 deletions(-)
  create mode 100644 codex-rs/app-server/tests/suite/v2/mcp_channels_fence.rs
 
 diff --git a/codex-rs/app-server/tests/suite/v2/mcp_channels.rs b/codex-rs/app-server/tests/suite/v2/mcp_channels.rs
-index 640b4afacc..d8d056eb1b 100644
+index 640b4afacc..6499847878 100644
 --- a/codex-rs/app-server/tests/suite/v2/mcp_channels.rs
 +++ b/codex-rs/app-server/tests/suite/v2/mcp_channels.rs
-@@ -1005,3 +1005,6 @@ fn subagent_requests(requests: &[ResponsesRequest], child_prompt: &str) -> usize
+@@ -256,6 +256,8 @@ struct HarnessOptions<'a> {
+     features: &'a [Feature],
+     /// Notifications already in a server's inbox before Codex starts it.
+     preloaded: &'a [(&'static str, Value)],
++    /// Servers that Codex relaunches when their process exits (`restart_on_exit`).
++    restart_on_exit: &'a [&'static str],
+ }
+ 
+ impl Harness {
+@@ -264,6 +266,7 @@ impl Harness {
+             specs,
+             features: &[],
+             preloaded: &[],
++            restart_on_exit: &[],
+         })
+         .await
+     }
+@@ -293,7 +296,8 @@ impl Harness {
+                 inbox: home.path().join(format!("{}.inbox", spec.name)),
+                 record: home.path().join(format!("{}.record", spec.name)),
+             };
+-            mcp_config.push_str(&server_toml(spec, &script, &server)?);
++            let restart_on_exit = options.restart_on_exit.contains(&spec.name);
++            mcp_config.push_str(&server_toml(spec, &script, &server, restart_on_exit)?);
+             servers.insert(spec.name, server);
+         }
+         for (name, params) in options.preloaded {
+@@ -509,7 +513,12 @@ impl Harness {
+     }
+ }
+ 
+-fn server_toml(spec: &ServerSpec, script: &Path, server: &FakeServer) -> Result<String> {
++fn server_toml(
++    spec: &ServerSpec,
++    script: &Path,
++    server: &FakeServer,
++    restart_on_exit: bool,
++) -> Result<String> {
+     let python = if cfg!(windows) { "python" } else { "python3" };
+     let mut args = vec![
+         path_str(script)?,
+@@ -532,6 +541,9 @@ fn server_toml(spec: &ServerSpec, script: &Path, server: &FakeServer) -> Result<
+     if let Some(channel) = spec.channel {
+         toml.push_str(&format!("channel = {channel}\n"));
+     }
++    if restart_on_exit {
++        toml.push_str("restart_on_exit = true\n");
++    }
+     Ok(toml)
+ }
+ 
+@@ -908,6 +920,7 @@ async fn notification_sent_before_the_thread_is_ready_is_delivered() -> Result<(
+         specs: &[CHANNEL],
+         features: &[],
+         preloaded: &[("chan", json!({"content": "early bird"}))],
++        restart_on_exit: &[],
+     })
+     .await?;
+ 
+@@ -929,6 +942,7 @@ async fn subagent_does_not_start_a_second_channel_server() -> Result<()> {
+         specs: &[CHANNEL, plain],
+         features: &[Feature::Collab],
+         preloaded: &[],
++        restart_on_exit: &[],
+     })
+     .await?;
+     responses::mount_sse_once(
+@@ -1005,3 +1019,6 @@ fn subagent_requests(requests: &[ResponsesRequest], child_prompt: &str) -> usize
  
  #[path = "mcp_channels_during_turn.rs"]
  mod during_turn;
@@ -28,10 +96,10 @@ index 640b4afacc..d8d056eb1b 100644
 +mod fence;
 diff --git a/codex-rs/app-server/tests/suite/v2/mcp_channels_fence.rs b/codex-rs/app-server/tests/suite/v2/mcp_channels_fence.rs
 new file mode 100644
-index 0000000000..4a098c4ea0
+index 0000000000..7b948c5d94
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/mcp_channels_fence.rs
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,393 @@
 +//! The channel barrier over a server that supports `channel/fence`: input the server accepted
 +//! before the fence is held, never reaches the model while the barrier is closed, and is either
 +//! released by the caller or delivered when the barrier opens.
@@ -170,6 +238,52 @@ index 0000000000..4a098c4ea0
 +        Ok(())
 +    }
 +
++    /// Kills the server's process and returns the `initialize` params of the process Codex
++    /// launches in its place.
++    #[cfg(unix)]
++    async fn restart_server(&self, name: &str) -> Result<Value> {
++        let server = self.server(name);
++        let start = server.records("start")?;
++        let pid = start
++            .last()
++            .and_then(|start| start["pid"].as_i64())
++            .ok_or_else(|| anyhow::anyhow!("server `{name}` has not started"))?;
++        let pid = i32::try_from(pid)?;
++        let initialized = server.records("initialize")?.len();
++        // SAFETY: the signal only targets the fixture process the test started.
++        let killed = unsafe { libc::kill(pid, libc::SIGKILL) };
++        anyhow::ensure!(killed == 0, "could not kill the server process {pid}");
++        let deadline = Instant::now() + READ_TIMEOUT;
++        loop {
++            if let Some(initialize) = server.records("initialize")?.get(initialized) {
++                return Ok(initialize["params"].clone());
++            }
++            anyhow::ensure!(
++                Instant::now() < deadline,
++                "server `{name}` was not relaunched within {READ_TIMEOUT:?}"
++            );
++            sleep(POLL_INTERVAL).await;
++        }
++    }
++
++    /// Waits until the server has been asked to accept input again, so new input is not refused.
++    async fn wait_for_server_reopened(&self, name: &str) -> Result<()> {
++        let deadline = Instant::now() + READ_TIMEOUT;
++        while !self
++            .server(name)
++            .records("fence")?
++            .iter()
++            .any(|record| record["params"]["closed"] == json!(false))
++        {
++            anyhow::ensure!(
++                Instant::now() < deadline,
++                "server `{name}` was not reopened within {READ_TIMEOUT:?}"
++            );
++            sleep(POLL_INTERVAL).await;
++        }
++        Ok(())
++    }
++
 +    /// Closes the barrier and waits until it is drained.
 +    async fn close_and_drain(&mut self) -> Result<(String, ChannelBarrier)> {
 +        let closed = self.fence(true, None, None).await?;
@@ -254,18 +368,72 @@ index 0000000000..4a098c4ea0
 +        .fence(false, Some(fence_id.clone()), Some(vec![kept]))
 +        .await?;
 +    assert!(!opened.closed);
-+    harness.wait_for_delivery("chan", "held for later").await?;
-+    // A retried opening changes nothing.
++    // A retried opening with other discardSeqs has no effect: what it lists is still delivered.
 +    let retried = harness
 +        .fence(false, Some(fence_id), Some(vec![barrier.held[0].seq]))
 +        .await?;
 +    assert!(!retried.closed);
++    harness.wait_for_delivery("chan", "held for later").await?;
 +
++    harness.wait_for_server_reopened("chan").await?;
 +    harness
 +        .server("chan")
 +        .push(&[json!({ "content": "open again" })])?;
 +    harness.wait_for_delivery("chan", "open again").await?;
 +    harness.assert_never_delivered("kept by the caller").await;
++    Ok(())
++}
++
++#[cfg(unix)]
++#[tokio::test]
++async fn discarded_input_is_never_delivered_even_if_the_server_restarts() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let mut harness = Harness::start_with(super::HarnessOptions {
++        specs: &[CHANNEL],
++        features: &[],
++        preloaded: &[],
++        restart_on_exit: &["chan"],
++    })
++    .await?;
++    harness.accept_before_fence(
++        "chan",
++        &[
++            json!({ "content": "delivered on reopening" }),
++            json!({ "content": "discarded by the caller" }),
++        ],
++    )?;
++    let (fence_id, barrier) = harness.close_and_drain().await?;
++    let discarded = barrier.held[1].seq;
++    let generation = barrier.servers[0].generation;
++
++    // The relaunched server starts fenced, and the held input keeps its sequence numbers.
++    let initialize = harness.restart_server("chan").await?;
++    assert_eq!(
++        initialize["capabilities"]["experimental"]["channel/fence"],
++        json!({ "closed": true, "token": fence_id })
++    );
++    let restarted = harness.read_barrier(Some(WAIT_DRAINED_MS)).await?;
++    assert!(restarted.drained, "{restarted:?}");
++    assert!(restarted.uncertain.is_empty(), "{restarted:?}");
++    assert_eq!(restarted.servers[0].generation, generation + 1);
++    assert_eq!(restarted.held, barrier.held);
++
++    let opened = harness
++        .fence(false, Some(fence_id), Some(vec![discarded]))
++        .await?;
++    assert!(!opened.closed);
++    harness
++        .wait_for_delivery("chan", "delivered on reopening")
++        .await?;
++    harness.wait_for_server_reopened("chan").await?;
++    harness
++        .server("chan")
++        .push(&[json!({ "content": "after reopening" })])?;
++    harness.wait_for_delivery("chan", "after reopening").await?;
++    sleep(QUIET_PERIOD).await;
++    harness
++        .assert_never_delivered("discarded by the caller")
++        .await;
 +    Ok(())
 +}
 +
