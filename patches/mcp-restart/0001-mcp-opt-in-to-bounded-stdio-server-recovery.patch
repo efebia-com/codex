@@ -1,4 +1,4 @@
-From bb516a15385cadcc51e85a78c8253894a332d2d5 Mon Sep 17 00:00:00 2001
+From 69f37f0121c11a3e6aab66885c66c1136dc51eed Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 11:55:16 +0100
 Subject: [PATCH 1/2] mcp: opt in to bounded stdio server recovery
@@ -18,10 +18,10 @@ Subject: [PATCH 1/2] mcp: opt in to bounded stdio server recovery
  codex-rs/core/config.schema.json              |   5 +
  codex-rs/rmcp-client/src/lib.rs               |   2 +
  .../rmcp-client/src/local_stdio_transport.rs  |   5 +
- codex-rs/rmcp-client/src/rmcp_client.rs       |  70 ++-
+ codex-rs/rmcp-client/src/rmcp_client.rs       |  69 ++-
  codex-rs/rmcp-client/src/stdio_restart.rs     | 479 ++++++++++++++++++
  .../rmcp-client/src/stdio_server_launcher.rs  | 160 +++++-
- 17 files changed, 825 insertions(+), 38 deletions(-)
+ 17 files changed, 825 insertions(+), 37 deletions(-)
  create mode 100644 codex-rs/codex-mcp/src/restart.rs
  create mode 100644 codex-rs/rmcp-client/src/stdio_restart.rs
 
@@ -420,7 +420,7 @@ index 4b01c3bd3d..5b015bd065 100644
  
  impl Transport<RoleClient> for LocalStdioTransport {
 diff --git a/codex-rs/rmcp-client/src/rmcp_client.rs b/codex-rs/rmcp-client/src/rmcp_client.rs
-index 1f4a273673..c44d234ad9 100644
+index 1f4a273673..b3b6d589c3 100644
 --- a/codex-rs/rmcp-client/src/rmcp_client.rs
 +++ b/codex-rs/rmcp-client/src/rmcp_client.rs
 @@ -115,6 +115,8 @@ use codex_config::types::OAuthCredentialsStoreMode;
@@ -475,39 +475,38 @@ index 1f4a273673..c44d234ad9 100644
          if let Some(OAuthRuntime::Legacy(runtime)) = oauth_runtime
              && let Err(error) = runtime.persist_if_needed().await
          {
-@@ -1291,12 +1301,26 @@ impl RmcpClient {
-     }
+@@ -1292,11 +1302,26 @@ impl RmcpClient {
  
      async fn service(&self) -> Result<Arc<RunningService<RoleClient, ElicitationClientService>>> {
--        let guard = self.state.lock().await;
+         let guard = self.state.lock().await;
 -        match &*guard {
 -            ClientState::Ready { service, .. } => Ok(Arc::clone(service)),
 -            ClientState::Connecting { .. } => Err(anyhow!("MCP client not initialized")),
 -            ClientState::Closed => Err(anyhow!("MCP client is shut down")),
-+        let service = {
-+            let guard = self.state.lock().await;
-+            match &*guard {
-+                ClientState::Ready { service, .. } => Arc::clone(service),
-+                ClientState::Connecting { .. } => {
-+                    return Err(anyhow!("MCP client not initialized"));
-+                }
-+                ClientState::Closed => return Err(anyhow!("MCP client is shut down")),
++        let service = match &*guard {
++            ClientState::Ready { service, .. } => service,
++            ClientState::Connecting { .. } => {
++                return Err(anyhow!("MCP client not initialized"));
 +            }
++            ClientState::Closed => return Err(anyhow!("MCP client is shut down")),
 +        };
 +        if let Some(restart) = &self.stdio_restart {
 +            restart.check_available()?;
++            // Keep this service and the recovery state in the same generation: a replacement
++            // must not become ready between selecting the old service and checking its exit.
 +            if service.is_closed()
 +                || service.peer().is_transport_closed()
 +                || restart.connection_exited()
 +            {
++                drop(guard);
 +                return self.service_after_stdio_exit().await;
 +            }
          }
-+        Ok(service)
++        Ok(Arc::clone(service))
      }
  
      async fn oauth_runtime(&self) -> Option<OAuthRuntime> {
-@@ -1324,7 +1348,11 @@ impl RmcpClient {
+@@ -1324,7 +1349,11 @@ impl RmcpClient {
          let state = self.state.lock().await;
          match &*state {
              ClientState::Ready { service, .. } => {
@@ -520,7 +519,7 @@ index 1f4a273673..c44d234ad9 100644
              }
              ClientState::Connecting { .. } => false,
              ClientState::Closed => true,
-@@ -1344,6 +1372,9 @@ impl RmcpClient {
+@@ -1344,6 +1373,9 @@ impl RmcpClient {
      }
  
      async fn shutdown_for(&self, reason: StdioTermination) -> io::Result<()> {
@@ -530,7 +529,7 @@ index 1f4a273673..c44d234ad9 100644
          let previous_state = {
              let mut guard = self.state.lock().await;
              std::mem::replace(&mut *guard, ClientState::Closed)
-@@ -1608,16 +1639,23 @@ impl RmcpClient {
+@@ -1608,16 +1640,23 @@ impl RmcpClient {
          };
          let lifecycle = self.protocol_mode.client_lifecycle();
          let connect_stdio = |transport: StdioServerTransport, lifecycle| {

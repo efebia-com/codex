@@ -1,7 +1,13 @@
 # Restart exited stdio MCP servers
 
 Apply these two patches after channels-inject through `3520f1ce49`.
-Source commits: `bb516a1538` (implementation and unit tests), `b5f7857095` (integration tests).
+Source commits: `69f37f0121` (implementation and unit tests), `37817c867c` (integration tests).
+
+These replace `bb516a1538`/`b5f7857095` after the first integrated verification. Service selection
+checks the recovery state while holding the client state lock. Tests wait for the catalog revision
+after recovery, account for discovery's initial probe process, and inspect budget exhaustion only
+after the client has observed the final exit. Fixture helpers return errors instead of panicking
+on missing values. The nine integration cases and the targeted commands below are unchanged.
 
 ```toml
 [mcp_servers.example]

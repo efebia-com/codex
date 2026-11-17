@@ -1,19 +1,19 @@
-From b5f78570954699f14fe215682e1d99836262224f Mon Sep 17 00:00:00 2001
+From 37817c867c9b364e849b69a79e85639ed22ed5cf Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 11:55:16 +0100
 Subject: [PATCH 2/2] mcp: test stdio recovery and cancellation
 
 ---
- codex-rs/rmcp-client/tests/stdio_restart.rs | 454 ++++++++++++++++++++
- 1 file changed, 454 insertions(+)
+ codex-rs/rmcp-client/tests/stdio_restart.rs | 487 ++++++++++++++++++++
+ 1 file changed, 487 insertions(+)
  create mode 100644 codex-rs/rmcp-client/tests/stdio_restart.rs
 
 diff --git a/codex-rs/rmcp-client/tests/stdio_restart.rs b/codex-rs/rmcp-client/tests/stdio_restart.rs
 new file mode 100644
-index 0000000000..25d0fe55d8
+index 0000000000..16c4995411
 --- /dev/null
 +++ b/codex-rs/rmcp-client/tests/stdio_restart.rs
-@@ -0,0 +1,454 @@
+@@ -0,0 +1,487 @@
 +//! Recovery owns one stdio connection and never replays a tool invocation.
 +
 +#![cfg(unix)]
@@ -24,6 +24,7 @@ index 0000000000..25d0fe55d8
 +use std::sync::Arc;
 +use std::time::Duration;
 +
++use anyhow::Context;
 +use anyhow::Result;
 +use codex_exec_server::Environment;
 +use codex_rmcp_client::ExecutorStdioServerLauncher;
@@ -147,13 +148,40 @@ index 0000000000..25d0fe55d8
 +    }
 +}
 +
-+fn pid(launch: &Value) -> i32 {
-+    launch["pid"].as_i64().expect("fixture pid") as i32
++fn pid(launch: &Value) -> Result<i32> {
++    let pid = launch["pid"].as_i64().context("fixture pid is missing")?;
++    let pid = i32::try_from(pid).context("fixture pid is out of range")?;
++    anyhow::ensure!(pid > 0, "fixture pid must be positive");
++    Ok(pid)
 +}
 +
-+fn kill(launch: &Value) {
++fn kill(launch: &Value) -> Result<()> {
 +    // Only a PID written by this test's isolated fixture may be signalled.
-+    assert_eq!(unsafe { libc::kill(pid(launch), libc::SIGKILL) }, 0);
++    assert_eq!(unsafe { libc::kill(pid(launch)?, libc::SIGKILL) }, 0);
++    Ok(())
++}
++
++async fn wait_revision(client: &RmcpClient, revision: u64) -> Result<()> {
++    tokio::time::timeout(WAIT, async {
++        while client.tool_list_revision().current() == revision {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .context("stdio recovery did not publish a catalog revision")?;
++    assert_eq!(client.tool_list_revision().current(), revision + 1);
++    Ok(())
++}
++
++async fn wait_closed(client: &RmcpClient) -> Result<()> {
++    tokio::time::timeout(WAIT, async {
++        while !client.is_closed().await {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .context("MCP client did not close")?;
++    Ok(())
 +}
 +
 +async fn wait_gone(process: i32) -> Result<()> {
@@ -170,27 +198,37 @@ index 0000000000..25d0fe55d8
 +    let result = client
 +        .call_tool("echo".to_string(), None, |_| Ok(None), Some(WAIT))
 +        .await?;
-+    Ok(result.structured_content.expect("fixture result"))
++    result
++        .structured_content
++        .context("fixture result is missing")
 +}
 +
 +#[tokio::test]
 +async fn proactively_restarts_the_same_connection_with_the_same_environment() -> Result<()> {
 +    // Exercise both launcher implementations and legacy discovery, which must still initialize.
-+    for (executor, protocol) in [
-+        (false, McpProtocolMode::Legacy),
-+        (true, McpProtocolMode::Legacy),
-+        (false, McpProtocolMode::DiscoverLocalStdio),
++    // This legacy fixture ignores discovery, so that mode launches a probe and a fresh
++    // initialize-only process for each connection, including the first one.
++    for (executor, protocol, launches_per_connection) in [
++        (false, McpProtocolMode::Legacy, 1),
++        (true, McpProtocolMode::Legacy, 1),
++        (false, McpProtocolMode::DiscoverLocalStdio, 2),
 +    ] {
 +        let fixture = Fixture::new("normal")?;
 +        let (client, _supervisor) = fixture
 +            .client(Some(fast_policy()), executor, protocol)
 +            .await?;
-+        let first = echo(&client).await?;
++        let context = format!("executor={executor}, protocol={protocol:?}");
++        let first = echo(&client).await.context(context.clone())?;
++        assert_eq!(fixture.launches()?.len(), launches_per_connection);
 +        let revision = client.tool_list_revision().current();
-+        kill(&first);
++        kill(&first)?;
 +        // No subsequent request is needed to start the replacement.
-+        let launches = fixture.wait_launches(2).await?;
-+        let second = echo(&client).await?;
++        wait_revision(&client, revision)
++            .await
++            .context(context.clone())?;
++        let launches = fixture.launches()?;
++        assert_eq!(launches.len(), 2 * launches_per_connection);
++        let second = echo(&client).await.context(context)?;
 +        assert_ne!(first["pid"], second["pid"]);
 +        for launch in &launches {
 +            assert_eq!(launch["session"], "session-owner");
@@ -200,9 +238,9 @@ index 0000000000..25d0fe55d8
 +        let (a, b) = tokio::join!(echo(&client), echo(&client));
 +        assert_eq!(a?["pid"], second["pid"]);
 +        assert_eq!(b?["pid"], second["pid"]);
-+        assert_eq!(fixture.launches()?.len(), 2);
++        assert_eq!(fixture.launches()?.len(), 2 * launches_per_connection);
 +        client.shutdown().await;
-+        wait_gone(pid(&second)).await?;
++        wait_gone(pid(&second)?).await?;
 +    }
 +    Ok(())
 +}
@@ -243,7 +281,7 @@ index 0000000000..25d0fe55d8
 +        .expect_err("closing stdout fails the call");
 +    fixture.wait_launches(2).await?;
 +    // The old process ignores TERM and must be killed before a new one is launched.
-+    assert_eq!(unsafe { libc::kill(pid(&first), 0) }, -1);
++    assert_eq!(unsafe { libc::kill(pid(&first)?, 0) }, -1);
 +    assert_ne!(echo(&client).await?["pid"], first["pid"]);
 +    client.shutdown().await;
 +    Ok(())
@@ -256,14 +294,9 @@ index 0000000000..25d0fe55d8
 +        .client(Some(fast_policy()), false, McpProtocolMode::Legacy)
 +        .await?;
 +    let first = echo(&client).await?;
-+    kill(&first);
++    kill(&first)?;
 +    let launches = fixture.wait_launches(4).await?;
-+    tokio::time::timeout(WAIT, async {
-+        while !client.is_closed().await {
-+            tokio::time::sleep(Duration::from_millis(10)).await;
-+        }
-+    })
-+    .await?;
++    wait_closed(&client).await?;
 +    let error = echo(&client).await.expect_err("budget must be exhausted");
 +    assert!(
 +        error
@@ -272,7 +305,7 @@ index 0000000000..25d0fe55d8
 +        "{error:#}"
 +    );
 +    for launch in &launches {
-+        wait_gone(pid(launch)).await?;
++        wait_gone(pid(launch)?).await?;
 +    }
 +    tokio::time::sleep(SETTLE).await;
 +    assert_eq!(fixture.launches()?.len(), 4);
@@ -288,15 +321,20 @@ index 0000000000..25d0fe55d8
 +        .await?;
 +    for count in 1..=4 {
 +        let current = echo(&client).await?;
-+        kill(&current);
++        let revision = client.tool_list_revision().current();
++        kill(&current)?;
 +        if count < 4 {
 +            fixture.wait_launches(count + 1).await?;
++            wait_revision(&client, revision).await?;
 +        }
 +    }
++    // SIGKILL can return before the transport observes EOF. A call sent in that window is
++    // in flight and must fail without replay; inspect the give-up error only after closure.
++    wait_closed(&client).await?;
 +    let error = echo(&client)
 +        .await
 +        .expect_err("fourth exit must exhaust the budget");
-+    assert!(error.to_string().contains("after 3 attempts"));
++    assert!(error.to_string().contains("after 3 attempts"), "{error:#}");
 +    client.shutdown().await;
 +    assert_eq!(fixture.launches()?.len(), 4);
 +    Ok(())
@@ -312,7 +350,7 @@ index 0000000000..25d0fe55d8
 +            .client(Some(policy), false, McpProtocolMode::Legacy)
 +            .await?;
 +        let first = echo(&client).await?;
-+        kill(&first);
++        kill(&first)?;
 +        // Closing status must not cause a refresh to create a second connection.
 +        assert!(!client.is_closed().await);
 +        tokio::time::sleep(SETTLE).await;
@@ -322,7 +360,7 @@ index 0000000000..25d0fe55d8
 +        } else {
 +            client.shutdown().await;
 +        }
-+        wait_gone(pid(&first)).await?;
++        wait_gone(pid(&first)?).await?;
 +        tokio::time::sleep(Duration::from_secs(2)).await;
 +        assert_eq!(fixture.launches()?.len(), 1);
 +    }
@@ -334,13 +372,8 @@ index 0000000000..25d0fe55d8
 +    let fixture = Fixture::new("normal")?;
 +    let (client, supervisor) = fixture.client(None, false, McpProtocolMode::Legacy).await?;
 +    assert!(supervisor.is_none());
-+    kill(&echo(&client).await?);
-+    tokio::time::timeout(WAIT, async {
-+        while !client.is_closed().await {
-+            tokio::time::sleep(Duration::from_millis(10)).await;
-+        }
-+    })
-+    .await?;
++    kill(&echo(&client).await?)?;
++    wait_closed(&client).await?;
 +    assert!(echo(&client).await.is_err());
 +    tokio::time::sleep(SETTLE).await;
 +    assert_eq!(fixture.launches()?.len(), 1);
@@ -354,11 +387,11 @@ index 0000000000..25d0fe55d8
 +    let (client, _supervisor) = fixture
 +        .client(Some(fast_policy()), false, McpProtocolMode::Legacy)
 +        .await?;
-+    kill(&echo(&client).await?);
++    kill(&echo(&client).await?)?;
 +    let launches = fixture.wait_launches(2).await?;
 +    fixture.cancellation.cancel();
 +    for launch in &launches {
-+        wait_gone(pid(launch)).await?;
++        wait_gone(pid(launch)?).await?;
 +    }
 +    tokio::time::timeout(WAIT, async {
 +        while !client.is_closed().await {
@@ -379,7 +412,7 @@ index 0000000000..25d0fe55d8
 +        let (client, supervisor) = fixture
 +            .client(Some(fast_policy()), false, McpProtocolMode::Legacy)
 +            .await?;
-+        kill(&echo(&client).await?);
++        kill(&echo(&client).await?)?;
 +        let launches = fixture.wait_launches(2).await?;
 +        tokio::time::timeout(WAIT, async {
 +            while !fixture.path().join("blocked").exists() {
@@ -395,7 +428,7 @@ index 0000000000..25d0fe55d8
 +            client.shutdown().await;
 +        }
 +        for launch in &launches {
-+            wait_gone(pid(launch)).await?;
++            wait_gone(pid(launch)?).await?;
 +        }
 +        if drop_owner {
 +            tokio::time::timeout(WAIT, async {
