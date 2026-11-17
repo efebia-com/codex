@@ -1,4 +1,4 @@
-From 5a00475871a0e3e9541eae5fc14141700f2329b5 Mon Sep 17 00:00:00 2001
+From f9d35e22d6e986e64fd7d0260bed08c92ec588d2 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 11:49:41 +0100
 Subject: [PATCH 4/4] channels: steer opted-in notifications with recording
@@ -6,11 +6,11 @@ Subject: [PATCH 4/4] channels: steer opted-in notifications with recording
 
 ---
  codex-rs/ext/channels/README.md             |  51 ++++
- codex-rs/ext/channels/src/delivery.rs       | 261 ++++++++++++++----
+ codex-rs/ext/channels/src/delivery.rs       | 271 ++++++++++++++----
  codex-rs/ext/channels/src/delivery_tests.rs | 287 +++++++++++++++++++-
  codex-rs/ext/channels/src/lib.rs            |  85 +++++-
  codex-rs/ext/channels/tests/lifecycle.rs    | 189 +++++++++++--
- 5 files changed, 806 insertions(+), 67 deletions(-)
+ 5 files changed, 816 insertions(+), 67 deletions(-)
  create mode 100644 codex-rs/ext/channels/README.md
 
 diff --git a/codex-rs/ext/channels/README.md b/codex-rs/ext/channels/README.md
@@ -71,7 +71,7 @@ index 0000000000..6e918e19f4
 +
 +Apply this series after the base channel, channel test, MCP environment and status line series.
 diff --git a/codex-rs/ext/channels/src/delivery.rs b/codex-rs/ext/channels/src/delivery.rs
-index 84c8b53ee8..ba9d9bcc38 100644
+index 84c8b53ee8..e93e8cbe25 100644
 --- a/codex-rs/ext/channels/src/delivery.rs
 +++ b/codex-rs/ext/channels/src/delivery.rs
 @@ -1,11 +1,13 @@
@@ -179,7 +179,7 @@ index 84c8b53ee8..ba9d9bcc38 100644
                  turn_trigger: Some(CHANNEL_TURN_TRIGGER.to_string()),
                  ..Default::default()
              });
-@@ -99,11 +110,50 @@ impl Delivery for ThreadDelivery {
+@@ -99,11 +110,60 @@ impl Delivery for ThreadDelivery {
              }
          })
      }
@@ -202,7 +202,17 @@ index 84c8b53ee8..ba9d9bcc38 100644
 +                .user_input_extension_data
 +                .insert("channels".to_string(), batch_id.into());
 +            match thread.steer_turn(request, turn_id.to_string()).await {
-+                Ok(SteerSubmission::Steered { .. }) => DeliveryOutcome::Delivered,
++                Ok(SteerSubmission::Steered { .. }) => {
++                    debug!(
++                        event.name = "channels.input_steered",
++                        thread_id = %self.thread_id,
++                        turn_id,
++                        batch_id,
++                        count = notifications.len(),
++                        "MCP channel input accepted by the active turn"
++                    );
++                    DeliveryOutcome::Delivered
++                }
 +                Ok(SteerSubmission::NotSubmitted { reason }) => {
 +                    debug!(thread_id = %self.thread_id, ?reason, "MCP channel steer declined; trying idle delivery");
 +                    DeliveryOutcome::Later
@@ -231,7 +241,7 @@ index 84c8b53ee8..ba9d9bcc38 100644
      task: JoinHandle<()>,
  }
  
-@@ -111,15 +161,20 @@ impl Worker {
+@@ -111,15 +171,20 @@ impl Worker {
      pub(crate) fn spawn(
          notifications: mpsc::Receiver<ChannelNotification>,
          delivery: Arc<dyn Delivery>,
@@ -256,7 +266,7 @@ index 84c8b53ee8..ba9d9bcc38 100644
      }
  }
  
-@@ -131,40 +186,77 @@ impl Drop for Worker {
+@@ -131,40 +196,77 @@ impl Drop for Worker {
  
  async fn run(
      mut notifications: mpsc::Receiver<ChannelNotification>,
@@ -352,7 +362,7 @@ index 84c8b53ee8..ba9d9bcc38 100644
              Err(Rejected::NoContent) => {
                  warn!(%server, "dropping MCP channel notification without a string content");
              }
-@@ -173,13 +265,88 @@ impl Pending {
+@@ -173,13 +275,88 @@ impl Pending {
              }
          }
      }
