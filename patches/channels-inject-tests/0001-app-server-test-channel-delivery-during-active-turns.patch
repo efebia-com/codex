@@ -1,12 +1,12 @@
-From 2ac0e4e9ddc8fcbc20fff3cb74cc136da642e957 Mon Sep 17 00:00:00 2001
+From 1a04dd0ff3d16a421a8827ce15daa4544f9c76b0 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 11:51:32 +0100
 Subject: [PATCH] app-server: test channel delivery during active turns
 
 ---
  .../app-server/tests/suite/v2/mcp_channels.rs |   3 +
- .../suite/v2/mcp_channels_during_turn.rs      | 485 ++++++++++++++++++
- 2 files changed, 488 insertions(+)
+ .../suite/v2/mcp_channels_during_turn.rs      | 493 ++++++++++++++++++
+ 2 files changed, 496 insertions(+)
  create mode 100644 codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs
 
 diff --git a/codex-rs/app-server/tests/suite/v2/mcp_channels.rs b/codex-rs/app-server/tests/suite/v2/mcp_channels.rs
@@ -22,10 +22,10 @@ index 3a5712e297..640b4afacc 100644
 +mod during_turn;
 diff --git a/codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs b/codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs
 new file mode 100644
-index 0000000000..6ab6a2991d
+index 0000000000..72f9cd59c9
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs
-@@ -0,0 +1,485 @@
+@@ -0,0 +1,493 @@
 +//! The additional per-server opt-in delivers channel input into the active root turn.
 +
 +use super::*;
@@ -74,6 +74,7 @@ index 0000000000..6ab6a2991d
 +        .write(home.path())?;
 +    let mut app = TestAppServer::builder()
 +        .with_codex_home(home.path())
++        .with_json_logging("codex_channels_extension=debug")
 +        .build_initialized()
 +        .await?;
 +    let ThreadStartResponse { thread, .. } = app
@@ -427,15 +428,22 @@ index 0000000000..6ab6a2991d
 +    harness
 +        .server("chan")
 +        .push(&[json!({"content": "survives interrupt"})])?;
-+    timeout(READ_TIMEOUT, async {
-+        while harness.server("chan").sent_notifications()?.is_empty() {
-+            sleep(POLL_INTERVAL).await;
-+        }
-+        Ok::<_, anyhow::Error>(())
-+    })
-+    .await??;
-+    // Allow the live server's input to reach steer while sampling is still blocked.
-+    sleep(Duration::from_millis(500)).await;
++    // Interrupt only after the active turn accepted the batch. A sent notification alone
++    // could still be waiting locally, which would not exercise recovery of steered input.
++    let steered = harness
++        .app
++        .wait_for_matching_json_log_event(
++            "channel input accepted by the interrupted turn",
++            |event| {
++                event["fields"]["event.name"] == "channels.input_steered"
++                    && event["fields"]["thread_id"] == harness.thread_id
++                    && event["fields"]["turn_id"] == turn
++            },
++            READ_TIMEOUT,
++        )
++        .await?;
++    assert_eq!(steered["fields"]["count"], 1);
++    assert!(steered["fields"]["batch_id"].as_u64().is_some());
 +    harness
 +        .app
 +        .interrupt_turn_and_wait_for_aborted(harness.thread_id.clone(), turn, READ_TIMEOUT)
