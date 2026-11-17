@@ -4,7 +4,8 @@
 # Usage: tests/install/run.sh
 #
 # Needs python3, curl and tar; no network. HOME points to a temporary
-# directory, so nothing outside it is touched.
+# directory, so nothing outside it is touched. A fake uname makes the host look
+# like Linux x86_64, or like the platform a test chooses.
 
 set -euo pipefail
 
@@ -33,8 +34,8 @@ sha256() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{ print $1 }'; else shasum -a 256 "$1" | awk '{ print $1 }'; fi
 }
 
-# Fake releases for every target, so the test does not depend on the host.
-targets=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin)
+# Releases are published for Linux x86_64 only.
+targets=(x86_64-unknown-linux-musl)
 versions=(1.0.0-ext.1 1.0.0-ext.2 1.1.0-ext.1)
 latest=1.1.0-ext.1
 for version in "${versions[@]}"; do
@@ -61,6 +62,19 @@ for _ in $(seq 50); do
   sleep 0.1
 done
 [[ -s "${work}/port" ]] || { echo "server did not start"; exit 1; }
+
+real_uname="$(command -v uname)"
+mkdir -p "${work}/fakebin"
+cat >"${work}/fakebin/uname" <<FAKE
+#!/bin/sh
+case "\${1:-}" in
+  -s) echo "\${FAKE_UNAME_S:-Linux}" ;;
+  -m) echo "\${FAKE_UNAME_M:-x86_64}" ;;
+  *) exec "${real_uname}" "\$@" ;;
+esac
+FAKE
+chmod 0755 "${work}/fakebin/uname"
+export PATH="${work}/fakebin:${PATH}"
 
 export HOME="${work}/home"
 mkdir -p "$HOME"
@@ -101,6 +115,17 @@ check "and reports it" output_has "checksum mismatch"
 check "and leaves the active release alone" installed 1.0.0-ext.2
 
 check "a missing release fails" fails run_install --version 9.9.9-ext.1
+
+run_install_on() {
+  FAKE_UNAME_S="$1" FAKE_UNAME_M="$2" sh "$installer" --prefix "$prefix" --version "$latest" >"${work}/out" 2>&1
+}
+prefix="${HOME}/unsupported"
+for platform in "Linux aarch64" "Linux arm64" "Darwin arm64" "Darwin x86_64" "FreeBSD amd64"; do
+  read -r os arch <<<"$platform"
+  check "${os} ${arch} is refused" fails run_install_on "$os" "$arch"
+  check "with a clear message" output_has "unsupported platform: ${os} ${arch}. Codex with extensions is published for Linux x86_64 only"
+  check "before anything is written" test ! -e "$prefix"
+done
 
 prefix="${HOME}/.codex/packages/standalone/releases/x"
 check "a prefix inside CODEX_HOME is refused" fails run_install --version "$latest"

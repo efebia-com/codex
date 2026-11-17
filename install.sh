@@ -12,6 +12,9 @@
 #
 # Nothing outside the prefix is touched: not other Codex installations, not
 # ~/.codex, not shell profiles. Add <prefix>/bin to PATH yourself.
+#
+# Releases are published for Linux x86_64 only; on any other platform the
+# installer stops before it writes anything.
 
 set -eu
 
@@ -55,26 +58,9 @@ command -v tar >/dev/null 2>&1 || die "tar is required"
 detect_target() {
   os="$(uname -s)"
   arch="$(uname -m)"
-  case "$os" in
-    Linux)
-      case "$arch" in
-        x86_64|amd64) echo x86_64-unknown-linux-musl ;;
-        aarch64|arm64) echo aarch64-unknown-linux-musl ;;
-        *) die "unsupported Linux architecture: $arch" ;;
-      esac
-      ;;
-    Darwin)
-      # A shell running under Rosetta reports x86_64 on Apple silicon.
-      if [ "$arch" = x86_64 ] && [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = 1 ]; then
-        arch=arm64
-      fi
-      case "$arch" in
-        arm64|aarch64) echo aarch64-apple-darwin ;;
-        x86_64) echo x86_64-apple-darwin ;;
-        *) die "unsupported macOS architecture: $arch" ;;
-      esac
-      ;;
-    *) die "unsupported operating system: $os" ;;
+  case "${os}/${arch}" in
+    Linux/x86_64|Linux/amd64) echo x86_64-unknown-linux-musl ;;
+    *) die "unsupported platform: ${os} ${arch}. Codex with extensions is published for Linux x86_64 only" ;;
   esac
 }
 
@@ -104,12 +90,6 @@ check_prefix() {
     "$codex_home"/*)
       die "the prefix must not be inside ${codex_home}: Codex would treat it as its own standalone install" ;;
   esac
-  if [ "$(uname -s)" = Darwin ]; then
-    case "$PREFIX/" in
-      /opt/homebrew/*|/usr/local/*)
-        die "on macOS the prefix must not be under /opt/homebrew or /usr/local: Codex would treat it as a Homebrew install" ;;
-    esac
-  fi
   if [ -d "$PREFIX" ] && [ ! -f "$PREFIX/.codex-ext" ] && [ -n "$(ls -A "$PREFIX" 2>/dev/null)" ]; then
     die "$PREFIX exists, is not empty and was not created by this installer"
   fi
@@ -135,9 +115,10 @@ download() {
   curl -fsSL --retry 3 -o "$2" "$1" || die "download failed: $1"
 }
 
+# First: an unsupported platform stops here, before anything is checked or written.
+target="$(detect_target)"
 PREFIX="$(absolute_dir "$PREFIX")"
 check_prefix
-target="$(detect_target)"
 current="$(installed_version || true)"
 
 if [ "$VERSION" = latest ]; then
@@ -183,11 +164,6 @@ tar -xzf "$tmp/$asset" -C "$tmp/unpack"
 unpacked="$tmp/unpack/codex-${VERSION}-${target}"
 [ -x "$unpacked/bin/codex" ] && [ -f "$unpacked/DISTRIBUTION" ] ||
   die "unexpected archive layout in ${asset}"
-# curl does not set the quarantine attribute; clear it anyway in case the
-# archive came through a browser-managed cache.
-if [ "$(uname -s)" = Darwin ]; then
-  xattr -dr com.apple.quarantine "$unpacked" 2>/dev/null || true
-fi
 
 rm -rf "$release_dir"
 mv "$unpacked" "$release_dir"

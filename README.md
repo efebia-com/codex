@@ -15,7 +15,8 @@ notes and in `MODIFICATIONS.md` inside the archive.
 
 ## Install
 
-Linux (x86_64, aarch64) and macOS (Apple silicon, Intel):
+Linux x86_64 (releases are published for this platform only; on any other the
+installer stops with an error):
 
 ```sh
 curl -fsSL https://github.com/efebia-com/codex/releases/latest/download/install.sh | sh
@@ -42,9 +43,8 @@ against the release's `SHA256SUMS`, and unpacks it into the prefix:
 It changes nothing outside the prefix: other Codex installations, `~/.codex`
 and shell profiles stay as they are. Add `<prefix>/bin` to your `PATH` (it prints
 the line to use); whichever `codex` comes first in `PATH` is the one that runs.
-It refuses prefixes inside `$CODEX_HOME` and, on macOS, under `/opt/homebrew`
-or `/usr/local`, where Codex would think it had been installed by its own
-installer or by Homebrew and would offer their update commands.
+It refuses prefixes inside `$CODEX_HOME`, where Codex would think it had been
+installed by its own installer and would offer that installer's update command.
 
 Options: `--version <version>` installs a given release, `--check` only reports
 whether an update is available. To uninstall, delete the prefix.
@@ -97,17 +97,6 @@ updates. The daemon belongs to `$CODEX_HOME`, so every Codex installation that
 uses the same `$CODEX_HOME` shares it.
 
 To avoid the daemon altogether, start the TUI with `codex --no-daemon`.
-
-### macOS
-
-The binaries are not signed with a Developer ID nor notarized. Files downloaded
-with `curl`, as the installer does, do not get the quarantine attribute, so
-Gatekeeper does not block them. If you download an archive with a browser,
-remove the attribute before running it:
-
-```sh
-xattr -dr com.apple.quarantine codex-<version>-<target>
-```
 
 ## Versions
 
