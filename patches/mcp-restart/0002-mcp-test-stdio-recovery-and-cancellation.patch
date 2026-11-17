@@ -1,0 +1,419 @@
+From 712d443bc8da25b11b3bf4e713a437530702fd7d Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 11:55:16 +0100
+Subject: [PATCH 2/2] mcp: test stdio recovery and cancellation
+
+---
+ codex-rs/rmcp-client/tests/stdio_restart.rs | 400 ++++++++++++++++++++
+ 1 file changed, 400 insertions(+)
+ create mode 100644 codex-rs/rmcp-client/tests/stdio_restart.rs
+
+diff --git a/codex-rs/rmcp-client/tests/stdio_restart.rs b/codex-rs/rmcp-client/tests/stdio_restart.rs
+new file mode 100644
+index 0000000000..89e807d178
+--- /dev/null
++++ b/codex-rs/rmcp-client/tests/stdio_restart.rs
+@@ -0,0 +1,400 @@
++//! Recovery owns one stdio connection and never replays a tool invocation.
++
++#![cfg(unix)]
++
++use std::collections::HashMap;
++use std::fs;
++use std::path::Path;
++use std::sync::Arc;
++use std::time::Duration;
++
++use anyhow::Result;
++use codex_exec_server::Environment;
++use codex_rmcp_client::ExecutorStdioServerLauncher;
++use codex_rmcp_client::LocalStdioServerLauncher;
++use codex_rmcp_client::McpProtocolMode;
++use codex_rmcp_client::RmcpClient;
++use codex_rmcp_client::StdioRestartGuard;
++use codex_rmcp_client::StdioRestartPolicy;
++use codex_rmcp_client::StdioServerLauncher;
++use futures::FutureExt;
++use pretty_assertions::assert_eq;
++use rmcp::model::ClientCapabilities;
++use rmcp::model::Implementation;
++use rmcp::model::InitializeRequestParams;
++use rmcp::model::ProtocolVersion;
++use serde_json::Value;
++use serde_json::json;
++
++const WAIT: Duration = Duration::from_secs(30);
++const SETTLE: Duration = Duration::from_millis(250);
++
++struct Fixture {
++    temporary: tempfile::TempDir,
++}
++
++impl Fixture {
++    fn new(mode: &str) -> Result<Self> {
++        let temporary = tempfile::tempdir()?;
++        fs::write(temporary.path().join("mode"), mode)?;
++        fs::write(temporary.path().join("main.py"), SERVER)?;
++        Ok(Self { temporary })
++    }
++
++    fn path(&self) -> &Path {
++        self.temporary.path()
++    }
++
++    fn launches(&self) -> Result<Vec<Value>> {
++        let path = self.path().join("launches");
++        if !path.exists() {
++            return Ok(Vec::new());
++        }
++        fs::read_to_string(path)?
++            .lines()
++            .map(|line| Ok(serde_json::from_str(line)?))
++            .collect()
++    }
++
++    async fn wait_launches(&self, count: usize) -> Result<Vec<Value>> {
++        tokio::time::timeout(WAIT, async {
++            loop {
++                let launches = self.launches()?;
++                if launches.len() >= count {
++                    return Ok(launches);
++                }
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        })
++        .await?
++    }
++
++    async fn client(
++        &self,
++        policy: Option<StdioRestartPolicy>,
++        executor: bool,
++        protocol: McpProtocolMode,
++    ) -> Result<(Arc<RmcpClient>, Option<StdioRestartGuard>)> {
++        let launcher: Arc<dyn StdioServerLauncher> = if executor {
++            Arc::new(ExecutorStdioServerLauncher::new(
++                Environment::default_for_tests().get_exec_backend(),
++            ))
++        } else {
++            Arc::new(LocalStdioServerLauncher::new(self.path().to_path_buf()))
++        };
++        let mut client = RmcpClient::new_stdio_client_with_protocol_mode(
++            "python3".into(),
++            vec![
++                self.path().join("main.py").into_os_string(),
++                self.path().as_os_str().to_owned(),
++            ],
++            Some(HashMap::from([
++                ("CODEX_SESSION_ID".into(), "session-owner".into()),
++                ("CODEX_THREAD_ID".into(), "thread-owner".into()),
++            ])),
++            &[],
++            Some(self.path().to_string_lossy().into_owned()),
++            launcher,
++            protocol,
++        )
++        .await?;
++        if let Some(policy) = policy {
++            client = client.with_stdio_restart(policy);
++        }
++        let client = Arc::new(client);
++        client
++            .initialize(
++                InitializeRequestParams::new(
++                    ClientCapabilities::default(),
++                    Implementation::new("restart-test", "1"),
++                )
++                .with_protocol_version(ProtocolVersion::V_2025_06_18),
++                Some(Duration::from_secs(5)),
++                Box::new(|_, _| async { anyhow::bail!("unexpected elicitation") }.boxed()),
++            )
++            .await?;
++        let supervisor = client.supervise_stdio_restarts();
++        Ok((client, supervisor))
++    }
++}
++
++fn fast_policy() -> StdioRestartPolicy {
++    StdioRestartPolicy {
++        backoff: [Duration::from_millis(20); 3],
++        stable_after: Duration::from_secs(60),
++    }
++}
++
++fn pid(launch: &Value) -> i32 {
++    launch["pid"].as_i64().expect("fixture pid") as i32
++}
++
++fn kill(launch: &Value) {
++    // Only a PID written by this test's isolated fixture may be signalled.
++    assert_eq!(unsafe { libc::kill(pid(launch), libc::SIGKILL) }, 0);
++}
++
++async fn wait_gone(process: i32) -> Result<()> {
++    tokio::time::timeout(WAIT, async {
++        while unsafe { libc::kill(process, 0) } == 0 {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await?;
++    Ok(())
++}
++
++async fn echo(client: &RmcpClient) -> Result<Value> {
++    let result = client
++        .call_tool("echo".to_string(), None, |_| Ok(None), Some(WAIT))
++        .await?;
++    Ok(result.structured_content.expect("fixture result"))
++}
++
++#[tokio::test]
++async fn proactively_restarts_the_same_connection_with_the_same_environment() -> Result<()> {
++    // Exercise both launcher implementations and legacy discovery, which must still initialize.
++    for (executor, protocol) in [
++        (false, McpProtocolMode::Legacy),
++        (true, McpProtocolMode::Legacy),
++        (false, McpProtocolMode::DiscoverLocalStdio),
++    ] {
++        let fixture = Fixture::new("normal")?;
++        let (client, _supervisor) = fixture
++            .client(Some(fast_policy()), executor, protocol)
++            .await?;
++        let first = echo(&client).await?;
++        let revision = client.tool_list_revision().current();
++        kill(&first);
++        // No subsequent request is needed to start the replacement.
++        let launches = fixture.wait_launches(2).await?;
++        let second = echo(&client).await?;
++        assert_ne!(first["pid"], second["pid"]);
++        for launch in &launches {
++            assert_eq!(launch["session"], "session-owner");
++            assert_eq!(launch["thread"], "thread-owner");
++        }
++        assert_eq!(client.tool_list_revision().current(), revision + 1);
++        let (a, b) = tokio::join!(echo(&client), echo(&client));
++        assert_eq!(a?["pid"], second["pid"]);
++        assert_eq!(b?["pid"], second["pid"]);
++        assert_eq!(fixture.launches()?.len(), 2);
++        client.shutdown().await;
++        wait_gone(pid(&second)).await?;
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn a_tool_that_exits_mid_call_is_not_replayed() -> Result<()> {
++    let fixture = Fixture::new("normal")?;
++    let (client, _supervisor) = fixture
++        .client(Some(fast_policy()), false, McpProtocolMode::Legacy)
++        .await?;
++    let error = client
++        .call_tool(
++            "crash".to_string(),
++            Some(json!({})),
++            |_| Ok(None),
++            Some(WAIT),
++        )
++        .await
++        .expect_err("in-flight invocation must fail");
++    assert!(!error.to_string().is_empty());
++    fixture.wait_launches(2).await?;
++    echo(&client).await?;
++    assert_eq!(fs::read_to_string(fixture.path().join("calls"))?, "crash\n");
++    client.shutdown().await;
++    Ok(())
++}
++
++#[tokio::test]
++async fn failed_initializations_exhaust_three_attempts_and_leave_no_process() -> Result<()> {
++    let fixture = Fixture::new("fail_restart")?;
++    let (client, _supervisor) = fixture
++        .client(Some(fast_policy()), false, McpProtocolMode::Legacy)
++        .await?;
++    let first = echo(&client).await?;
++    kill(&first);
++    let launches = fixture.wait_launches(4).await?;
++    tokio::time::timeout(WAIT, async {
++        while !client.is_closed().await {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await?;
++    let error = echo(&client).await.expect_err("budget must be exhausted");
++    assert!(
++        error
++            .to_string()
++            .contains("was not restarted after 3 attempts"),
++        "{error:#}"
++    );
++    for launch in &launches {
++        wait_gone(pid(launch)).await?;
++    }
++    tokio::time::sleep(SETTLE).await;
++    assert_eq!(fixture.launches()?.len(), 4);
++    client.shutdown().await;
++    Ok(())
++}
++
++#[tokio::test]
++async fn repeated_successful_but_short_lived_processes_exhaust_the_budget() -> Result<()> {
++    let fixture = Fixture::new("normal")?;
++    let (client, _supervisor) = fixture
++        .client(Some(fast_policy()), false, McpProtocolMode::Legacy)
++        .await?;
++    for count in 1..=4 {
++        let current = echo(&client).await?;
++        kill(&current);
++        if count < 4 {
++            fixture.wait_launches(count + 1).await?;
++        }
++    }
++    let error = echo(&client)
++        .await
++        .expect_err("fourth exit must exhaust the budget");
++    assert!(error.to_string().contains("after 3 attempts"));
++    client.shutdown().await;
++    assert_eq!(fixture.launches()?.len(), 4);
++    Ok(())
++}
++
++#[tokio::test]
++async fn shutdown_and_owner_drop_cancel_the_backoff_without_a_late_spawn() -> Result<()> {
++    for drop_owner in [false, true] {
++        let fixture = Fixture::new("normal")?;
++        let mut policy = fast_policy();
++        policy.backoff = [Duration::from_secs(2); 3];
++        let (client, supervisor) = fixture
++            .client(Some(policy), false, McpProtocolMode::Legacy)
++            .await?;
++        let first = echo(&client).await?;
++        kill(&first);
++        // Closing status must not cause a refresh to create a second connection.
++        assert!(!client.is_closed().await);
++        tokio::time::sleep(SETTLE).await;
++        if drop_owner {
++            drop(supervisor);
++            drop(client);
++        } else {
++            client.shutdown().await;
++        }
++        wait_gone(pid(&first)).await?;
++        tokio::time::sleep(Duration::from_secs(2)).await;
++        assert_eq!(fixture.launches()?.len(), 1);
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn an_unconfigured_server_is_not_restarted() -> Result<()> {
++    let fixture = Fixture::new("normal")?;
++    let (client, supervisor) = fixture.client(None, false, McpProtocolMode::Legacy).await?;
++    assert!(supervisor.is_none());
++    kill(&echo(&client).await?);
++    tokio::time::timeout(WAIT, async {
++        while !client.is_closed().await {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await?;
++    assert!(echo(&client).await.is_err());
++    tokio::time::sleep(SETTLE).await;
++    assert_eq!(fixture.launches()?.len(), 1);
++    client.shutdown().await;
++    Ok(())
++}
++
++#[tokio::test]
++async fn shutdown_and_owner_drop_stop_a_replacement_during_initialize() -> Result<()> {
++    for drop_owner in [false, true] {
++        let fixture = Fixture::new("hang_restart")?;
++        let (client, supervisor) = fixture
++            .client(Some(fast_policy()), false, McpProtocolMode::Legacy)
++            .await?;
++        kill(&echo(&client).await?);
++        let launches = fixture.wait_launches(2).await?;
++        tokio::time::timeout(WAIT, async {
++            while !fixture.path().join("blocked").exists() {
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        })
++        .await?;
++        let weak = Arc::downgrade(&client);
++        if drop_owner {
++            drop(supervisor);
++            drop(client);
++        } else {
++            client.shutdown().await;
++        }
++        for launch in &launches {
++            wait_gone(pid(launch)).await?;
++        }
++        if drop_owner {
++            tokio::time::timeout(WAIT, async {
++                while weak.strong_count() > 0 {
++                    tokio::task::yield_now().await;
++                }
++            })
++            .await?;
++        }
++        tokio::time::sleep(SETTLE).await;
++        assert_eq!(fixture.launches()?.len(), 2);
++    }
++    Ok(())
++}
++
++const SERVER: &str = r#"import json
++import os
++import pathlib
++import signal
++import sys
++import time
++
++
++def main() -> None:
++    signal.alarm(120)
++    root = pathlib.Path(sys.argv[1])
++    launch = {
++        "pid": os.getpid(),
++        "session": os.environ.get("CODEX_SESSION_ID"),
++        "thread": os.environ.get("CODEX_THREAD_ID"),
++    }
++    launches_path = root / "launches"
++    with launches_path.open("a") as stream:
++        stream.write(json.dumps(launch) + "\n")
++    count = len(launches_path.read_text().splitlines())
++    if (root / "mode").read_text() == "fail_restart" and count > 1:
++        return
++    for line in sys.stdin:
++        request = json.loads(line)
++        if "id" not in request:
++            continue
++        method = request["method"]
++        if method == "initialize":
++            if (root / "mode").read_text() == "hang_restart" and count > 1:
++                (root / "blocked").touch()
++                time.sleep(60)
++            result = {
++                "protocolVersion": "2025-06-18",
++                "capabilities": {"tools": {}},
++                "serverInfo": {"name": "restart-fixture", "version": "1"},
++            }
++        elif method == "tools/list":
++            result = {"tools": []}
++        elif method == "tools/call":
++            if request["params"]["name"] == "crash":
++                with (root / "calls").open("a") as stream:
++                    stream.write("crash\n")
++                os._exit(1)
++            result = {"content": [], "structuredContent": launch}
++        else:
++            continue
++        print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
++
++
++if __name__ == "__main__":
++    main()
++"#;
+-- 
+2.53.0
+

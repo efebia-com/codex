@@ -1,0 +1,834 @@
+From 7beee849c8c1d5b71567d9174e5184ec7c65259f Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 11:52:56 +0100
+Subject: [PATCH] app-server: test opted-in MCP process restarts
+
+---
+ .../app-server/tests/suite/v2/mcp_restart.rs  | 619 ++++++++++++++++++
+ .../tests/suite/v2/mcp_restart_server.py      | 175 +++++
+ codex-rs/app-server/tests/suite/v2/mod.rs     |   1 +
+ 3 files changed, 795 insertions(+)
+ create mode 100644 codex-rs/app-server/tests/suite/v2/mcp_restart.rs
+ create mode 100644 codex-rs/app-server/tests/suite/v2/mcp_restart_server.py
+
+diff --git a/codex-rs/app-server/tests/suite/v2/mcp_restart.rs b/codex-rs/app-server/tests/suite/v2/mcp_restart.rs
+new file mode 100644
+index 0000000000..53659903b9
+--- /dev/null
++++ b/codex-rs/app-server/tests/suite/v2/mcp_restart.rs
+@@ -0,0 +1,619 @@
++//! Opted-in stdio servers recover without replaying in-flight calls or channel input.
++#![cfg(unix)]
++
++use std::io::Write as _;
++use std::path::PathBuf;
++use std::time::Duration;
++
++use anyhow::Context;
++use anyhow::Result;
++use anyhow::bail;
++use app_test_support::MockResponsesConfig;
++use app_test_support::TestAppServer;
++use codex_app_server_protocol::ClientRequest;
++use codex_app_server_protocol::ThreadStartParams;
++use codex_app_server_protocol::ThreadStartResponse;
++use codex_app_server_protocol::TurnStartParams;
++use codex_app_server_protocol::TurnStartResponse;
++use codex_app_server_protocol::UserInput;
++use codex_features::Feature;
++use core_test_support::responses;
++use core_test_support::responses::ResponsesRequest;
++use core_test_support::skip_if_no_network;
++use pretty_assertions::assert_eq;
++use serde_json::Value;
++use serde_json::json;
++use tempfile::TempDir;
++use tokio::time::Instant;
++use tokio::time::sleep;
++use tokio::time::timeout;
++use wiremock::Mock;
++use wiremock::MockServer;
++use wiremock::matchers::method;
++use wiremock::matchers::path_regex;
++
++const SERVER_SCRIPT: &str = include_str!("mcp_restart_server.py");
++const READ_TIMEOUT: Duration = Duration::from_secs(40);
++const POLL_INTERVAL: Duration = Duration::from_millis(50);
++// Covers all three backoffs (1 + 2 + 4 seconds), with room for scheduler delays.
++const NO_RESTART_WINDOW: Duration = Duration::from_secs(9);
++
++#[derive(Default)]
++struct Options {
++    restart: Option<bool>,
++    channel: bool,
++    drop_capability: bool,
++}
++
++struct Harness {
++    model: MockServer,
++    app: TestAppServer,
++    thread_id: String,
++    inbox: PathBuf,
++    record: PathBuf,
++    _home: TempDir,
++}
++
++impl Harness {
++    async fn start(options: Options) -> Result<Self> {
++        let model = responses::start_mock_server().await;
++        Mock::given(method("POST"))
++            .and(path_regex(".*/responses$"))
++            .respond_with(responses::sse_response(responses::sse(vec![
++                responses::ev_response_created("resp-final"),
++                responses::ev_assistant_message("msg-final", "done"),
++                responses::ev_completed("resp-final"),
++            ])))
++            .with_priority(u8::MAX)
++            .mount(&model)
++            .await;
++        let home = TempDir::new()?;
++        let script = home.path().join("mcp_restart_server.py");
++        let inbox = home.path().join("server.inbox");
++        let record = home.path().join("server.record");
++        std::fs::write(&script, SERVER_SCRIPT)?;
++        let mut args = vec![
++            script.to_str().context("UTF-8 script")?,
++            "--inbox",
++            inbox.to_str().context("UTF-8 inbox")?,
++            "--record",
++            record.to_str().context("UTF-8 record")?,
++        ];
++        if options.drop_capability {
++            args.push("--drop-capability-after-first");
++        }
++        let mut config = format!(
++            "\n[mcp_servers.restart]\ncommand = \"python3\"\nargs = {}\n\
++             startup_timeout_sec = 10\ntool_timeout_sec = 10\n\
++             default_tools_approval_mode = \"approve\"\n\
++             env = {{ RESTART_TEST_VALUE = \"configured\" }}\n\
++             env_vars = [{{name = \"CODEX_SESSION_ID\", source = \"codex\"}}, \
++             {{name = \"CODEX_THREAD_ID\", source = \"codex\"}}]\n",
++            serde_json::to_string(&args)?,
++        );
++        if let Some(restart) = options.restart {
++            config.push_str(&format!("restart_on_exit = {restart}\n"));
++        }
++        if options.channel {
++            config.push_str("channel = true\n");
++        }
++        MockResponsesConfig::new(&model.uri())
++            .with_extra_config(&config)
++            .enable_feature(Feature::Collab)
++            .write(home.path())?;
++        let mut app = TestAppServer::builder()
++            .with_codex_home(home.path())
++            .build_initialized()
++            .await?;
++        let ThreadStartResponse { thread, .. } = app
++            .start_thread(ThreadStartParams {
++                model: Some("mock-model".to_string()),
++                ..Default::default()
++            })
++            .await?;
++        timeout(
++            READ_TIMEOUT,
++            app.read_stream_until_matching_notification("restart server ready", |notification| {
++                notification.method == "mcpServer/startupStatus/updated"
++                    && notification.params.as_ref().is_some_and(|params| {
++                        params["name"] == "restart" && params["status"] == "ready"
++                    })
++            }),
++        )
++        .await??;
++        Ok(Self {
++            model,
++            app,
++            thread_id: thread.id,
++            inbox,
++            record,
++            _home: home,
++        })
++    }
++
++    fn records(&self, event: &str) -> Result<Vec<Value>> {
++        let text = std::fs::read_to_string(&self.record)?;
++        // Each complete line is written under the fixture's lock. Ignore an in-progress tail.
++        let mut records = Vec::new();
++        for line in text
++            .split_inclusive('\n')
++            .filter(|line| line.ends_with('\n'))
++        {
++            let record: Value = serde_json::from_str(line)?;
++            if record["event"] == event {
++                records.push(record);
++            }
++        }
++        Ok(records)
++    }
++
++    async fn wait_records(&self, event: &str, count: usize) -> Result<Vec<Value>> {
++        let deadline = Instant::now() + READ_TIMEOUT;
++        loop {
++            let records = self.records(event)?;
++            if records.len() >= count {
++                return Ok(records);
++            }
++            if Instant::now() >= deadline {
++                bail!(
++                    "expected {count} {event} records, got {records:?}; all records: {}",
++                    std::fs::read_to_string(&self.record)?
++                );
++            }
++            sleep(POLL_INTERVAL).await;
++        }
++    }
++
++    fn command(&self, pid: &Value, action: &str, params: Value) -> Result<()> {
++        let mut inbox = std::fs::OpenOptions::new()
++            .create(true)
++            .append(true)
++            .open(&self.inbox)?;
++        writeln!(
++            inbox,
++            "{}",
++            json!({"pid": pid, "action": action, "params": params})
++        )?;
++        Ok(())
++    }
++
++    async fn restart(&self) -> Result<(Value, Value)> {
++        let first = self
++            .records("start")?
++            .last()
++            .context("first start")?
++            .clone();
++        let count = self.records("start")?.len();
++        self.command(&first["pid"], "exit", Value::Null)?;
++        // No tool call is issued until the new process has initialized: recovery is proactive.
++        self.wait_records("initialized", count + 1).await?;
++        let starts = self.records("start")?;
++        let next = starts.last().context("replacement start")?.clone();
++        assert_ne!(first["pid"], next["pid"]);
++        Ok((first, next))
++    }
++
++    async fn requests(&self) -> Vec<ResponsesRequest> {
++        responses::received_responses_requests(&self.model).await
++    }
++
++    async fn turn(&mut self, prompt: &str) -> Result<String> {
++        let thread_id = self.thread_id.clone();
++        let TurnStartResponse { turn } = self
++            .app
++            .request(|request_id| ClientRequest::TurnStart {
++                request_id,
++                params: TurnStartParams {
++                    thread_id,
++                    input: vec![UserInput::Text {
++                        text: prompt.to_string(),
++                        text_elements: Vec::new(),
++                    }],
++                    ..Default::default()
++                },
++            })
++            .await?;
++        Ok(turn.id)
++    }
++
++    async fn completed(&mut self, turn_id: &str) -> Result<()> {
++        timeout(
++            READ_TIMEOUT,
++            self.app.read_stream_until_matching_notification(
++                "matching completed turn",
++                |notification| {
++                    notification.method == "turn/completed"
++                        && notification
++                            .params
++                            .as_ref()
++                            .is_some_and(|params| params["turn"]["id"] == turn_id)
++                },
++            ),
++        )
++        .await??;
++        Ok(())
++    }
++
++    async fn call(&mut self, call_id: &str, name: &str, arguments: Value) -> Result<Vec<String>> {
++        responses::mount_sse_once(
++            &self.model,
++            responses::sse(vec![
++                responses::ev_response_created(call_id),
++                responses::ev_function_call_with_namespace(
++                    call_id,
++                    "mcp__restart",
++                    name,
++                    &arguments.to_string(),
++                ),
++                responses::ev_completed(call_id),
++            ]),
++        )
++        .await;
++        let turn = self.turn(&format!("call {name}: {call_id}")).await?;
++        self.completed(&turn).await?;
++        let requests = self.requests().await;
++        let item = requests
++            .iter()
++            .rev()
++            .find_map(|request| {
++                request
++                    .inputs_of_type("function_call_output")
++                    .into_iter()
++                    .find(|item| item["call_id"] == call_id)
++            })
++            .with_context(|| format!("no output for {call_id}"))?;
++        Ok(match &item["output"] {
++            Value::String(text) => vec![text.clone()],
++            Value::Array(parts) => parts
++                .iter()
++                .filter_map(|part| part["text"].as_str().map(str::to_string))
++                .collect(),
++            output => bail!("unexpected tool output: {output}"),
++        })
++    }
++
++    async fn wait_channel(&self, text: &str) -> Result<String> {
++        timeout(READ_TIMEOUT, async {
++            loop {
++                for request in self.requests().await {
++                    if channel_texts(&request).iter().any(|value| value == text) {
++                        return request.body_json()["client_metadata"]["turn_id"]
++                            .as_str()
++                            .map(str::to_string)
++                            .context("channel turn id");
++                    }
++                }
++                sleep(POLL_INTERVAL).await;
++            }
++        })
++        .await?
++    }
++
++    async fn shutdown(&mut self) -> Result<()> {
++        let status = timeout(READ_TIMEOUT, self.app.shutdown_gracefully()).await??;
++        assert!(status.success(), "app-server shutdown: {status}");
++        self.wait_no_processes().await
++    }
++
++    async fn wait_no_processes(&self) -> Result<()> {
++        let pids = self.records("start")?;
++        timeout(READ_TIMEOUT, async {
++            while pids.iter().any(|record| process_alive(&record["pid"])) {
++                sleep(POLL_INTERVAL).await;
++            }
++        })
++        .await
++        .context("an MCP process survived shutdown or restart exhaustion")?;
++        Ok(())
++    }
++}
++
++fn process_alive(pid: &Value) -> bool {
++    let pid = i32::try_from(pid.as_i64().expect("fixture PID")).expect("PID fits pid_t");
++    // SAFETY: signal 0 only probes the existence of a fixture process; it sends no signal.
++    unsafe {
++        libc::kill(pid, 0) == 0
++            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
++    }
++}
++
++fn pid_result(texts: &[String]) -> Result<Value> {
++    texts
++        .iter()
++        .find_map(|text| {
++            serde_json::from_str::<Value>(text)
++                .ok()
++                .filter(|value| value.get("pid").is_some())
++        })
++        .context("successful PID tool result")
++}
++
++fn channel_texts(request: &ResponsesRequest) -> Vec<String> {
++    request
++        .message_input_texts("user")
++        .into_iter()
++        .filter(|text| text.starts_with("<channel "))
++        .collect()
++}
++
++fn channel_text(content: &str) -> String {
++    format!("<channel source=\"restart\">\n{content}\n</channel>")
++}
++
++#[tokio::test]
++async fn restart_is_proactive_and_preserves_configured_and_session_environment() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let mut harness = Harness::start(Options {
++        restart: Some(true),
++        ..Default::default()
++    })
++    .await?;
++    let before = pid_result(&harness.call("pid-before", "pid", json!({})).await?)?;
++    let (first, next) = harness.restart().await?;
++    assert_eq!(before["pid"], first["pid"]);
++    assert_eq!(next["env"], first["env"]);
++    assert_eq!(first["env"]["RESTART_TEST_VALUE"], "configured");
++    assert_eq!(first["env"]["CODEX_THREAD_ID"], harness.thread_id);
++    assert!(
++        first["env"]["CODEX_SESSION_ID"]
++            .as_str()
++            .is_some_and(|id| !id.is_empty())
++    );
++    let after = pid_result(&harness.call("pid-after", "pid", json!({})).await?)?;
++    assert_eq!(after["pid"], next["pid"]);
++    assert_eq!(after["env"], first["env"]);
++    assert_eq!(harness.records("start")?.len(), 2);
++    harness.shutdown().await
++}
++
++#[tokio::test]
++async fn a_call_in_flight_fails_once_and_is_not_replayed_after_restart() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let mut harness = Harness::start(Options {
++        restart: Some(true),
++        ..Default::default()
++    })
++    .await?;
++    let texts = harness.call("crash-once", "crash", json!({})).await?;
++    assert!(
++        texts
++            .iter()
++            .any(|text| text.to_lowercase().contains("error")),
++        "the interrupted call must return an error: {texts:?}"
++    );
++    harness.wait_records("initialized", 2).await?;
++    let next = harness
++        .records("start")?
++        .last()
++        .context("replacement start")?
++        .clone();
++    let result = pid_result(&harness.call("after-crash", "pid", json!({})).await?)?;
++    assert_eq!(result["pid"], next["pid"]);
++    assert_eq!(
++        harness
++            .records("tool_call")?
++            .iter()
++            .filter(|record| record["name"] == "crash")
++            .count(),
++        1,
++        "an in-flight call may have side effects and must not be retried"
++    );
++    harness.shutdown().await
++}
++
++#[tokio::test]
++async fn repeated_post_initialize_exits_stop_after_three_restart_attempts() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let mut harness = Harness::start(Options {
++        restart: Some(true),
++        ..Default::default()
++    })
++    .await?;
++    let first = harness.records("start")?[0].clone();
++    harness.command(&first["pid"], "crash-loop", Value::Null)?;
++    harness.wait_records("exit", 4).await?;
++    harness.wait_no_processes().await?;
++    let output = harness.call("exhausted", "pid", json!({})).await?;
++    assert!(
++        output
++            .iter()
++            .any(|text| text.contains("exited and was not restarted after 3 attempts")),
++        "exhaustion error must explain the retry budget: {output:?}"
++    );
++    sleep(NO_RESTART_WINDOW).await;
++    assert_eq!(
++        harness.records("start")?.len(),
++        4,
++        "one original process and exactly three replacements"
++    );
++    harness.shutdown().await
++}
++
++#[test_case::test_case(None; "key_absent")]
++#[test_case::test_case(Some(false); "explicit_false")]
++#[tokio::test]
++async fn a_server_without_restart_opt_in_stays_dead(restart: Option<bool>) -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let mut harness = Harness::start(Options {
++        restart,
++        ..Default::default()
++    })
++    .await?;
++    let first = harness.records("start")?[0].clone();
++    harness.command(&first["pid"], "exit", Value::Null)?;
++    harness.wait_records("exit", 1).await?;
++    let output = harness.call("dead-no-opt-in", "pid", json!({})).await?;
++    assert!(
++        pid_result(&output).is_err(),
++        "a dead server must not execute the call: {output:?}"
++    );
++    sleep(NO_RESTART_WINDOW).await;
++    assert_eq!(harness.records("start")?.len(), 1);
++    harness.shutdown().await
++}
++
++#[tokio::test]
++async fn app_server_shutdown_cancels_backoff_and_leaves_no_process() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let mut harness = Harness::start(Options {
++        restart: Some(true),
++        ..Default::default()
++    })
++    .await?;
++    let first = harness.records("start")?[0].clone();
++    harness.command(&first["pid"], "exit", Value::Null)?;
++    harness.wait_records("exit", 1).await?;
++    harness.shutdown().await?;
++    let starts_at_shutdown = harness.records("start")?.len();
++    sleep(NO_RESTART_WINDOW).await;
++    assert_eq!(
++        harness.records("start")?.len(),
++        starts_at_shutdown,
++        "no replacement may start after shutdown completes"
++    );
++    harness.wait_no_processes().await
++}
++
++#[tokio::test]
++async fn root_channel_restart_does_not_start_a_copy_for_a_subagent() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    const CHILD_PROMPT: &str = "child after root restart";
++    let mut harness = Harness::start(Options {
++        restart: Some(true),
++        channel: true,
++        ..Default::default()
++    })
++    .await?;
++    harness.restart().await?;
++    responses::mount_sse_once(
++        &harness.model,
++        responses::sse(vec![
++            responses::ev_response_created("resp-spawn"),
++            responses::ev_function_call_with_namespace(
++                "spawn-after-restart",
++                "multi_agent_v1",
++                "spawn_agent",
++                &json!({"message": CHILD_PROMPT}).to_string(),
++            ),
++            responses::ev_completed("resp-spawn"),
++        ]),
++    )
++    .await;
++    let root_turn = harness.turn("spawn a helper after restart").await?;
++    harness.completed(&root_turn).await?;
++    timeout(READ_TIMEOUT, async {
++        loop {
++            if harness.requests().await.iter().any(|request| {
++                request
++                    .message_input_texts("user")
++                    .iter()
++                    .any(|text| text == CHILD_PROMPT)
++            }) {
++                break;
++            }
++            sleep(POLL_INTERVAL).await;
++        }
++    })
++    .await
++    .context("subagent never reached its model request")?;
++    sleep(Duration::from_secs(3)).await;
++    assert_eq!(
++        harness.records("start")?.len(),
++        2,
++        "only the root's original and replacement servers may start"
++    );
++    let next = harness
++        .records("start")?
++        .last()
++        .context("replacement")?
++        .clone();
++    harness.command(&next["pid"], "notify", json!({"content": "root only"}))?;
++    let channel_turn = harness.wait_channel(&channel_text("root only")).await?;
++    harness.completed(&channel_turn).await?;
++    for request in harness.requests().await {
++        if request
++            .message_input_texts("user")
++            .iter()
++            .any(|text| text == CHILD_PROMPT)
++        {
++            assert!(
++                channel_texts(&request).is_empty(),
++                "channel input must not reach a child"
++            );
++        }
++    }
++    harness.shutdown().await
++}
++
++#[test_case::test_case(false; "capability_retained")]
++#[test_case::test_case(true; "capability_removed")]
++#[tokio::test]
++async fn channel_capability_is_checked_again_on_each_restart(drop_capability: bool) -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let mut harness = Harness::start(Options {
++        restart: Some(true),
++        channel: true,
++        drop_capability,
++    })
++    .await?;
++    harness
++        .call(
++            "before-restart-notify",
++            "emit",
++            json!({"message": {"content": "before restart"}}),
++        )
++        .await?;
++    let first_turn = harness
++        .wait_channel(&channel_text("before restart"))
++        .await?;
++    harness.completed(&first_turn).await?;
++    let (_, next) = harness.restart().await?;
++    let result = pid_result(&harness.call("replacement-alive", "pid", json!({})).await?)?;
++    assert_eq!(
++        result["pid"], next["pid"],
++        "the replacement must accept ordinary tool calls even if its channel capability was removed"
++    );
++    harness.command(&next["pid"], "notify", json!({"content": "after restart"}))?;
++    harness.wait_records("notification", 2).await?;
++    if drop_capability {
++        sleep(Duration::from_secs(1)).await;
++    } else {
++        let channel_turn = harness.wait_channel(&channel_text("after restart")).await?;
++        harness.completed(&channel_turn).await?;
++    }
++    let final_turn = harness.turn("check channel history").await?;
++    harness.completed(&final_turn).await?;
++    let requests = harness.requests().await;
++    let last = requests.last().context("final request")?;
++    let expected = if drop_capability {
++        vec![channel_text("before restart")]
++    } else {
++        vec![
++            channel_text("before restart"),
++            channel_text("after restart"),
++        ]
++    };
++    assert_eq!(
++        channel_texts(last),
++        expected,
++        "restart must neither replay input nor accept a capability removed by initialize"
++    );
++    if drop_capability {
++        assert!(
++            requests
++                .iter()
++                .all(|request| !channel_texts(request).contains(&channel_text("after restart"))),
++            "the new process sent the notification but did not declare its capability"
++        );
++    }
++    let initializations = harness.records("initialize")?;
++    assert_eq!(initializations.len(), 2);
++    for initialization in initializations {
++        assert_eq!(
++            initialization["params"]["capabilities"]["experimental"]["claude/channel"],
++            json!({})
++        );
++    }
++    assert_eq!(next["capability"], !drop_capability);
++    harness.shutdown().await
++}
+diff --git a/codex-rs/app-server/tests/suite/v2/mcp_restart_server.py b/codex-rs/app-server/tests/suite/v2/mcp_restart_server.py
+new file mode 100644
+index 0000000000..06af013bc9
+--- /dev/null
++++ b/codex-rs/app-server/tests/suite/v2/mcp_restart_server.py
+@@ -0,0 +1,175 @@
++# Offline MCP fixture for process restart, in-flight failure and channel capability tests.
++# Commands in the inbox target one PID, so a replacement never replays an old command.
++
++import argparse
++import json
++import os
++import sys
++import threading
++import time
++from pathlib import Path
++
++CHANNEL_CAPABILITY = "claude/channel"
++POLL_SECONDS = 0.05
++EXIT_DELAY_SECONDS = 0.25
++EMPTY_RESULTS = {
++    "ping": {},
++    "resources/list": {"resources": []},
++    "resources/templates/list": {"resourceTemplates": []},
++    "prompts/list": {"prompts": []},
++}
++TOOLS = [
++    {
++        "name": name,
++        "description": description,
++        "inputSchema": {"type": "object", "properties": {}},
++    }
++    for name, description in [
++        ("pid", "Return this server process id and selected environment."),
++        ("crash", "Exit without returning a result."),
++        ("emit", "Send the channel notification in arguments.message."),
++    ]
++]
++TOOLS[2]["inputSchema"] = {
++    "type": "object",
++    "properties": {"message": {"type": "object"}},
++    "required": ["message"],
++}
++
++
++class RestartServer:
++    def __init__(self, *, inbox: Path, record: Path, drop_capability: bool) -> None:
++        self.inbox = inbox
++        self.record = record
++        self.crash_loop = record.with_suffix(".crash-loop")
++        self.lock = threading.Lock()
++        self.initialized = threading.Event()
++        self.pid = os.getpid()
++        self.env = {
++            name: os.environ.get(name)
++            for name in ["CODEX_SESSION_ID", "CODEX_THREAD_ID", "RESTART_TEST_VALUE"]
++        }
++        self.capability = not drop_capability or not record.exists()
++
++    def log(self, event: str, **fields: object) -> None:
++        line = json.dumps({"event": event, "pid": self.pid, **fields}) + "\n"
++        with self.lock, self.record.open("a", encoding="utf-8") as record:
++            record.write(line)
++
++    def send(self, message: dict) -> None:
++        line = json.dumps({"jsonrpc": "2.0", **message}) + "\n"
++        with self.lock:
++            sys.stdout.write(line)
++            sys.stdout.flush()
++
++    def notify(self, params: dict) -> None:
++        self.send({"method": "notifications/claude/channel", "params": params})
++        self.log("notification", params=params)
++
++    def exit(self) -> None:
++        self.log("exit")
++        # The fixture deliberately models a crash, including when called from the inbox thread.
++        os._exit(23)
++
++    def call_tool(self, params: dict) -> dict:
++        name = params.get("name")
++        self.log("tool_call", name=name, arguments=params.get("arguments"))
++        if name == "crash":
++            self.exit()
++        if name == "emit":
++            self.notify(params["arguments"]["message"])
++        return {
++            "content": [
++                {"type": "text", "text": json.dumps({"pid": self.pid, "env": self.env})}
++            ]
++        }
++
++    def result_for(self, method: str, params: dict) -> dict | None:
++        if method == "initialize":
++            self.log("initialize", params=params)
++            capabilities: dict = {"tools": {}}
++            if self.capability:
++                capabilities["experimental"] = {CHANNEL_CAPABILITY: {}}
++            return {
++                "protocolVersion": params.get("protocolVersion", "2025-06-18"),
++                "capabilities": capabilities,
++                "serverInfo": {"name": "restart-fixture", "version": "1"},
++            }
++        if method == "tools/list":
++            self.log("tools_list")
++            return {"tools": TOOLS}
++        if method == "tools/call":
++            return self.call_tool(params)
++        return EMPTY_RESULTS.get(method)
++
++    def handle(self, message: dict) -> None:
++        method = message.get("method")
++        if method is None:
++            return
++        if "id" not in message:
++            if method == "notifications/initialized":
++                self.log("initialized")
++                self.initialized.set()
++            return
++        result = self.result_for(method, message.get("params") or {})
++        if result is None:
++            self.send(
++                {
++                    "id": message["id"],
++                    "error": {"code": -32601, "message": f"unknown method: {method}"},
++                }
++            )
++            return
++        self.send({"id": message["id"], "result": result})
++        if method == "tools/list" and self.crash_loop.exists():
++            # Finish startup before exiting so every replacement exercises post-initialize death.
++            threading.Timer(EXIT_DELAY_SECONDS, self.exit).start()
++
++    def watch_inbox(self) -> None:
++        self.initialized.wait()
++        offset = 0
++        while True:
++            data = self.inbox.read_bytes() if self.inbox.exists() else b""
++            end = data.rfind(b"\n", offset) + 1
++            for line in data[offset:end].splitlines():
++                if not line.strip():
++                    continue
++                command = json.loads(line)
++                if command["pid"] != self.pid:
++                    continue
++                action = command["action"]
++                if action == "notify":
++                    self.notify(command["params"])
++                elif action == "crash-loop":
++                    self.crash_loop.touch()
++                    self.exit()
++                elif action == "exit":
++                    self.exit()
++                else:
++                    raise ValueError(f"unknown inbox action: {action}")
++            offset = max(offset, end)
++            time.sleep(POLL_SECONDS)
++
++    def serve(self) -> None:
++        self.log("start", env=self.env, capability=self.capability)
++        threading.Thread(target=self.watch_inbox, daemon=True).start()
++        for line in sys.stdin:
++            if line.strip():
++                self.handle(json.loads(line))
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--inbox", type=Path, required=True)
++    parser.add_argument("--record", type=Path, required=True)
++    parser.add_argument("--drop-capability-after-first", action="store_true")
++    args = parser.parse_args()
++    RestartServer(
++        inbox=args.inbox,
++        record=args.record,
++        drop_capability=args.drop_capability_after_first,
++    ).serve()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/codex-rs/app-server/tests/suite/v2/mod.rs b/codex-rs/app-server/tests/suite/v2/mod.rs
+index b25cdae263..a298e59914 100644
+--- a/codex-rs/app-server/tests/suite/v2/mod.rs
++++ b/codex-rs/app-server/tests/suite/v2/mod.rs
+@@ -96,6 +96,7 @@ mod mcp_event_stream;
+ mod mcp_protocol_default;
+ mod mcp_resource;
+ mod mcp_resource_origin;
++mod mcp_restart;
+ mod mcp_server_elicitation;
+ mod mcp_server_status;
+ mod mcp_tool;
+-- 
+2.53.0
+

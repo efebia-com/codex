@@ -9,3 +9,5 @@ mcp-session-env
 status-line-file
 channels-inject
 channels-inject-tests
+mcp-restart
+mcp-restart-tests

@@ -1,0 +1,1296 @@
+From 9617ed49b22a67984d9de68e13acd4aa09313eac Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 11:55:16 +0100
+Subject: [PATCH 1/2] mcp: opt in to bounded stdio server recovery
+
+---
+ codex-rs/codex-mcp/src/binding_tests.rs       |   1 +
+ codex-rs/codex-mcp/src/connection_manager.rs  |  13 +-
+ .../codex-mcp/src/connection_manager_tests.rs |   3 +
+ codex-rs/codex-mcp/src/elicitation.rs         |  13 +
+ codex-rs/codex-mcp/src/lib.rs                 |   1 +
+ codex-rs/codex-mcp/src/restart.rs             |  65 +++
+ codex-rs/codex-mcp/src/rmcp_client.rs         |  17 +-
+ .../src/rmcp_client/managed_client.rs         |   1 +
+ codex-rs/codex-mcp/src/server.rs              |   8 +
+ codex-rs/codex-mcp/src/server_tests.rs        |  10 +
+ codex-rs/config/src/mcp_types.rs              |   5 +
+ codex-rs/core/config.schema.json              |   5 +
+ codex-rs/rmcp-client/src/lib.rs               |   2 +
+ .../rmcp-client/src/local_stdio_transport.rs  |   5 +
+ codex-rs/rmcp-client/src/rmcp_client.rs       |  70 ++-
+ codex-rs/rmcp-client/src/stdio_restart.rs     | 464 ++++++++++++++++++
+ .../rmcp-client/src/stdio_server_launcher.rs  | 160 +++++-
+ 17 files changed, 805 insertions(+), 38 deletions(-)
+ create mode 100644 codex-rs/codex-mcp/src/restart.rs
+ create mode 100644 codex-rs/rmcp-client/src/stdio_restart.rs
+
+diff --git a/codex-rs/codex-mcp/src/binding_tests.rs b/codex-rs/codex-mcp/src/binding_tests.rs
+index 2ffb3e86bd..6d477e3bcc 100644
+--- a/codex-rs/codex-mcp/src/binding_tests.rs
++++ b/codex-rs/codex-mcp/src/binding_tests.rs
+@@ -91,6 +91,7 @@ async fn test_step(
+         connection_sharing: Default::default(),
+         shared_elicitation: None,
+         _auth_change_notifications: None,
++        _stdio_restart: None,
+         client: Arc::clone(&client),
+         server_info: McpServerInfo {
+             name: label.to_string(),
+diff --git a/codex-rs/codex-mcp/src/connection_manager.rs b/codex-rs/codex-mcp/src/connection_manager.rs
+index 493320a154..9f995b47ba 100644
+--- a/codex-rs/codex-mcp/src/connection_manager.rs
++++ b/codex-rs/codex-mcp/src/connection_manager.rs
+@@ -485,6 +485,13 @@ impl McpConnectionSet {
+             };
+             let metadata = McpServerMetadata::from(&server);
+             let configured_config = server.config().clone();
++            let restart_on_exit = matches!(
++                &configured_config.transport,
++                McpServerTransportConfig::Stdio { .. }
++            ) && crate::restart::restart_on_exit_enabled(
++                &config.config_layer_stack,
++                &server_name,
++            );
+             let protocol_mode = if matches!(
+                 &configured_config.transport,
+                 McpServerTransportConfig::StreamableHttp { .. }
+@@ -652,7 +659,8 @@ impl McpConnectionSet {
+                 previous
+                     .and_then(|previous| previous.servers.get(&server_name))
+                     .and_then(|view| view.connection.identity.as_ref()),
+-            );
++            )
++            .with_restart_on_exit(restart_on_exit);
+             let expected_protocol_mode = match &configured_config.transport {
+                 McpServerTransportConfig::StreamableHttp { .. } => Some(protocol_mode),
+                 McpServerTransportConfig::Stdio { .. } => server.stdio_protocol_mode(protocol_mode),
+@@ -706,7 +714,8 @@ impl McpConnectionSet {
+             let protocol_mode = expected_protocol_mode.unwrap_or(protocol_mode);
+             let connection_pool = runtime_context.connection_pool.as_ref().filter(|_| {
+                 // Sharing a signed-in helper requires tracking account changes.
+-                discover_local_stdio
++                !restart_on_exit
++                    && discover_local_stdio
+                     && protocol_mode != McpProtocolMode::Legacy
+                     && (auth.is_none() || auth_manager.is_some())
+             });
+diff --git a/codex-rs/codex-mcp/src/connection_manager_tests.rs b/codex-rs/codex-mcp/src/connection_manager_tests.rs
+index 2216fecdda..a244ffbe51 100644
+--- a/codex-rs/codex-mcp/src/connection_manager_tests.rs
++++ b/codex-rs/codex-mcp/src/connection_manager_tests.rs
+@@ -509,6 +509,7 @@ async fn create_test_managed_client(tools: Vec<ToolInfo>) -> ManagedClient {
+         connection_sharing: Default::default(),
+         shared_elicitation: None,
+         _auth_change_notifications: None,
++        _stdio_restart: None,
+         client: Arc::new(
+             RmcpClient::new_in_process_client(Arc::new(TestInProcessTransportFactory))
+                 .await
+@@ -865,6 +866,7 @@ pub(crate) async fn create_test_manager_with_ready_apps_client(
+         connection_sharing: Default::default(),
+         shared_elicitation: None,
+         _auth_change_notifications: None,
++        _stdio_restart: None,
+         client,
+         server_info: create_test_server_info("Codex Apps"),
+         tool_catalog: Arc::new(ClientToolCatalog::new(
+@@ -5969,6 +5971,7 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
+         connection_sharing: Default::default(),
+         shared_elicitation: None,
+         _auth_change_notifications: None,
++        _stdio_restart: None,
+         client: Arc::clone(&client),
+         server_info: create_test_server_info("Mutable tools"),
+         tool_catalog: Arc::new(ClientToolCatalog::new(
+diff --git a/codex-rs/codex-mcp/src/elicitation.rs b/codex-rs/codex-mcp/src/elicitation.rs
+index 858cd7e12b..9d7b95f008 100644
+--- a/codex-rs/codex-mcp/src/elicitation.rs
++++ b/codex-rs/codex-mcp/src/elicitation.rs
+@@ -431,6 +431,19 @@ impl ElicitationRequestManager {
+         enabled.then(|| self.router.channels.clone())
+     }
+ 
++    pub(crate) fn restart_on_exit_enabled(&self, server: &str) -> bool {
++        self.authority
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .as_ref()
++            .is_some_and(|authority| {
++                crate::restart::restart_on_exit_enabled(
++                    &authority.config.config_layer_stack,
++                    server,
++                )
++            })
++    }
++
+     pub(crate) fn make_sender(
+         &self,
+         server_name: String,
+diff --git a/codex-rs/codex-mcp/src/lib.rs b/codex-rs/codex-mcp/src/lib.rs
+index 50c3456430..7be2afafa2 100644
+--- a/codex-rs/codex-mcp/src/lib.rs
++++ b/codex-rs/codex-mcp/src/lib.rs
+@@ -152,6 +152,7 @@ mod pagination;
+ mod plugin_config;
+ mod resource_client;
+ mod resource_origin;
++mod restart;
+ pub(crate) mod rmcp_client;
+ pub(crate) mod runtime;
+ mod sandbox_executable;
+diff --git a/codex-rs/codex-mcp/src/restart.rs b/codex-rs/codex-mcp/src/restart.rs
+new file mode 100644
+index 0000000000..697f2ce0a8
+--- /dev/null
++++ b/codex-rs/codex-mcp/src/restart.rs
+@@ -0,0 +1,65 @@
++//! Opt-in recovery of private stdio MCP connections.
++
++use codex_config::ConfigLayerStack;
++use codex_config::TomlValue;
++
++pub(crate) fn restart_on_exit_enabled(layers: &ConfigLayerStack, server: &str) -> bool {
++    layers
++        .effective_config()
++        .get("mcp_servers")
++        .and_then(|servers| servers.get(server))
++        .and_then(|server| server.get("restart_on_exit"))
++        .and_then(TomlValue::as_bool)
++        .unwrap_or(false)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use codex_config::ConfigLayerEntry;
++    use codex_config::ConfigLayerSource;
++    use serde_json::json;
++
++    #[test]
++    fn restart_config_accepts_a_boolean_and_rejects_other_types() {
++        for value in [true, false] {
++            serde_json::from_value::<codex_config::McpServerConfig>(json!({
++                "command": "server", "restart_on_exit": value,
++            }))
++            .expect("restart configuration");
++        }
++        assert!(
++            serde_json::from_value::<codex_config::McpServerConfig>(json!({
++                "command": "server", "restart_on_exit": "true",
++            }))
++            .is_err()
++        );
++    }
++
++    #[test]
++    fn restart_requires_explicit_true_and_uses_layer_precedence() {
++        let layers = [
++            json!({"mcp_servers": {
++                "on": {"command": "server", "restart_on_exit": true},
++                "off": {"command": "server", "restart_on_exit": false},
++                "unset": {"command": "server"},
++                "overridden": {"command": "server", "restart_on_exit": true}
++            }}),
++            json!({"mcp_servers": {"overridden": {"restart_on_exit": false}}}),
++        ]
++        .into_iter()
++        .map(|value| {
++            ConfigLayerEntry::new(
++                ConfigLayerSource::SessionFlags,
++                serde_json::from_value(value).expect("TOML config"),
++            )
++        })
++        .collect();
++        let layers = ConfigLayerStack::new(layers, Default::default(), Default::default())
++            .expect("config layers");
++        assert!(restart_on_exit_enabled(&layers, "on"));
++        for server in ["off", "unset", "overridden", "missing"] {
++            assert!(!restart_on_exit_enabled(&layers, server));
++        }
++    }
++}
+diff --git a/codex-rs/codex-mcp/src/rmcp_client.rs b/codex-rs/codex-mcp/src/rmcp_client.rs
+index 94c272fedc..06ae06f654 100644
+--- a/codex-rs/codex-mcp/src/rmcp_client.rs
++++ b/codex-rs/codex-mcp/src/rmcp_client.rs
+@@ -364,9 +364,18 @@ impl ManagedClientStartup {
+                 )
+                 .await
+                 {
+-                    Ok(result) => Arc::new(
+-                        result?.with_read_only_tools(server.requires_read_only_mcp_tools()),
+-                    ),
++                    Ok(result) => {
++                        let mut client = result?
++                            .with_read_only_tools(server.requires_read_only_mcp_tools());
++                        if elicitation_requests.restart_on_exit_enabled(&server_name) {
++                            if matches!(server.config().transport, McpServerTransportConfig::Stdio { .. }) {
++                                client = client.with_stdio_restart(Default::default());
++                            } else {
++                                warn!(server = %server_name, "restart_on_exit is ignored for HTTP MCP servers");
++                            }
++                        }
++                        Arc::new(client)
++                    },
+                     Err(_) => {
+                         return Err(StartupOutcomeError::from(anyhow!(
+                             "MCP client startup timed out after {startup_timeout:?}"
+@@ -1189,6 +1198,7 @@ async fn start_server_task(
+         &initialize_result,
+     );
+     let initialize_result = initialize_result.map_err(StartupOutcomeError::from)?;
++    let stdio_restart = client.supervise_stdio_restarts().map(Arc::new);
+     if let Some(channel) = channel {
+         channel.connect(server_name.clone(), &initialize_result);
+     }
+@@ -1312,6 +1322,7 @@ async fn start_server_task(
+         connection_sharing,
+         shared_elicitation: None,
+         _auth_change_notifications: auth_change_notifications,
++        _stdio_restart: stdio_restart,
+         client: Arc::clone(&client),
+         server_info,
+         tool_catalog: Arc::new(ClientToolCatalog::new(
+diff --git a/codex-rs/codex-mcp/src/rmcp_client/managed_client.rs b/codex-rs/codex-mcp/src/rmcp_client/managed_client.rs
+index 7c3d830dc2..7f95714fc3 100644
+--- a/codex-rs/codex-mcp/src/rmcp_client/managed_client.rs
++++ b/codex-rs/codex-mcp/src/rmcp_client/managed_client.rs
+@@ -30,6 +30,7 @@ pub(crate) struct ManagedClient {
+     /// The calling chat's input handler, separate from the shared transport's startup handler.
+     pub(crate) shared_elicitation: Option<Arc<SendElicitation>>,
+     pub(crate) _auth_change_notifications: Option<Arc<AbortOnDropHandle<()>>>,
++    pub(crate) _stdio_restart: Option<Arc<codex_rmcp_client::StdioRestartGuard>>,
+     pub(crate) client: Arc<RmcpClient>,
+     pub(crate) server_info: McpServerInfo,
+     pub(crate) tool_catalog: Arc<ClientToolCatalog>,
+diff --git a/codex-rs/codex-mcp/src/server.rs b/codex-rs/codex-mcp/src/server.rs
+index a3d825250b..cef18ec2f3 100644
+--- a/codex-rs/codex-mcp/src/server.rs
++++ b/codex-rs/codex-mcp/src/server.rs
+@@ -164,6 +164,7 @@ pub(crate) fn has_explicit_http_authorization(config: &McpServerConfig) -> bool
+ /// those belong to a publication and can change without reconnecting.
+ #[derive(Clone)]
+ pub(crate) struct McpServerConnectionIdentity {
++    restart_on_exit: bool,
+     auth: McpServerAuth,
+     pub(crate) credential_policy: McpCredentialPolicy,
+     transport: McpServerTransportConfig,
+@@ -301,6 +302,7 @@ impl McpServerConnectionIdentity {
+ 
+         Self {
+             auth: config.auth.clone(),
++            restart_on_exit: false,
+             credential_policy: server.credential_policy(),
+             transport: config.transport.clone(),
+             environment_id: config.environment_id.clone(),
+@@ -327,6 +329,11 @@ impl McpServerConnectionIdentity {
+         }
+     }
+ 
++    pub(crate) fn with_restart_on_exit(mut self, enabled: bool) -> Self {
++        self.restart_on_exit = enabled;
++        self
++    }
++
+     pub(crate) fn has_same_connection_config(&self, other: &Self) -> bool {
+         let same_runtime_auth = match (&self.runtime_auth, &other.runtime_auth) {
+             (Some(CodexAuth::AgentIdentity(left)), Some(CodexAuth::AgentIdentity(right))) => {
+@@ -342,6 +349,7 @@ impl McpServerConnectionIdentity {
+             (Some(_), None) | (None, Some(_)) => false,
+         };
+         self.auth == other.auth
++            && self.restart_on_exit == other.restart_on_exit
+             && self.credential_policy == other.credential_policy
+             && self.transport == other.transport
+             && self.environment_id == other.environment_id
+diff --git a/codex-rs/codex-mcp/src/server_tests.rs b/codex-rs/codex-mcp/src/server_tests.rs
+index 3185e384e2..e7831a69d8 100644
+--- a/codex-rs/codex-mcp/src/server_tests.rs
++++ b/codex-rs/codex-mcp/src/server_tests.rs
+@@ -119,6 +119,16 @@ fn connection_identity_does_not_reuse_connections_across_credential_policies() {
+     assert!(!executor_identity.has_same_connection_config(&host_identity));
+ }
+ 
++#[test]
++fn changing_restart_policy_requires_a_new_connection() {
++    let runtime_context = runtime_context();
++    let server = explicit_authorization_server();
++    let original = connection_identity(&server, &runtime_context);
++    let opted_in = original.clone().with_restart_on_exit(true);
++    assert!(!original.has_same_connection_config(&opted_in));
++    assert!(original.has_same_connection_config(&opted_in.with_restart_on_exit(false)));
++}
++
+ #[test]
+ fn executor_connection_identity_does_not_capture_host_environment_values() {
+     let runtime_context = runtime_context();
+diff --git a/codex-rs/config/src/mcp_types.rs b/codex-rs/config/src/mcp_types.rs
+index 7c4c77051d..f1511a40c0 100644
+--- a/codex-rs/config/src/mcp_types.rs
++++ b/codex-rs/config/src/mcp_types.rs
+@@ -453,6 +453,10 @@ pub struct RawMcpServerConfig {
+     // The extension reads this from the layered config; it is not part of `McpServerConfig`.
+     #[serde(default)]
+     pub channel_during_turn: Option<bool>,
++    /// Restart an exited stdio server up to three times with 1/2/4 second backoff.
++    /// Disabled by default; ignored for HTTP servers. The retry budget resets after 60 seconds.
++    #[serde(default)]
++    pub restart_on_exit: Option<bool>,
+     /// Whether startup requires a live connection or can use a valid cached tool catalog.
+     #[serde(default)]
+     pub startup_readiness: Option<McpStartupReadiness>,
+@@ -510,6 +514,7 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
+             required,
+             channel: _,
+             channel_during_turn: _,
++            restart_on_exit: _,
+             startup_readiness,
+             supports_parallel_tool_calls,
+             tool_input_schema_max_bytes,
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index 05346c48c5..d21302dc39 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -4449,6 +4449,11 @@
+           "default": null,
+           "type": "boolean"
+         },
++        "restart_on_exit": {
++          "default": null,
++          "description": "Restart an exited stdio server up to three times with 1/2/4 second backoff. Disabled by default; ignored for HTTP servers. The retry budget resets after 60 seconds.",
++          "type": "boolean"
++        },
+         "scopes": {
+           "default": null,
+           "items": {
+diff --git a/codex-rs/rmcp-client/src/lib.rs b/codex-rs/rmcp-client/src/lib.rs
+index 265de8ad07..149a486585 100644
+--- a/codex-rs/rmcp-client/src/lib.rs
++++ b/codex-rs/rmcp-client/src/lib.rs
+@@ -112,6 +112,8 @@ pub use rmcp_client::RmcpClient;
+ pub use rmcp_client::SendElicitation;
+ pub use rmcp_client::StreamableHttpBearerToken;
+ pub use rmcp_client::ToolWithConnectorId;
++pub use rmcp_client::stdio_restart::StdioRestartGuard;
++pub use rmcp_client::stdio_restart::StdioRestartPolicy;
+ pub use service_error::is_retryable_transport_error;
+ pub use service_error::mcp_error;
+ pub use service_error::request_error_code;
+diff --git a/codex-rs/rmcp-client/src/local_stdio_transport.rs b/codex-rs/rmcp-client/src/local_stdio_transport.rs
+index 4b01c3bd3d..5b015bd065 100644
+--- a/codex-rs/rmcp-client/src/local_stdio_transport.rs
++++ b/codex-rs/rmcp-client/src/local_stdio_transport.rs
+@@ -199,6 +199,11 @@ impl LocalStdioTransport {
+     pub(super) fn take_child(&mut self) -> Option<Box<Child>> {
+         self.child.take()
+     }
++
++    #[cfg(windows)]
++    pub(super) fn child_id(&self) -> Option<u32> {
++        self.child.as_ref().and_then(|child| child.id())
++    }
+ }
+ 
+ impl Transport<RoleClient> for LocalStdioTransport {
+diff --git a/codex-rs/rmcp-client/src/rmcp_client.rs b/codex-rs/rmcp-client/src/rmcp_client.rs
+index 1f4a273673..c44d234ad9 100644
+--- a/codex-rs/rmcp-client/src/rmcp_client.rs
++++ b/codex-rs/rmcp-client/src/rmcp_client.rs
+@@ -115,6 +115,8 @@ use codex_config::types::OAuthCredentialsStoreMode;
+ 
+ #[path = "stdio_handshake.rs"]
+ mod stdio_handshake;
++#[path = "stdio_restart.rs"]
++pub(crate) mod stdio_restart;
+ #[path = "streamable_http_retry.rs"]
+ mod streamable_http_retry;
+ 
+@@ -416,6 +418,7 @@ pub struct CancellableEventStreamRequest {
+ pub struct RmcpClient {
+     // Drop our interest in retrying before the SDK transport uses its ordinary shutdown grace.
+     stdio_process: Option<StdioProcessSlot>,
++    stdio_restart: Option<Arc<stdio_restart::StdioRestart>>,
+     state: Mutex<ClientState>,
+     transport_recipe: TransportRecipe,
+     protocol_mode: McpProtocolMode,
+@@ -493,6 +496,7 @@ impl RmcpClient {
+                 transport: Some(transport),
+             }),
+             stdio_process: None,
++            stdio_restart: None,
+             transport_recipe,
+             protocol_mode: McpProtocolMode::Legacy,
+             requires_read_only_tools: false,
+@@ -570,6 +574,7 @@ impl RmcpClient {
+                 transport: Some(transport),
+             }),
+             stdio_process,
++            stdio_restart: None,
+             transport_recipe,
+             protocol_mode,
+             initialize_context: Mutex::new(None),
+@@ -680,6 +685,7 @@ impl RmcpClient {
+                 transport: Some(transport),
+             }),
+             stdio_process: None,
++            stdio_restart: None,
+             transport_recipe,
+             protocol_mode,
+             initialize_context: Mutex::new(None),
+@@ -744,6 +750,10 @@ impl RmcpClient {
+             };
+         }
+ 
++        if let Some(restart) = &self.stdio_restart {
++            restart.mark_ready();
++        }
++
+         if let Some(OAuthRuntime::Legacy(runtime)) = oauth_runtime
+             && let Err(error) = runtime.persist_if_needed().await
+         {
+@@ -1291,12 +1301,26 @@ impl RmcpClient {
+     }
+ 
+     async fn service(&self) -> Result<Arc<RunningService<RoleClient, ElicitationClientService>>> {
+-        let guard = self.state.lock().await;
+-        match &*guard {
+-            ClientState::Ready { service, .. } => Ok(Arc::clone(service)),
+-            ClientState::Connecting { .. } => Err(anyhow!("MCP client not initialized")),
+-            ClientState::Closed => Err(anyhow!("MCP client is shut down")),
++        let service = {
++            let guard = self.state.lock().await;
++            match &*guard {
++                ClientState::Ready { service, .. } => Arc::clone(service),
++                ClientState::Connecting { .. } => {
++                    return Err(anyhow!("MCP client not initialized"));
++                }
++                ClientState::Closed => return Err(anyhow!("MCP client is shut down")),
++            }
++        };
++        if let Some(restart) = &self.stdio_restart {
++            restart.check_available()?;
++            if service.is_closed()
++                || service.peer().is_transport_closed()
++                || restart.connection_exited()
++            {
++                return self.service_after_stdio_exit().await;
++            }
+         }
++        Ok(service)
+     }
+ 
+     async fn oauth_runtime(&self) -> Option<OAuthRuntime> {
+@@ -1324,7 +1348,11 @@ impl RmcpClient {
+         let state = self.state.lock().await;
+         match &*state {
+             ClientState::Ready { service, .. } => {
+-                service.is_closed() || service.peer().is_transport_closed()
++                (service.is_closed() || service.peer().is_transport_closed())
++                    && self
++                        .stdio_restart
++                        .as_ref()
++                        .is_none_or(|restart| !restart.can_restart())
+             }
+             ClientState::Connecting { .. } => false,
+             ClientState::Closed => true,
+@@ -1344,6 +1372,9 @@ impl RmcpClient {
+     }
+ 
+     async fn shutdown_for(&self, reason: StdioTermination) -> io::Result<()> {
++        if let Some(restart) = &self.stdio_restart {
++            restart.shutdown.cancel();
++        }
+         let previous_state = {
+             let mut guard = self.state.lock().await;
+             std::mem::replace(&mut *guard, ClientState::Closed)
+@@ -1608,16 +1639,23 @@ impl RmcpClient {
+         };
+         let lifecycle = self.protocol_mode.client_lifecycle();
+         let connect_stdio = |transport: StdioServerTransport, lifecycle| {
+-            client_service()
+-                .serve_with_lifecycle(
+-                    track_tool_list_changes(
+-                        self.custom_notifications
+-                            .capture(OrderedByteTransport::new(transport)),
+-                        Arc::clone(&self.tool_list_revision),
+-                    ),
+-                    lifecycle,
+-                )
+-                .boxed()
++            let transport = track_tool_list_changes(
++                self.custom_notifications
++                    .capture(OrderedByteTransport::new(transport)),
++                Arc::clone(&self.tool_list_revision),
++            );
++            if let Some(restart) = &self.stdio_restart {
++                client_service()
++                    .serve_with_lifecycle(
++                        stdio_restart::watch_exit(transport, restart.watch_connection()),
++                        lifecycle,
++                    )
++                    .boxed()
++            } else {
++                client_service()
++                    .serve_with_lifecycle(transport, lifecycle)
++                    .boxed()
++            }
+         };
+         let mut discovery = None;
+         let (transport, oauth_runtime) = match pending_transport {
+diff --git a/codex-rs/rmcp-client/src/stdio_restart.rs b/codex-rs/rmcp-client/src/stdio_restart.rs
+new file mode 100644
+index 0000000000..2300d74df5
+--- /dev/null
++++ b/codex-rs/rmcp-client/src/stdio_restart.rs
+@@ -0,0 +1,464 @@
++//! Bounded recovery of an opted-in stdio connection, without replaying requests.
++
++use std::future::Future;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::sync::PoisonError;
++use std::sync::atomic::AtomicBool;
++use std::sync::atomic::Ordering;
++use std::time::Duration;
++
++use anyhow::Context;
++use anyhow::Result;
++use anyhow::anyhow;
++use rmcp::service::RoleClient;
++use rmcp::service::RunningService;
++use rmcp::service::RxJsonRpcMessage;
++use rmcp::service::TxJsonRpcMessage;
++use rmcp::transport::Transport;
++use tokio::time::Instant;
++use tokio_util::sync::CancellationToken;
++use tokio_util::sync::DropGuard;
++use tracing::Instrument;
++use tracing::info;
++use tracing::warn;
++
++use super::ClientState;
++use super::RmcpClient;
++use super::TransportRecipe;
++use crate::elicitation_client_service::ElicitationClientService;
++use crate::stdio_server_launcher::StdioTermination;
++
++/// Retry delays and the uptime required to reset the budget of three launches.
++#[derive(Clone, Debug)]
++pub struct StdioRestartPolicy {
++    pub backoff: [Duration; 3],
++    pub stable_after: Duration,
++}
++
++impl Default for StdioRestartPolicy {
++    fn default() -> Self {
++        Self {
++            backoff: [1, 2, 4].map(Duration::from_secs),
++            stable_after: Duration::from_secs(60),
++        }
++    }
++}
++
++/// Keep this guard with the connection owner. Dropping its last copy stops recovery,
++/// including a recovery task that temporarily holds the client alive.
++#[must_use = "retain the guard for the lifetime of the MCP connection"]
++pub struct StdioRestartGuard {
++    _cancel_on_drop: DropGuard,
++}
++
++pub(super) struct StdioRestart {
++    policy: StdioRestartPolicy,
++    pub(super) shutdown: CancellationToken,
++    supervising: AtomicBool,
++    state: Mutex<RestartState>,
++    changed: tokio::sync::Notify,
++}
++
++#[derive(Default)]
++struct RestartState {
++    attempts: usize,
++    ready_since: Option<Instant>,
++    gave_up: Option<String>,
++    exit: Option<CancellationToken>,
++    recovering: bool,
++}
++
++impl StdioRestart {
++    fn new(policy: StdioRestartPolicy) -> Self {
++        Self {
++            policy,
++            shutdown: CancellationToken::new(),
++            supervising: AtomicBool::new(false),
++            state: Mutex::new(RestartState::default()),
++            changed: tokio::sync::Notify::new(),
++        }
++    }
++
++    pub(super) fn watch_connection(&self) -> CancellationToken {
++        let exit = CancellationToken::new();
++        self.state
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .exit = Some(exit.clone());
++        exit
++    }
++
++    pub(super) fn mark_ready(&self) {
++        {
++            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
++            state.ready_since = Some(Instant::now());
++            state.recovering = false;
++        }
++        self.changed.notify_waiters();
++    }
++
++    fn exit(&self) -> Option<CancellationToken> {
++        self.state
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .exit
++            .clone()
++    }
++
++    pub(super) fn connection_exited(&self) -> bool {
++        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
++        state.recovering
++            || state
++                .exit
++                .as_ref()
++                .is_some_and(CancellationToken::is_cancelled)
++    }
++
++    pub(super) fn can_restart(&self) -> bool {
++        self.check_available().is_ok()
++    }
++
++    pub(super) fn check_available(&self) -> Result<()> {
++        if self.shutdown.is_cancelled() {
++            return Err(anyhow!("MCP client is shut down"));
++        }
++        if let Some(error) = &self
++            .state
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .gave_up
++        {
++            return Err(anyhow!(error.clone()));
++        }
++        Ok(())
++    }
++
++    fn reset_after_stable_connection(&self) {
++        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
++        state.recovering = true;
++        if state
++            .ready_since
++            .take()
++            .is_some_and(|since| since.elapsed() >= self.policy.stable_after)
++        {
++            state.attempts = 0;
++        }
++    }
++
++    fn next_attempt(&self) -> Option<(usize, Duration)> {
++        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
++        let delay = *self.policy.backoff.get(state.attempts)?;
++        state.attempts += 1;
++        Some((state.attempts, delay))
++    }
++
++    fn give_up(&self, error: &anyhow::Error) -> anyhow::Error {
++        let message =
++            format!("MCP server exited and was not restarted after 3 attempts: {error:#}");
++        self.state
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .gave_up = Some(message.clone());
++        self.changed.notify_waiters();
++        warn!("{message}");
++        anyhow!(message)
++    }
++
++    fn cleanup_failed(&self, error: anyhow::Error) -> anyhow::Error {
++        let message =
++            format!("MCP server could not be restarted because process cleanup failed: {error:#}");
++        self.state
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .gave_up = Some(message.clone());
++        self.changed.notify_waiters();
++        warn!("{message}");
++        anyhow!(message)
++    }
++}
++
++impl RmcpClient {
++    pub(super) async fn service_after_stdio_exit(
++        &self,
++    ) -> Result<Arc<RunningService<RoleClient, ElicitationClientService>>> {
++        let restart = self
++            .stdio_restart
++            .as_ref()
++            .context("stdio recovery is disabled")?;
++        if !restart.supervising.load(Ordering::Acquire) {
++            self.restart_stdio_after_exit().await?;
++        }
++        let wait = async {
++            loop {
++                let changed = restart.changed.notified();
++                tokio::pin!(changed);
++                changed.as_mut().enable();
++                restart.check_available()?;
++                {
++                    let state = self.state.lock().await;
++                    match &*state {
++                        ClientState::Ready { service, .. }
++                            if !service.is_closed()
++                                && !service.peer().is_transport_closed()
++                                && !restart.connection_exited() =>
++                        {
++                            return Ok(Arc::clone(service));
++                        }
++                        ClientState::Ready { .. } => {}
++                        _ => return Err(anyhow!("MCP client is shut down")),
++                    }
++                }
++                tokio::select! {
++                    biased;
++                    () = restart.shutdown.cancelled() => return Err(anyhow!("MCP client is shut down")),
++                    () = changed => {}
++                }
++            }
++        };
++        let timeout = self
++            .initialize_context
++            .lock()
++            .await
++            .as_ref()
++            .and_then(|context| context.timeout);
++        match timeout {
++            Some(timeout) => tokio::time::timeout(timeout, wait)
++                .await
++                .context("timed out waiting for MCP stdio server restart")?,
++            None => wait.await,
++        }
++    }
++
++    /// Enable recovery before initialize. Other transport kinds ignore this policy.
++    pub fn with_stdio_restart(mut self, policy: StdioRestartPolicy) -> Self {
++        if let TransportRecipe::Stdio { command, .. } = &mut self.transport_recipe
++            && let Some(slot) = &mut self.stdio_process
++            && let ClientState::Connecting {
++                transport: Some(super::PendingTransport::Stdio { transport }),
++            } = self.state.get_mut()
++        {
++            if let Some(slot) = Arc::get_mut(slot) {
++                slot.get_mut().retain_for_restart(transport);
++            }
++            // Pin host-resolved variables and defaults from the first actual launch.
++            // Executor-owned variables continue to be resolved by that executor.
++            *command = command.with_process_slot(Arc::clone(slot), transport.launch_env());
++            self.stdio_restart = Some(Arc::new(StdioRestart::new(policy)));
++        }
++        self
++    }
++
++    /// Start proactive exit detection after initialize and return its ownership guard.
++    pub fn supervise_stdio_restarts(self: &Arc<Self>) -> Option<StdioRestartGuard> {
++        let restart = self.stdio_restart.as_ref()?;
++        if restart.supervising.swap(true, Ordering::AcqRel) {
++            return None;
++        }
++        let restart = Arc::clone(restart);
++        let weak = Arc::downgrade(self);
++        let guard = StdioRestartGuard {
++            _cancel_on_drop: restart.shutdown.clone().drop_guard(),
++        };
++        tokio::spawn(
++            async move {
++                loop {
++                    let Some(exit) = restart.exit() else {
++                        return;
++                    };
++                    tokio::select! {
++                        biased;
++                        () = restart.shutdown.cancelled() => {
++                            if let Some(client) = weak.upgrade() { client.shutdown().await; }
++                            return;
++                        }
++                        () = exit.cancelled() => {}
++                    }
++                    let Some(client) = weak.upgrade() else {
++                        return;
++                    };
++                    tokio::select! {
++                        biased;
++                        () = restart.shutdown.cancelled() => {
++                            client.shutdown().await;
++                            return;
++                        }
++                        result = client.restart_stdio_after_exit() => {
++                            if result.is_err() { return; }
++                        }
++                    }
++                }
++            }
++            .in_current_span(),
++        );
++        Some(guard)
++    }
++
++    async fn stop_stdio_process(&self) -> Result<()> {
++        if let Some(slot) = &self.stdio_process {
++            let process = slot.lock().await.process();
++            process.terminate(StdioTermination::Shutdown).await?;
++        }
++        Ok(())
++    }
++
++    pub(super) async fn restart_stdio_after_exit(&self) -> Result<()> {
++        let restart = self
++            .stdio_restart
++            .as_ref()
++            .context("stdio recovery is disabled")?;
++        let _recovery = tokio::select! {
++            biased;
++            () = restart.shutdown.cancelled() => return Err(anyhow!("MCP client is shut down")),
++            permit = self.session_recovery_lock.acquire() => permit?,
++        };
++        restart.check_available()?;
++        {
++            let state = self.state.lock().await;
++            match &*state {
++                ClientState::Ready { service, .. }
++                    if !service.is_closed()
++                        && !service.peer().is_transport_closed()
++                        && !restart.connection_exited() =>
++                {
++                    return Ok(());
++                }
++                ClientState::Ready { .. } => {}
++                _ => return Err(anyhow!("MCP client is shut down")),
++            }
++        }
++        let context = self
++            .initialize_context
++            .lock()
++            .await
++            .clone()
++            .context("MCP client cannot recover before initialize succeeds")?;
++        restart.reset_after_stable_connection();
++        let mut last_error = anyhow!("stdio transport closed");
++        while let Some((attempt, delay)) = restart.next_attempt() {
++            // Also clean up failed handshakes before attempting another launch.
++            self.stop_stdio_process()
++                .await
++                .map_err(|error| restart.cleanup_failed(error))?;
++            tokio::select! {
++                biased;
++                () = restart.shutdown.cancelled() => return Err(anyhow!("MCP client is shut down")),
++                () = tokio::time::sleep(delay) => {}
++            }
++            let connect = async {
++                let transport = Self::create_pending_transport(&self.transport_recipe).await?;
++                self.connect_pending_transport_with_initialize_retries(transport, &context)
++                    .await
++            };
++            let result = tokio::select! {
++                biased;
++                () = restart.shutdown.cancelled() => return Err(anyhow!("MCP client is shut down")),
++                result = async {
++                    match context.timeout {
++                        Some(timeout) => tokio::time::timeout(timeout, connect).await
++                            .context("timed out restarting MCP server")?,
++                        None => connect.await,
++                    }
++                } => result,
++            };
++            match result {
++                Ok((service, oauth)) => {
++                    let mut state = self.state.lock().await;
++                    if matches!(*state, ClientState::Closed) || restart.shutdown.is_cancelled() {
++                        return Err(anyhow!("MCP client is shut down"));
++                    }
++                    *state = ClientState::Ready { service, oauth };
++                    restart.mark_ready();
++                    self.tool_list_revision.fetch_add(1, Ordering::AcqRel);
++                    info!(attempt, "restarted MCP stdio server");
++                    return Ok(());
++                }
++                Err(error) => {
++                    warn!(attempt, error = %error, "failed to restart MCP stdio server");
++                    last_error = error;
++                }
++            }
++        }
++        self.stop_stdio_process()
++            .await
++            .map_err(|error| restart.cleanup_failed(error))?;
++        Err(restart.give_up(&last_error))
++    }
++}
++
++impl Drop for RmcpClient {
++    fn drop(&mut self) {
++        if let Some(restart) = &self.stdio_restart {
++            restart.shutdown.cancel();
++        }
++    }
++}
++
++pub(super) fn watch_exit<T: Transport<RoleClient> + 'static>(
++    inner: T,
++    exit: CancellationToken,
++) -> impl Transport<RoleClient, Error = T::Error> {
++    ExitWatch { inner, exit }
++}
++
++struct ExitWatch<T> {
++    inner: T,
++    exit: CancellationToken,
++}
++
++impl<T> Drop for ExitWatch<T> {
++    fn drop(&mut self) {
++        self.exit.cancel();
++    }
++}
++
++impl<T: Transport<RoleClient> + 'static> Transport<RoleClient> for ExitWatch<T> {
++    type Error = T::Error;
++
++    fn send(
++        &mut self,
++        message: TxJsonRpcMessage<RoleClient>,
++    ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send + 'static {
++        let send = self.inner.send(message);
++        let exit = self.exit.clone();
++        async move {
++            let result = send.await;
++            if result.is_err() {
++                exit.cancel();
++            }
++            result
++        }
++    }
++
++    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
++        let result = self.inner.receive().await;
++        if result.is_none() {
++            self.exit.cancel();
++        }
++        result
++    }
++
++    fn close(&mut self) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send {
++        self.inner.close()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn budget_resets_only_after_a_stable_connection() {
++        let restart = StdioRestart::new(StdioRestartPolicy::default());
++        assert_eq!(restart.next_attempt(), Some((1, Duration::from_secs(1))));
++        restart.mark_ready();
++        restart.reset_after_stable_connection();
++        assert_eq!(restart.next_attempt(), Some((2, Duration::from_secs(2))));
++        assert_eq!(restart.next_attempt(), Some((3, Duration::from_secs(4))));
++        assert!(restart.next_attempt().is_none());
++        restart.state.lock().expect("restart state").ready_since =
++            Some(Instant::now() - Duration::from_secs(60));
++        restart.reset_after_stable_connection();
++        assert_eq!(restart.next_attempt(), Some((1, Duration::from_secs(1))));
++    }
++}
+diff --git a/codex-rs/rmcp-client/src/stdio_server_launcher.rs b/codex-rs/rmcp-client/src/stdio_server_launcher.rs
+index 0a089db96b..2f8ad6cd15 100644
+--- a/codex-rs/rmcp-client/src/stdio_server_launcher.rs
++++ b/codex-rs/rmcp-client/src/stdio_server_launcher.rs
+@@ -109,6 +109,8 @@ pub struct StdioServerCommand {
+     cwd: Option<String>,
+     protocol_mode: McpProtocolMode,
+     replacement_slot: Option<StdioProcessSlot>,
++    retain_process_for_restart: bool,
++    frozen_env: bool,
+ }
+ 
+ /// A replacement holds the slot from OS spawn through registration. Closing it seals that handoff.
+@@ -120,6 +122,53 @@ pub(super) struct StdioProcessRegistration {
+ }
+ 
+ impl StdioProcessRegistration {
++    pub(super) fn retain_for_restart(&mut self, transport: &mut StdioServerTransport) {
++        if transport.discovery_cleanup.is_some() {
++            return;
++        }
++        // Before initialize, the transport is the only strong owner of this process.
++        // Release the registration's Weak temporarily so its terminator can retain the child.
++        self.process.process = Weak::new();
++        if let Some(process) = Arc::get_mut(&mut transport.process) {
++            #[cfg(unix)]
++            if let StdioServerTransportInner::Local(local) = &mut transport.inner {
++                process.kind =
++                    StdioServerProcessKind::Local(Some(LocalProcessTerminator::DiscoveryLeader {
++                        leader: Mutex::new(local.take_child()),
++                        runtime: Handle::current(),
++                    }));
++            }
++            #[cfg(windows)]
++            if let StdioServerTransportInner::Local(local) = &transport.inner
++                && let StdioServerProcessKind::Local(Some(LocalProcessTerminator::Job {
++                    discovery_root,
++                    ..
++                })) = &mut process.kind
++            {
++                *discovery_root = local
++                    .child_id()
++                    .and_then(|pid| codex_utils_pty::JobObject::open_process_handle(pid).ok());
++            }
++            transport.discovery_cleanup = Some(Arc::new(DiscoveryCleanup {
++                process: Arc::downgrade(&transport.process),
++                result: OnceLock::new(),
++            }));
++        }
++        self.process = transport.process_ref();
++    }
++
++    pub(super) fn process(&self) -> StdioProcessRef {
++        self.process.clone()
++    }
++
++    pub(super) fn replace(&mut self, process: StdioProcessRef) -> bool {
++        if self.closed {
++            return false;
++        }
++        self.process = process;
++        true
++    }
++
+     pub(super) fn close(&mut self) -> StdioProcessRef {
+         self.closed = true;
+         self.process.clone()
+@@ -139,18 +188,29 @@ impl DiscoveryCleanup {
+             let process = self.process.upgrade();
+             // The owner waits for this worker on shutdown. Its grace periods must also advance
+             // when the caller leaves a current-thread runtime idle.
+-            runtime
+-                .spawn_blocking(move || {
++            let task = if process
++                .as_ref()
++                .is_some_and(|process| matches!(process.kind, StdioServerProcessKind::Executor(_)))
++            {
++                runtime.spawn(async move {
++                    process
++                        .ok_or_else(|| io::Error::other("MCP process already released"))?
++                        .terminate()
++                        .await
++                })
++            } else {
++                runtime.spawn_blocking(move || {
+                     process
+                         .ok_or_else(|| io::Error::other("discovery process already released"))?
+                         .terminate_discovery(reason)
+                 })
+-                .map(|joined| match joined {
+-                    Ok(result) => result.map_err(Arc::new),
+-                    Err(error) => Err(Arc::new(io::Error::other(error))),
+-                })
+-                .boxed()
+-                .shared()
++            };
++            task.map(|joined| match joined {
++                Ok(result) => result.map_err(Arc::new),
++                Err(error) => Err(Arc::new(io::Error::other(error))),
++            })
++            .boxed()
++            .shared()
+         })
+     }
+ }
+@@ -184,6 +244,7 @@ pub struct StdioServerTransport {
+     process: Arc<StdioServerProcessHandle>,
+     discovery_cleanup: Option<Arc<DiscoveryCleanup>>,
+     protocol_mode: McpProtocolMode,
++    launch_env: HashMap<OsString, OsString>,
+ }
+ 
+ enum StdioServerTransportInner {
+@@ -243,6 +304,9 @@ impl Drop for StdioServerTransport {
+ }
+ 
+ impl StdioServerTransport {
++    pub(super) fn launch_env(&self) -> HashMap<OsString, OsString> {
++        self.launch_env.clone()
++    }
+     pub(super) fn protocol_mode(&self) -> McpProtocolMode {
+         self.protocol_mode
+     }
+@@ -292,6 +356,8 @@ impl StdioServerCommand {
+             cwd,
+             protocol_mode,
+             replacement_slot: None,
++            retain_process_for_restart: false,
++            frozen_env: false,
+         }
+     }
+ 
+@@ -304,6 +370,22 @@ impl StdioServerCommand {
+         Self {
+             protocol_mode,
+             replacement_slot: Some(slot),
++            retain_process_for_restart: true,
++            ..self.clone()
++        }
++    }
++
++    /// Register replacements and retain their process until cleanup has completed.
++    pub(super) fn with_process_slot(
++        &self,
++        slot: StdioProcessSlot,
++        env: HashMap<OsString, OsString>,
++    ) -> Self {
++        Self {
++            replacement_slot: Some(slot),
++            retain_process_for_restart: true,
++            env: Some(env),
++            frozen_env: true,
+             ..self.clone()
+         }
+     }
+@@ -461,9 +543,15 @@ impl LocalStdioServerLauncher {
+             cwd,
+             protocol_mode,
+             replacement_slot,
++            retain_process_for_restart,
++            frozen_env,
+         } = command;
+         let program_name = program.to_string_lossy().into_owned();
+-        let envs = create_env_for_mcp_server(env, &env_vars).map_err(io::Error::other)?;
++        let envs = if frozen_env {
++            env.unwrap_or_default()
++        } else {
++            create_env_for_mcp_server(env, &env_vars).map_err(io::Error::other)?
++        };
+         let cwd = cwd.map(PathBuf::from).unwrap_or(fallback_cwd);
+         let resolved_program =
+             program_resolver::resolve(program, &envs, &cwd).map_err(io::Error::other)?;
+@@ -537,7 +625,7 @@ impl LocalStdioServerLauncher {
+         let process_id = stdio.child.id();
+         // A legacy replacement still belongs to the discovery startup that launched it.
+         let discovery_owned = (protocol_mode == McpProtocolMode::DiscoverLocalStdio
+-            || replacement_slot.is_some())
++            || retain_process_for_restart)
+             && process_id.is_some();
+         let (transport, stderr) =
+             LocalStdioTransport::new(stdio, program_name.clone(), protocol_mode);
+@@ -623,9 +711,10 @@ impl LocalStdioServerLauncher {
+             process,
+             discovery_cleanup,
+             protocol_mode,
++            launch_env: envs,
+         };
+         if let Some(mut slot) = slot {
+-            slot.process = transport.process_ref();
++            slot.replace(transport.process_ref());
+         }
+ 
+         Ok(transport)
+@@ -885,7 +974,17 @@ impl StdioServerLauncher for ExecutorStdioServerLauncher {
+         command: StdioServerCommand,
+     ) -> BoxFuture<'static, io::Result<StdioServerTransport>> {
+         let exec_backend = Arc::clone(&self.exec_backend);
+-        async move { Self::launch_server(command, exec_backend).await }.boxed()
++        async move {
++            if command.replacement_slot.is_some() {
++                // The slot remains locked until registration even if the caller cancels.
++                tokio::spawn(Self::launch_server(command, exec_backend))
++                    .await
++                    .map_err(io::Error::other)?
++            } else {
++                Self::launch_server(command, exec_backend).await
++            }
++        }
++        .boxed()
+     }
+ }
+ 
+@@ -905,7 +1004,9 @@ impl ExecutorStdioServerLauncher {
+             env_vars,
+             cwd,
+             protocol_mode,
+-            replacement_slot: _,
++            replacement_slot,
++            retain_process_for_restart: _,
++            frozen_env,
+         } = command;
+         let Some(cwd) = cwd else {
+             return Err(io::Error::other(
+@@ -916,7 +1017,12 @@ impl ExecutorStdioServerLauncher {
+             .try_into()
+             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+         let program_name = program.to_string_lossy().into_owned();
+-        let envs = create_env_overlay_for_remote_mcp_server(env, &env_vars);
++        let envs = if frozen_env {
++            env.unwrap_or_default()
++        } else {
++            create_env_overlay_for_remote_mcp_server(env, &env_vars)
++        };
++        let launch_env = envs.clone();
+         let remote_env_vars = remote_mcp_env_var_names(&env_vars);
+         // The executor protocol carries argv/env as UTF-8 strings. Local stdio can
+         // accept arbitrary OsString values because it calls the OS directly; remote
+@@ -925,6 +1031,16 @@ impl ExecutorStdioServerLauncher {
+         let argv = Self::process_api_argv(&program, &args).map_err(io::Error::other)?;
+         let env = Self::process_api_env(envs).map_err(io::Error::other)?;
+         let process_id = ExecutorProcessTransport::next_process_id();
++        let mut slot = match &replacement_slot {
++            Some(slot) => Some(slot.lock().await),
++            None => None,
++        };
++        if slot.as_ref().is_some_and(|slot| slot.closed) {
++            return Err(io::Error::new(
++                io::ErrorKind::Interrupted,
++                "MCP client is shut down",
++            ));
++        }
+         // Start the MCP server process on the executor with raw pipes. `tty=false`
+         // keeps stdout as a clean protocol stream, while `pipe_stdin=true` lets
+         // rmcp write JSON-RPC requests after the process starts.
+@@ -950,15 +1066,25 @@ impl ExecutorStdioServerLauncher {
+ 
+         let process =
+             StdioServerProcessHandle::executor(program_name.clone(), Arc::clone(&started.process));
+-        Ok(StdioServerTransport {
++        let transport = StdioServerTransport {
+             inner: StdioServerTransportInner::Executor(ExecutorProcessTransport::new(
+                 started.process,
+                 program_name,
+             )),
++            discovery_cleanup: replacement_slot.as_ref().map(|_| {
++                Arc::new(DiscoveryCleanup {
++                    process: Arc::downgrade(&process),
++                    result: OnceLock::new(),
++                })
++            }),
+             process,
+-            discovery_cleanup: None,
+             protocol_mode,
+-        })
++            launch_env,
++        };
++        if let Some(slot) = slot.as_mut() {
++            slot.replace(transport.process_ref());
++        }
++        Ok(transport)
+     }
+ 
+     fn process_api_argv(program: &OsString, args: &[OsString]) -> Result<Vec<String>> {
+-- 
+2.53.0
+

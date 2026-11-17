@@ -30,3 +30,14 @@ channels-inject: -p codex-channels-extension
 channels-inject: -p codex-app-server --test all mcp_channels
 
 channels-inject-tests: -p codex-app-server --test all mcp_channels::during_turn
+
+mcp-restart: -p codex-rmcp-client --test stdio_restart
+mcp-restart: -p codex-rmcp-client --lib stdio_restart::
+mcp-restart: -p codex-mcp --lib restart::
+mcp-restart: -p codex-mcp --lib changing_restart_policy_requires_a_new_connection
+mcp-restart: -p codex-rmcp-client --test process_group_cleanup
+mcp-restart: -p codex-rmcp-client --test mcp_2026_stdio_discovery
+mcp-restart: -p codex-rmcp-client --test mcp_2026_stdio
+mcp-restart: -p codex-core --lib config::schema::tests
+
+mcp-restart-tests: -p codex-app-server --test all suite::v2::mcp_restart::
