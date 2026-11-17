@@ -1,4 +1,4 @@
-From 94208a4660567f35dc7c01655dbd181af4c02478 Mon Sep 17 00:00:00 2001
+From c322ead2444d0e4d2d2fe15691a70de60dc91cb9 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 19:49:51 +0100
 Subject: [PATCH 1/3] channels: hold channel input behind a per-thread barrier
@@ -12,17 +12,18 @@ the input it accepted before, which is never shown to the model.
 
 A snapshot reports the held and in-flight input, the servers' connection
 and fence state, what still blocks the drain and what may have been
-lost. The host releases held input it kept elsewhere, by sequence number,
-or opens the barrier, which delivers it.
+lost. The host releases held input it kept elsewhere, up to a sequence
+number, or opens the barrier, which drops the held input it discards
+and delivers the rest.
 ---
  codex-rs/ext/channels/Cargo.toml            |   3 +-
- codex-rs/ext/channels/README.md             |  24 ++
- codex-rs/ext/channels/src/barrier.rs        | 351 +++++++++++++++++
+ codex-rs/ext/channels/README.md             |  27 ++
+ codex-rs/ext/channels/src/barrier.rs        | 351 ++++++++++++++++
  codex-rs/ext/channels/src/barrier_tests.rs  | 273 +++++++++++++
- codex-rs/ext/channels/src/delivery.rs       | 402 ++++++++++++++++++--
- codex-rs/ext/channels/src/delivery_tests.rs | 204 +++++++++-
- codex-rs/ext/channels/src/lib.rs            | 111 +++++-
- 7 files changed, 1337 insertions(+), 31 deletions(-)
+ codex-rs/ext/channels/src/delivery.rs       | 418 ++++++++++++++++++--
+ codex-rs/ext/channels/src/delivery_tests.rs | 268 ++++++++++++-
+ codex-rs/ext/channels/src/lib.rs            | 116 +++++-
+ 7 files changed, 1425 insertions(+), 31 deletions(-)
  create mode 100644 codex-rs/ext/channels/src/barrier.rs
  create mode 100644 codex-rs/ext/channels/src/barrier_tests.rs
 
@@ -42,10 +43,10 @@ index f61871bc8e..c446bf0b6d 100644
  [dev-dependencies]
  anyhow = { workspace = true }
 diff --git a/codex-rs/ext/channels/README.md b/codex-rs/ext/channels/README.md
-index 81670f1bb6..6cb118985d 100644
+index 81670f1bb6..c3df0e37ca 100644
 --- a/codex-rs/ext/channels/README.md
 +++ b/codex-rs/ext/channels/README.md
-@@ -40,6 +40,30 @@ goes only to the root thread; channel servers are not started in sub-agents.
+@@ -40,6 +40,33 @@ goes only to the root thread; channel servers are not started in sub-agents.
  The server receives no delivery acknowledgement. Expose a reply tool when it needs a response.
  Permission relay and channels contributed by plugins remain outside this extension.
  
@@ -69,7 +70,10 @@ index 81670f1bb6..6cb118985d 100644
 +connection and fence state, what still blocks the drain and what may have been lost:
 +a connection that ended before its marker, input after a marker, or drops since closing.
 +The barrier is drained when it is closed and nothing blocks it. The host then keeps the held
-+input and releases it by sequence number, or opens the barrier, which delivers it.
++input and releases it up to a sequence number, or opens the barrier: opening drops the held
++input it lists as discarded and delivers the rest in order. Opening an open barrier succeeds,
++with no effect, only as a retry of its last opening, so a host whose fence was lost, for
++example by a restart, gets an error.
 +
 +Held input lives in memory: it is lost if the process exits or the thread stops first.
 +
@@ -713,7 +717,7 @@ index 0000000000..c94d41415e
 +    assert!(!barrier.drained);
 +}
 diff --git a/codex-rs/ext/channels/src/delivery.rs b/codex-rs/ext/channels/src/delivery.rs
-index d4d240a596..01930a5079 100644
+index d4d240a596..a379a860e3 100644
 --- a/codex-rs/ext/channels/src/delivery.rs
 +++ b/codex-rs/ext/channels/src/delivery.rs
 @@ -5,6 +5,8 @@ use std::collections::VecDeque;
@@ -757,7 +761,7 @@ index d4d240a596..01930a5079 100644
  use crate::render::Rejected;
  use crate::render::render;
  
-@@ -176,11 +194,31 @@ pub(crate) enum WorkerEvent {
+@@ -176,11 +194,34 @@ pub(crate) enum WorkerEvent {
      TurnStarted(String),
      Confirmed(u64),
      TurnEnded { turn_id: String, aborted: bool },
@@ -770,6 +774,9 @@ index d4d240a596..01930a5079 100644
 +    Fence {
 +        closed: bool,
 +        expected_fence_id: Option<String>,
++        /// When opening a closed barrier, held input with these sequence numbers is dropped
++        /// instead of delivered. Ignored otherwise.
++        discard_seqs: Vec<u64>,
 +        reply: oneshot::Sender<Result<ChannelBarrier, BarrierError>>,
 +    },
 +    Read {
@@ -789,7 +796,7 @@ index d4d240a596..01930a5079 100644
      task: JoinHandle<()>,
  }
  
-@@ -189,10 +227,23 @@ impl Worker {
+@@ -189,10 +230,23 @@ impl Worker {
          notifications: mpsc::Receiver<ChannelNotification>,
          delivery: Arc<dyn Delivery>,
          during_turn: HashSet<String>,
@@ -815,7 +822,7 @@ index d4d240a596..01930a5079 100644
      }
  
      pub(crate) fn event(&self, event: WorkerEvent) {
-@@ -203,6 +254,14 @@ impl Worker {
+@@ -203,6 +257,14 @@ impl Worker {
      pub(crate) fn wake(&self) {
          self.event(WorkerEvent::Wake);
      }
@@ -830,7 +837,7 @@ index d4d240a596..01930a5079 100644
  }
  
  impl Drop for Worker {
-@@ -211,44 +270,143 @@ impl Drop for Worker {
+@@ -211,44 +273,143 @@ impl Drop for Worker {
      }
  }
  
@@ -989,7 +996,7 @@ index d4d240a596..01930a5079 100644
  }
  
  struct Batch {
-@@ -258,6 +416,7 @@ struct Batch {
+@@ -258,6 +419,7 @@ struct Batch {
      turn: String,
      /// Whether that turn has started. A turn started for an idle batch reports its start later.
      started: bool,
@@ -997,7 +1004,7 @@ index d4d240a596..01930a5079 100644
  }
  
  #[derive(Default)]
-@@ -266,6 +425,10 @@ struct Queue {
+@@ -266,6 +428,12 @@ struct Queue {
      in_flight: Vec<Batch>,
      next_id: u64,
      active_turn: Option<String>,
@@ -1005,10 +1012,12 @@ index d4d240a596..01930a5079 100644
 +    dropped: Dropped,
 +    /// Set while the barrier is closed: nothing is delivered.
 +    fence: Option<Fence>,
++    /// The fence id of the last opening, so that a retried opening succeeds again.
++    last_opened: Option<String>,
  }
  
  impl Queue {
-@@ -280,18 +443,45 @@ impl Queue {
+@@ -280,18 +448,45 @@ impl Queue {
  
      fn push(&mut self, notification: &ChannelNotification, during_turn: bool) {
          let server = &notification.server;
@@ -1058,7 +1067,7 @@ index d4d240a596..01930a5079 100644
                  warn!(%server, chars, "dropping MCP channel notification: its content is too long");
              }
          }
-@@ -310,6 +500,8 @@ impl Queue {
+@@ -310,6 +505,8 @@ impl Queue {
                  self.in_flight.retain(|batch| batch.id != id);
                  false
              }
@@ -1067,7 +1076,7 @@ index d4d240a596..01930a5079 100644
              WorkerEvent::TurnEnded { turn_id, aborted } => {
                  if self.active_turn.as_ref() == Some(&turn_id) {
                      self.active_turn = None;
-@@ -319,7 +511,7 @@ impl Queue {
+@@ -319,7 +516,7 @@ impl Queue {
                  if aborted {
                      self.requeue(ended);
                  } else {
@@ -1076,7 +1085,7 @@ index d4d240a596..01930a5079 100644
                  }
                  false
              }
-@@ -338,7 +530,17 @@ impl Queue {
+@@ -338,7 +535,17 @@ impl Queue {
          let (never_started, ended): (Vec<Batch>, Vec<Batch>) =
              earlier.into_iter().partition(|batch| !batch.started);
          self.requeue(never_started);
@@ -1095,7 +1104,7 @@ index d4d240a596..01930a5079 100644
      }
  
      /// Splits the unconfirmed batches, in order, into those matching `select` and the rest.
-@@ -353,8 +555,14 @@ impl Queue {
+@@ -353,8 +560,14 @@ impl Queue {
          if batches.is_empty() {
              return;
          }
@@ -1112,7 +1121,7 @@ index d4d240a596..01930a5079 100644
          recovered.append(&mut self.pending);
          self.pending = recovered;
      }
-@@ -366,7 +574,7 @@ impl Queue {
+@@ -366,7 +579,7 @@ impl Queue {
      }
  
      async fn deliver(&mut self, delivery: &dyn Delivery) {
@@ -1121,7 +1130,7 @@ index d4d240a596..01930a5079 100644
              return;
          }
          if let Some(active_turn) = self.active_turn.clone() {
-@@ -389,6 +597,7 @@ impl Queue {
+@@ -389,6 +602,7 @@ impl Queue {
                          items,
                          turn: turn_id,
                          started: true,
@@ -1129,7 +1138,7 @@ index d4d240a596..01930a5079 100644
                      });
                      return;
                  }
-@@ -408,9 +617,150 @@ impl Queue {
+@@ -408,9 +622,161 @@ impl Queue {
                  items,
                  turn: turn_id,
                  started: false,
@@ -1201,6 +1210,7 @@ index d4d240a596..01930a5079 100644
 +            BarrierRequest::Fence {
 +                closed: true,
 +                expected_fence_id,
++                discard_seqs: _,
 +                reply,
 +            } => {
 +                let result = match current {
@@ -1225,18 +1235,28 @@ index d4d240a596..01930a5079 100644
 +            BarrierRequest::Fence {
 +                closed: false,
 +                expected_fence_id,
++                discard_seqs,
 +                reply,
 +            } => {
 +                let (result, reopened) = match current {
-+                    None => (Ok(self.snapshot(fence).await), false),
++                    // Only a retry of this worker's last opening finds the barrier open.
++                    None if expected_fence_id.is_some()
++                        && expected_fence_id == self.last_opened =>
++                    {
++                        (Ok(self.snapshot(fence).await), false)
++                    }
++                    None => (Err(BarrierError::FenceMismatch { current: None }), false),
 +                    Some(current) if expected_fence_id.as_deref() != Some(current.as_str()) => (
 +                        Err(BarrierError::FenceMismatch {
 +                            current: Some(current),
 +                        }),
 +                        false,
 +                    ),
-+                    Some(_) => {
++                    Some(current) => {
++                        self.pending
++                            .retain(|item| !discard_seqs.contains(&item.seq));
 +                        self.fence = None;
++                        self.last_opened = Some(current);
 +                        if let Some(fence) = fence {
 +                            fence.set(None);
 +                        }
@@ -1281,7 +1301,7 @@ index d4d240a596..01930a5079 100644
  
  /// A completed turn that did not record its input (for example, an input hook blocked it)
 diff --git a/codex-rs/ext/channels/src/delivery_tests.rs b/codex-rs/ext/channels/src/delivery_tests.rs
-index 457fc00e27..d749b223c6 100644
+index 457fc00e27..97af5286f4 100644
 --- a/codex-rs/ext/channels/src/delivery_tests.rs
 +++ b/codex-rs/ext/channels/src/delivery_tests.rs
 @@ -65,6 +65,7 @@ fn harness(outcomes: Vec<DeliveryOutcome>) -> Harness {
@@ -1314,7 +1334,7 @@ index 457fc00e27..d749b223c6 100644
      );
      assert!(events.set(worker.events.clone()).is_ok());
      worker.event(WorkerEvent::TurnStarted("turn".to_string()));
-@@ -601,3 +608,198 @@ fn both_paths_tag_the_recorded_message_with_the_batch_id() {
+@@ -601,3 +608,262 @@ fn both_paths_tag_the_recorded_message_with_the_batch_id() {
          Some(&json!(7))
      );
  }
@@ -1332,6 +1352,7 @@ index 457fc00e27..d749b223c6 100644
 +    let (barrier, _) = ask(queue, |reply| super::BarrierRequest::Fence {
 +        closed: true,
 +        expected_fence_id: None,
++        discard_seqs: Vec::new(),
 +        reply,
 +    })
 +    .await;
@@ -1367,6 +1388,7 @@ index 457fc00e27..d749b223c6 100644
 +    let (refused, attempt) = ask(&mut queue, |reply| super::BarrierRequest::Fence {
 +        closed: false,
 +        expected_fence_id: Some("fence-stale".to_string()),
++        discard_seqs: Vec::new(),
 +        reply,
 +    })
 +    .await;
@@ -1380,7 +1402,8 @@ index 457fc00e27..d749b223c6 100644
 +
 +    let (opened, attempt) = ask(&mut queue, |reply| super::BarrierRequest::Fence {
 +        closed: false,
-+        expected_fence_id: Some(id),
++        expected_fence_id: Some(id.clone()),
++        discard_seqs: Vec::new(),
 +        reply,
 +    })
 +    .await;
@@ -1390,6 +1413,65 @@ index 457fc00e27..d749b223c6 100644
 +    assert_eq!(
 +        *delivery.attempts.lock().expect("attempts"),
 +        vec![Attempt::Idle(vec![rendered("one"), rendered("two")])]
++    );
++
++    // Retrying that opening succeeds; any other id finds no fence to open.
++    let (retried, attempt) = ask(&mut queue, |reply| super::BarrierRequest::Fence {
++        closed: false,
++        expected_fence_id: Some(id),
++        discard_seqs: Vec::new(),
++        reply,
++    })
++    .await;
++    assert!(!retried.expect("retried").closed);
++    assert!(!attempt);
++    for expected_fence_id in [Some("fence-stale".to_string()), None] {
++        let (refused, _) = ask(&mut queue, |reply| super::BarrierRequest::Fence {
++            closed: false,
++            expected_fence_id,
++            discard_seqs: Vec::new(),
++            reply,
++        })
++        .await;
++        assert_eq!(refused, Err(BarrierError::FenceMismatch { current: None }));
++    }
++}
++
++#[tokio::test]
++async fn opening_drops_the_discarded_input_and_delivers_the_rest_once() {
++    let delivery = steering(true);
++    let mut queue = super::Queue::default();
++    let id = close(&mut queue).await;
++    for text in ["a", "b", "c", "d"] {
++        queue.push(&event(text), false);
++    }
++    // Unknown numbers are ignored.
++    let (opened, attempt) = ask(&mut queue, |reply| super::BarrierRequest::Fence {
++        closed: false,
++        expected_fence_id: Some(id.clone()),
++        discard_seqs: vec![1, 3, 9],
++        reply,
++    })
++    .await;
++    let opened = opened.expect("opened");
++    assert!(!opened.closed);
++    assert!(attempt);
++    queue.deliver(&delivery).await;
++
++    // A retried opening finds the barrier open and changes nothing, whatever it discards.
++    let (retried, attempt) = ask(&mut queue, |reply| super::BarrierRequest::Fence {
++        closed: false,
++        expected_fence_id: Some(id),
++        discard_seqs: vec![0, 2],
++        reply,
++    })
++    .await;
++    assert!(!retried.expect("retried").closed);
++    assert!(!attempt);
++    queue.deliver(&delivery).await;
++    assert_eq!(
++        *delivery.attempts.lock().expect("attempts"),
++        vec![Attempt::Idle(vec![rendered("a"), rendered("c")])]
 +    );
 +}
 +
@@ -1403,6 +1485,7 @@ index 457fc00e27..d749b223c6 100644
 +    let (refused, _) = ask(&mut queue, |reply| super::BarrierRequest::Fence {
 +        closed: true,
 +        expected_fence_id: Some("fence-other".to_string()),
++        discard_seqs: Vec::new(),
 +        reply,
 +    })
 +    .await;
@@ -1451,6 +1534,7 @@ index 457fc00e27..d749b223c6 100644
 +    ask(&mut queue, |reply| super::BarrierRequest::Fence {
 +        closed: false,
 +        expected_fence_id: Some(id.clone()),
++        discard_seqs: Vec::new(),
 +        reply,
 +    })
 +    .await;
@@ -1514,7 +1598,7 @@ index 457fc00e27..d749b223c6 100644
 +    assert!(barrier.servers.is_empty());
 +}
 diff --git a/codex-rs/ext/channels/src/lib.rs b/codex-rs/ext/channels/src/lib.rs
-index 7001833134..9122b51143 100644
+index 7001833134..423886efdc 100644
 --- a/codex-rs/ext/channels/src/lib.rs
 +++ b/codex-rs/ext/channels/src/lib.rs
 @@ -14,11 +14,18 @@
@@ -1569,24 +1653,29 @@ index 7001833134..9122b51143 100644
  }
  
  impl ChannelsExtension {
-@@ -86,6 +103,77 @@ impl ChannelsExtension {
+@@ -86,6 +103,82 @@ impl ChannelsExtension {
      pub fn attach(&self, thread_manager: Weak<ThreadManager>) {
          let _ = self.thread_manager.set(thread_manager);
      }
 +
 +    /// Closes (`closed`) or opens the thread's channel barrier. Closing an open barrier picks a
-+    /// new fence id; closing a closed one changes nothing. Opening needs the current fence id
-+    /// and delivers the held input. Returns at once with the resulting state.
++    /// new fence id; closing a closed one changes nothing. Opening needs the current fence id:
++    /// it drops the held input numbered in `discard_seqs` and delivers the rest in order.
++    /// Repeating it with the same id succeeds, with no effect, while the barrier stays open.
++    /// `discard_seqs` is ignored unless the barrier is opened. Returns at once with the
++    /// resulting state.
 +    pub async fn fence(
 +        &self,
 +        thread_id: ThreadId,
 +        closed: bool,
 +        expected_fence_id: Option<String>,
++        discard_seqs: Vec<u64>,
 +    ) -> Result<ChannelBarrier, BarrierError> {
 +        self.worker(thread_id)?
 +            .request(|reply| BarrierRequest::Fence {
 +                closed,
 +                expected_fence_id,
++                discard_seqs,
 +                reply,
 +            })
 +            .await
@@ -1647,7 +1736,7 @@ index 7001833134..9122b51143 100644
  }
  
  impl McpServerContributor<Config> for ChannelsExtension {
-@@ -141,11 +229,17 @@ impl ThreadLifecycleContributor<Config> for ChannelsExtension {
+@@ -141,11 +234,17 @@ impl ThreadLifecycleContributor<Config> for ChannelsExtension {
                      codex_mcp::channel_during_turn(&input.config.config_layer_stack, name)
                  })
                  .collect();
@@ -1667,7 +1756,7 @@ index 7001833134..9122b51143 100644
          })
      }
  
-@@ -167,7 +261,18 @@ impl ThreadLifecycleContributor<Config> for ChannelsExtension {
+@@ -167,7 +266,18 @@ impl ThreadLifecycleContributor<Config> for ChannelsExtension {
  
      fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
          Box::pin(async move {

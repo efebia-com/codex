@@ -1,25 +1,27 @@
-From 54f650125f0d95009af2265d9252aeff595985ff Mon Sep 17 00:00:00 2001
+From 7dcc010cf098aa73fbb9e019c31f14cbc0f8eca5 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 19:49:51 +0100
 Subject: [PATCH 2/3] app-server: expose the channel barrier as thread/channels
  requests
 
-thread/channels/fence closes or opens a loaded thread's channel barrier,
-thread/channels/read reports it and can wait for it to drain, and
-thread/channels/release drops held input the client has kept. Reads are
-not serialized with the thread's other requests, so a waiting read never
+thread/channels/fence closes or opens a loaded thread's channel barrier;
+opening can discard held input the client has kept, and a retried
+opening succeeds without effect. thread/channels/read reports the
+barrier and can wait for it to drain, and thread/channels/release drops
+held input the client has kept, up to a sequence number. Reads are not
+serialized with the thread's other requests, so a waiting read never
 delays a turn or a steer. Errors carry a reason: threadNotFound,
-noChannels, fenceMismatch or fenceOpen.
+noChannels, fenceMismatch (with the current fence id) or fenceOpen.
 ---
  .../src/protocol/common.rs                    |  19 ++
  .../src/protocol/v2/mod.rs                    |   2 +
- .../src/protocol/v2/thread_channels.rs        | 221 ++++++++++++++++
+ .../src/protocol/v2/thread_channels.rs        | 228 ++++++++++++++++
  codex-rs/app-server/src/extensions.rs         |   6 +-
  codex-rs/app-server/src/mcp_refresh.rs        |   1 +
  codex-rs/app-server/src/message_processor.rs  |  22 ++
  codex-rs/app-server/src/request_processors.rs |   2 +
- .../thread_channels_processor.rs              | 236 ++++++++++++++++++
- 8 files changed, 508 insertions(+), 1 deletion(-)
+ .../thread_channels_processor.rs              | 257 ++++++++++++++++++
+ 8 files changed, 536 insertions(+), 1 deletion(-)
  create mode 100644 codex-rs/app-server-protocol/src/protocol/v2/thread_channels.rs
  create mode 100644 codex-rs/app-server/src/request_processors/thread_channels_processor.rs
 
@@ -75,10 +77,10 @@ index 96bb11c2aa..7d66cd3caa 100644
  pub use thread_sample::*;
 diff --git a/codex-rs/app-server-protocol/src/protocol/v2/thread_channels.rs b/codex-rs/app-server-protocol/src/protocol/v2/thread_channels.rs
 new file mode 100644
-index 0000000000..bca8d2af21
+index 0000000000..1ca872c7d7
 --- /dev/null
 +++ b/codex-rs/app-server-protocol/src/protocol/v2/thread_channels.rs
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,228 @@
 +//! The channel input barrier of a loaded thread.
 +//!
 +//! While the barrier is closed, input from MCP channel servers does not reach the model: each
@@ -100,9 +102,16 @@ index 0000000000..bca8d2af21
 +    /// id; closing a closed one changes nothing. Opening delivers the held input.
 +    pub closed: bool,
 +    /// The current fence id. Required to open a closed barrier; when given while closing, a
-+    /// barrier closed under another id is an error.
++    /// barrier closed under another id is an error. Opening an open barrier succeeds, with no
++    /// effect, only as a retry of its last opening, with that fence id.
 +    #[ts(optional = nullable)]
 +    pub expected_fence_id: Option<String>,
++    /// Only when opening: held input with these sequence numbers is dropped instead of
++    /// delivered. Unknown or already dropped numbers are ignored; a retried opening ignores
++    /// the list.
++    #[ts(type = "Array<number> | null")]
++    #[ts(optional = nullable)]
++    pub discard_seqs: Option<Vec<i64>>,
 +}
 +
 +#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -440,10 +449,10 @@ index 82dbae7584..b7fd710a3d 100644
  pub(crate) use windows_sandbox_processor::WindowsSandboxRequestProcessor;
 diff --git a/codex-rs/app-server/src/request_processors/thread_channels_processor.rs b/codex-rs/app-server/src/request_processors/thread_channels_processor.rs
 new file mode 100644
-index 0000000000..30426e4d8e
+index 0000000000..ca463642e3
 --- /dev/null
 +++ b/codex-rs/app-server/src/request_processors/thread_channels_processor.rs
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,257 @@
 +//! `thread/channels/*`: the channel input barrier of a loaded thread.
 +
 +use std::sync::Arc;
@@ -499,10 +508,26 @@ index 0000000000..30426e4d8e
 +        &self,
 +        params: ThreadChannelsFenceParams,
 +    ) -> Result<ThreadChannelsFenceResponse, JSONRPCErrorError> {
++        if params.closed && params.discard_seqs.is_some() {
++            return Err(invalid_params("discardSeqs is only allowed when opening"));
++        }
++        let discard_seqs = params
++            .discard_seqs
++            .unwrap_or_default()
++            .into_iter()
++            .map(|seq| {
++                u64::try_from(seq).map_err(|_| invalid_params("discardSeqs must not be negative"))
++            })
++            .collect::<Result<Vec<_>, _>>()?;
 +        let thread_id = self.loaded_thread(&params.thread_id).await?;
 +        let barrier = self
 +            .channels
-+            .fence(thread_id, params.closed, params.expected_fence_id)
++            .fence(
++                thread_id,
++                params.closed,
++                params.expected_fence_id,
++                discard_seqs,
++            )
 +            .await
 +            .map_err(barrier_error)?;
 +        Ok(ThreadChannelsFenceResponse {
@@ -567,12 +592,17 @@ index 0000000000..30426e4d8e
 +}
 +
 +fn barrier_error(error: BarrierError) -> JSONRPCErrorError {
-+    let reason = match &error {
-+        BarrierError::NoChannels => "noChannels",
-+        BarrierError::FenceMismatch { .. } => "fenceMismatch",
-+        BarrierError::FenceOpen => "fenceOpen",
-+    };
-+    reason_error(reason, error.to_string())
++    let message = error.to_string();
++    match error {
++        BarrierError::NoChannels => reason_error("noChannels", message),
++        BarrierError::FenceOpen => reason_error("fenceOpen", message),
++        // `current` is the fence id the barrier is closed under, or null when it is open.
++        BarrierError::FenceMismatch { current } => {
++            let mut error = invalid_request(message);
++            error.data = Some(serde_json::json!({ "reason": "fenceMismatch", "current": current }));
++            error
++        }
++    }
 +}
 +
 +fn number(value: u64) -> i64 {

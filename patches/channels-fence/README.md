@@ -60,7 +60,10 @@ record it, it is held too. A read reports the held and in-flight input, each ser
 connection and fence state, what still blocks the drain and what may have been lost:
 a connection that ended before its marker, input after a marker, or drops since closing.
 The barrier is drained when it is closed and nothing blocks it. The host then keeps the held
-input and releases it by sequence number, or opens the barrier, which delivers it.
+input and releases it up to a sequence number, or opens the barrier: opening drops the held
+input it lists as discarded and delivers the rest in order. Opening an open barrier succeeds,
+with no effect, only as a retry of its last opening, so a host whose fence was lost, for
+example by a restart, gets an error.
 
 Held input lives in memory: it is lost if the process exits or the thread stops first.
 

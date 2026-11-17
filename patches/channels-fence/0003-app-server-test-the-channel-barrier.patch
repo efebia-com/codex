@@ -1,18 +1,18 @@
-From 375ba01207192ad67bef8ac57f40cf71cb8b8409 Mon Sep 17 00:00:00 2001
+From 39c94b2ce96999bcdbf718cb6b9e0d2870938a73 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 19:49:51 +0100
 Subject: [PATCH 3/3] app-server: test the channel barrier
 
 The fake channel server supports channel/fence: while fenced it refuses
 new input, and a fence request emits its backlog, then the marker. The
-tests hold input accepted before the fence, release it or deliver it on
-reopening, keep user turns working while closed, and check the error
-reasons.
+tests hold input accepted before the fence, release it or deliver on
+reopening what is not discarded, keep user turns working while closed,
+and check the errors.
 ---
  .../app-server/tests/suite/v2/mcp_channels.rs |   3 +
- .../tests/suite/v2/mcp_channels_fence.rs      | 243 ++++++++++++++++++
+ .../tests/suite/v2/mcp_channels_fence.rs      | 293 ++++++++++++++++++
  .../tests/suite/v2/mcp_channels_server.py     |  41 ++-
- 3 files changed, 285 insertions(+), 2 deletions(-)
+ 3 files changed, 335 insertions(+), 2 deletions(-)
  create mode 100644 codex-rs/app-server/tests/suite/v2/mcp_channels_fence.rs
 
 diff --git a/codex-rs/app-server/tests/suite/v2/mcp_channels.rs b/codex-rs/app-server/tests/suite/v2/mcp_channels.rs
@@ -28,10 +28,10 @@ index 640b4afacc..d8d056eb1b 100644
 +mod fence;
 diff --git a/codex-rs/app-server/tests/suite/v2/mcp_channels_fence.rs b/codex-rs/app-server/tests/suite/v2/mcp_channels_fence.rs
 new file mode 100644
-index 0000000000..43d6dda16b
+index 0000000000..4a098c4ea0
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/mcp_channels_fence.rs
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,293 @@
 +//! The channel barrier over a server that supports `channel/fence`: input the server accepted
 +//! before the fence is held, never reaches the model while the barrier is closed, and is either
 +//! released by the caller or delivered when the barrier opens.
@@ -42,6 +42,7 @@ index 0000000000..43d6dda16b
 +use codex_app_server_protocol::ChannelServerFence;
 +use codex_app_server_protocol::ClientRequest;
 +use codex_app_server_protocol::JSONRPCError;
++use codex_app_server_protocol::JSONRPCErrorError;
 +use codex_app_server_protocol::RequestId;
 +use codex_app_server_protocol::ThreadChannelsFenceParams;
 +use codex_app_server_protocol::ThreadChannelsFenceResponse;
@@ -67,10 +68,14 @@ index 0000000000..43d6dda16b
 +
 +impl Harness {
 +    /// Input the server accepted and has not emitted yet; a fence request emits it first.
-+    fn accept_before_fence(&self, name: &str, params: &Value) -> Result<()> {
++    fn accept_before_fence(&self, name: &str, params: &[Value]) -> Result<()> {
 +        let backlog = self.server(name).inbox.with_extension("backlog");
-+        let line = format!("{}\n", serde_json::to_string(params)?);
-+        std::fs::write(backlog, line)?;
++        let mut lines = String::new();
++        for line in params {
++            lines.push_str(&serde_json::to_string(line)?);
++            lines.push('\n');
++        }
++        std::fs::write(backlog, lines)?;
 +        Ok(())
 +    }
 +
@@ -78,6 +83,7 @@ index 0000000000..43d6dda16b
 +        &mut self,
 +        closed: bool,
 +        expected_fence_id: Option<String>,
++        discard_seqs: Option<Vec<i64>>,
 +    ) -> Result<ChannelBarrier> {
 +        let thread_id = self.thread_id.clone();
 +        let response: ThreadChannelsFenceResponse = self
@@ -88,6 +94,7 @@ index 0000000000..43d6dda16b
 +                    thread_id,
 +                    closed,
 +                    expected_fence_id,
++                    discard_seqs,
 +                },
 +            })
 +            .await?;
@@ -127,6 +134,20 @@ index 0000000000..43d6dda16b
 +
 +    /// The `data.reason` of the error answering `method` with `params`.
 +    async fn error_reason(&mut self, method: &str, params: Value) -> Result<Value> {
++        Ok(self.error_data(method, params).await?["reason"].clone())
++    }
++
++    /// The `data` of the error answering `method` with `params`.
++    async fn error_data(&mut self, method: &str, params: Value) -> Result<Value> {
++        Ok(self
++            .error(method, params)
++            .await?
++            .data
++            .unwrap_or(Value::Null))
++    }
++
++    /// The error answering `method` with `params`.
++    async fn error(&mut self, method: &str, params: Value) -> Result<JSONRPCErrorError> {
 +        let request_id = self.app.send_request(method, Some(params)).await?;
 +        let error: JSONRPCError = timeout(
 +            READ_TIMEOUT,
@@ -134,11 +155,7 @@ index 0000000000..43d6dda16b
 +                .read_stream_until_error_message(RequestId::Integer(request_id)),
 +        )
 +        .await??;
-+        Ok(error
-+            .error
-+            .data
-+            .and_then(|data| data.get("reason").cloned())
-+            .unwrap_or(Value::Null))
++        Ok(error.error)
 +    }
 +
 +    async fn wait_for_requests(&self, count: usize) -> Result<()> {
@@ -155,7 +172,7 @@ index 0000000000..43d6dda16b
 +
 +    /// Closes the barrier and waits until it is drained.
 +    async fn close_and_drain(&mut self) -> Result<(String, ChannelBarrier)> {
-+        let closed = self.fence(true, None).await?;
++        let closed = self.fence(true, None, None).await?;
 +        let fence_id = closed
 +            .fence_id
 +            .clone()
@@ -179,7 +196,7 @@ index 0000000000..43d6dda16b
 +-> Result<()> {
 +    skip_if_no_network!(Ok(()));
 +    let mut harness = Harness::start(&[CHANNEL]).await?;
-+    harness.accept_before_fence("chan", &json!({ "content": "accepted before" }))?;
++    harness.accept_before_fence("chan", &[json!({ "content": "accepted before" })])?;
 +
 +    let (fence_id, barrier) = harness.close_and_drain().await?;
 +    assert!(barrier.closed);
@@ -214,23 +231,41 @@ index 0000000000..43d6dda16b
 +}
 +
 +#[tokio::test]
-+async fn opening_the_barrier_delivers_the_held_input() -> Result<()> {
++async fn opening_the_barrier_delivers_the_held_input_it_does_not_discard() -> Result<()> {
 +    skip_if_no_network!(Ok(()));
 +    let mut harness = Harness::start(&[CHANNEL]).await?;
-+    harness.accept_before_fence("chan", &json!({ "content": "held for later" }))?;
++    harness.accept_before_fence(
++        "chan",
++        &[
++            json!({ "content": "held for later" }),
++            json!({ "content": "kept by the caller" }),
++        ],
++    )?;
 +    let (fence_id, barrier) = harness.close_and_drain().await?;
-+    assert_eq!(held_contents(&barrier), vec!["held for later"]);
++    assert_eq!(
++        held_contents(&barrier),
++        vec!["held for later", "kept by the caller"]
++    );
 +    sleep(QUIET_PERIOD).await;
 +    harness.assert_never_delivered("held for later").await;
 +
-+    let opened = harness.fence(false, Some(fence_id)).await?;
++    let kept = barrier.held[1].seq;
++    let opened = harness
++        .fence(false, Some(fence_id.clone()), Some(vec![kept]))
++        .await?;
 +    assert!(!opened.closed);
 +    harness.wait_for_delivery("chan", "held for later").await?;
++    // A retried opening changes nothing.
++    let retried = harness
++        .fence(false, Some(fence_id), Some(vec![barrier.held[0].seq]))
++        .await?;
++    assert!(!retried.closed);
 +
 +    harness
 +        .server("chan")
 +        .push(&[json!({ "content": "open again" })])?;
 +    harness.wait_for_delivery("chan", "open again").await?;
++    harness.assert_never_delivered("kept by the caller").await;
 +    Ok(())
 +}
 +
@@ -247,6 +282,21 @@ index 0000000000..43d6dda16b
 +        )
 +        .await?;
 +    assert_eq!(reason, json!("fenceOpen"));
++    // Nothing was opened under this id, for example before a restart: the fence is gone.
++    let data = harness
++        .error_data(
++            "thread/channels/fence",
++            json!({ "threadId": thread_id, "closed": false, "expectedFenceId": "fence-none" }),
++        )
++        .await?;
++    assert_eq!(data, json!({ "reason": "fenceMismatch", "current": null }));
++    let error = harness
++        .error(
++            "thread/channels/fence",
++            json!({ "threadId": thread_id, "closed": true, "discardSeqs": [0] }),
++        )
++        .await?;
++    assert_eq!(error.code, -32602);
 +
 +    let (fence_id, _) = harness.close_and_drain().await?;
 +    let reason = harness
