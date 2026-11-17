@@ -1,12 +1,12 @@
-From 1a04dd0ff3d16a421a8827ce15daa4544f9c76b0 Mon Sep 17 00:00:00 2001
+From b9f27c2facf9e2df423d3321c36067b2281ccb0e Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 11:51:32 +0100
 Subject: [PATCH] app-server: test channel delivery during active turns
 
 ---
  .../app-server/tests/suite/v2/mcp_channels.rs |   3 +
- .../suite/v2/mcp_channels_during_turn.rs      | 493 ++++++++++++++++++
- 2 files changed, 496 insertions(+)
+ .../suite/v2/mcp_channels_during_turn.rs      | 494 ++++++++++++++++++
+ 2 files changed, 497 insertions(+)
  create mode 100644 codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs
 
 diff --git a/codex-rs/app-server/tests/suite/v2/mcp_channels.rs b/codex-rs/app-server/tests/suite/v2/mcp_channels.rs
@@ -22,15 +22,16 @@ index 3a5712e297..640b4afacc 100644
 +mod during_turn;
 diff --git a/codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs b/codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs
 new file mode 100644
-index 0000000000..72f9cd59c9
+index 0000000000..8c40170253
 --- /dev/null
 +++ b/codex-rs/app-server/tests/suite/v2/mcp_channels_during_turn.rs
-@@ -0,0 +1,493 @@
+@@ -0,0 +1,494 @@
 +//! The additional per-server opt-in delivers channel input into the active root turn.
 +
 +use super::*;
 +use codex_app_server_protocol::ThreadResumeParams;
 +use codex_app_server_protocol::ThreadResumeResponse;
++use pretty_assertions::assert_eq;
 +
 +async fn start(specs: &[ServerSpec]) -> Result<Harness> {
 +    let names: Vec<&str> = specs.iter().map(|spec| spec.name).collect();
