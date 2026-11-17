@@ -26,10 +26,10 @@ on:
         description: "Publish a new revision even if this upstream version is already published"
         type: boolean
         default: false
-      macos:
-        description: "Build and publish the macOS packages too (off: Linux only)"
-        type: boolean
-        default: true
+      targets:
+        description: "Targets to build and publish, space or comma separated (default: all)"
+        required: false
+        default: "all"
 
 # One release run at a time; a scheduled run that arrives meanwhile waits and
 # then finds the release already published.
@@ -59,6 +59,7 @@ jobs:
       build: ${{ steps.check.outputs.build }}
       upstream_tag: ${{ steps.check.outputs.upstream_tag }}
       version: ${{ steps.check.outputs.version }}
+      linux: ${{ steps.targets.outputs.linux }}
       macos: ${{ steps.targets.outputs.macos }}
       smoke: ${{ steps.targets.outputs.smoke }}
     steps:
@@ -89,13 +90,25 @@ jobs:
         id: targets
         env:
           # Scheduled runs have no inputs: they build every target.
-          MACOS: ${{ github.event_name != 'workflow_dispatch' || inputs.macos }}
+          TARGETS: ${{ inputs.targets || 'all' }}
         run: |
-          linux='{"target":"x86_64-unknown-linux-musl","runner":"ubuntu-24.04"},{"target":"aarch64-unknown-linux-musl","runner":"ubuntu-24.04-arm"}'
-          macos='{"target":"aarch64-apple-darwin","runner":"macos-15"},{"target":"x86_64-apple-darwin","runner":"macos-15-intel"}'
-          if [[ "$MACOS" == true ]]; then smoke="[${linux},${macos}]"; else smoke="[${linux}]"; fi
-          echo "macos=${MACOS}" >>"$GITHUB_OUTPUT"
-          echo "smoke=${smoke}" >>"$GITHUB_OUTPUT"
+          # runner: where the package is built (Linux) and smoke-tested.
+          all='[
+            {"target": "x86_64-unknown-linux-musl", "runner": "ubuntu-24.04", "os": "linux"},
+            {"target": "aarch64-unknown-linux-musl", "runner": "ubuntu-24.04-arm", "os": "linux"},
+            {"target": "aarch64-apple-darwin", "runner": "macos-15", "os": "macos"},
+            {"target": "x86_64-apple-darwin", "runner": "macos-15-intel", "os": "macos"}]'
+          chosen="$(jq -c --arg want "$TARGETS" '
+            ($want | [splits("[ ,]+")] | map(select(. != ""))) as $w
+            | if $w == ["all"] then .
+              elif ($w - map(.target)) != [] then error("unknown targets: \($w - map(.target))")
+              else map(select(.target as $t | $w | index($t)))
+              end' <<<"$all")"
+          {
+            echo "linux=$(jq -c '[.[] | select(.os == "linux") | {target, runner}]' <<<"$chosen")"
+            echo "macos=$(jq -c '[.[] | select(.os == "macos") | .target]' <<<"$chosen")"
+            echo "smoke=$(jq -c '[.[] | {target, runner}]' <<<"$chosen")"
+          } | tee -a "$GITHUB_OUTPUT"
       - name: Check that the patches apply
         if: steps.check.outputs.build == 'true'
         run: scripts/prepare-source.sh --skip-lock "${{ steps.check.outputs.upstream_tag }}" "$SOURCE_DIR"
@@ -130,19 +143,15 @@ jobs:
 
   build-linux:
     needs: plan
-    if: needs.plan.outputs.build == 'true'
+    if: needs.plan.outputs.build == 'true' && needs.plan.outputs.linux != '[]'
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # musl, as upstream releases; each architecture builds natively.
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
+        # musl, as upstream releases; each architecture builds natively.
+        include: ${{ fromJSON(needs.plan.outputs.linux) }}
     env:
       TARGET: ${{ matrix.target }}
     steps:
@@ -214,7 +223,7 @@ jobs:
     # Runners are free for a public repository: build alongside the tests, which
     # still gate the publish job.
     needs: plan
-    if: needs.plan.outputs.build == 'true' && needs.plan.outputs.macos == 'true'
+    if: needs.plan.outputs.build == 'true' && needs.plan.outputs.macos != '[]'
     name: build (${{ matrix.target }})
     runs-on: macos-15
     # Upstream builds this in ~45 min on 6-core runners; standard runners have 3.
@@ -223,7 +232,7 @@ jobs:
       fail-fast: false
       matrix:
         # Both built on Apple silicon; x86_64 is cross-compiled, as upstream.
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+        target: ${{ fromJSON(needs.plan.outputs.macos) }}
     env:
       TARGET: ${{ matrix.target }}
     steps:
@@ -253,7 +262,8 @@ jobs:
 
   smoke:
     needs: [plan, build-linux, build-macos]
-    # build-macos is skipped in a Linux-only run; any failure still stops here.
+    # A build job is skipped when none of its targets was chosen; any failure
+    # still stops here.
     if: ${{ !cancelled() && !failure() && needs.plan.outputs.build == 'true' }}
     name: smoke (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}

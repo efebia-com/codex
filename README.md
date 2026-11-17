@@ -142,8 +142,8 @@ and an issue labelled `release-failure` names the failed step with the end of
 its log. While that issue is open the scheduled check does not retry the same
 upstream version; close it after fixing the cause, or run the workflow by hand.
 Running it by hand with `force` publishes a new revision of an upstream version
-that is already published; with `macos` off it builds and publishes the Linux
-packages only, and a later forced run adds the macOS ones.
+that is already published; `targets` (e.g. `x86_64-unknown-linux-musl`) limits
+it to some packages, and a later forced run adds the others.
 
 ## Build locally
 
