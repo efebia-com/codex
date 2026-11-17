@@ -45,7 +45,7 @@ env:
 
 jobs:
   plan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -256,7 +256,7 @@ jobs:
 
   publish:
     needs: [plan, test, build-linux, build-macos, smoke]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
@@ -282,7 +282,7 @@ jobs:
     # Only for runs that knew what they were building: a transient failure of
     # the check itself is retried by the next scheduled run.
     if: failure() && needs.plan.outputs.upstream_tag != ''
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
