@@ -27,7 +27,7 @@ on:
         type: boolean
         default: false
       targets:
-        description: "Targets to build and publish, space or comma separated (default: all)"
+        description: "Targets to build and publish, space or comma separated (default: all; only x86_64-unknown-linux-musl)"
         required: false
         default: "all"
 
@@ -60,7 +60,6 @@ jobs:
       upstream_tag: ${{ steps.check.outputs.upstream_tag }}
       version: ${{ steps.check.outputs.version }}
       linux: ${{ steps.targets.outputs.linux }}
-      macos: ${{ steps.targets.outputs.macos }}
       smoke: ${{ steps.targets.outputs.smoke }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -89,15 +88,13 @@ jobs:
       - name: Choose the targets
         id: targets
         env:
-          # Scheduled runs have no inputs: they build every target.
+          # Scheduled runs have no inputs: they build every target. Releases are for
+          # Linux x86_64 only.
           TARGETS: ${{ inputs.targets || 'all' }}
         run: |
           # runner: where the package is built (Linux) and smoke-tested.
           all='[
-            {"target": "x86_64-unknown-linux-musl", "runner": "ubuntu-24.04", "os": "linux"},
-            {"target": "aarch64-unknown-linux-musl", "runner": "ubuntu-24.04-arm", "os": "linux"},
-            {"target": "aarch64-apple-darwin", "runner": "macos-15", "os": "macos"},
-            {"target": "x86_64-apple-darwin", "runner": "macos-15-intel", "os": "macos"}]'
+            {"target": "x86_64-unknown-linux-musl", "runner": "ubuntu-24.04", "os": "linux"}]'
           chosen="$(jq -c --arg want "$TARGETS" '
             ($want | [splits("[ ,]+")] | map(select(. != ""))) as $w
             | if $w == ["all"] then .
@@ -106,7 +103,6 @@ jobs:
               end' <<<"$all")"
           {
             echo "linux=$(jq -c '[.[] | select(.os == "linux") | {target, runner}]' <<<"$chosen")"
-            echo "macos=$(jq -c '[.[] | select(.os == "macos") | .target]' <<<"$chosen")"
             echo "smoke=$(jq -c '[.[] | {target, runner}]' <<<"$chosen")"
           } | tee -a "$GITHUB_OUTPUT"
       - name: Check that the patches apply
@@ -150,7 +146,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # musl, as upstream releases; each architecture builds natively.
+        # musl, as upstream releases, built natively.
         include: ${{ fromJSON(needs.plan.outputs.linux) }}
     env:
       TARGET: ${{ matrix.target }}
@@ -193,8 +189,8 @@ jobs:
           var="AWS_LC_SYS_NO_JITTER_ENTROPY_${TARGET//-/_}"
           echo "${var}=1" >>"$GITHUB_ENV"
       - name: Add swap for the release links
-        # Both runners have 16 GB and were shut down while building the last,
-        # largest crates. The x86_64 one has a scratch disk on /mnt; arm64 has none.
+        # The runner has 16 GB and was shut down while building the last, largest
+        # crates. The swap file goes on the scratch disk on /mnt when there is one.
         run: |
           swapfile=/mnt/swapfile
           if ! mountpoint -q /mnt; then swapfile=/swapfile.release; fi
@@ -219,50 +215,9 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  build-macos:
-    # Runners are free for a public repository: build alongside the tests, which
-    # still gate the publish job.
-    needs: plan
-    if: needs.plan.outputs.build == 'true' && needs.plan.outputs.macos != '[]'
-    name: build (${{ matrix.target }})
-    runs-on: macos-15
-    # Upstream builds this in ~45 min on 6-core runners; standard runners have 3.
-    timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        # Both built on Apple silicon; x86_64 is cross-compiled, as upstream.
-        target: ${{ fromJSON(needs.plan.outputs.macos) }}
-    env:
-      TARGET: ${{ matrix.target }}
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/macos-bash
-      - uses: ./.github/actions/setup-rust
-        with:
-          upstream-tag: ${{ needs.plan.outputs.upstream_tag }}
-          target: ${{ matrix.target }}
-      - name: Prepare source
-        run: scripts/prepare-source.sh "${{ needs.plan.outputs.upstream_tag }}" "$SOURCE_DIR"
-      - name: Fetch the Codex-built V8 (checksums verified)
-        run: scripts/fetch-v8.sh --source "$SOURCE_DIR" --target "$TARGET" --cache "${RUNNER_TEMP}/rusty_v8" >>"$GITHUB_ENV"
-      - name: Build
-        run: scripts/build.sh --release --target "$TARGET" --source "$SOURCE_DIR" --out "${RUNNER_TEMP}/package"
-      - name: Package
-        run: |
-          scripts/package.sh --package "${RUNNER_TEMP}/package" --source "$SOURCE_DIR" \
-            --version "${{ needs.plan.outputs.version }}" --target "$TARGET" --out-dir dist
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: codex-${{ matrix.target }}
-          path: dist/*
-          if-no-files-found: error
-
   smoke:
-    needs: [plan, build-linux, build-macos]
-    # A build job is skipped when none of its targets was chosen; any failure
+    needs: [plan, build-linux]
+    # The build job is skipped when none of its targets was chosen; any failure
     # still stops here.
     if: ${{ !cancelled() && !failure() && needs.plan.outputs.build == 'true' }}
     name: smoke (${{ matrix.target }})
@@ -277,8 +232,6 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - if: runner.os == 'macOS'
-        uses: ./.github/actions/macos-bash
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
@@ -290,7 +243,7 @@ jobs:
         run: scripts/smoke.sh --archive-dir dist --version "${{ needs.plan.outputs.version }}"
 
   publish:
-    needs: [plan, test, build-linux, build-macos, smoke]
+    needs: [plan, test, build-linux, smoke]
     if: ${{ !cancelled() && !failure() && needs.plan.outputs.build == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -314,7 +267,7 @@ jobs:
             "${{ needs.plan.outputs.upstream_tag }}" dist "$GITHUB_SHA"
 
   report-failure:
-    needs: [plan, test, build-linux, build-macos, smoke, publish]
+    needs: [plan, test, build-linux, smoke, publish]
     # Only for runs that knew what they were building: a transient failure of
     # the check itself is retried by the next scheduled run.
     if: failure() && needs.plan.outputs.upstream_tag != ''

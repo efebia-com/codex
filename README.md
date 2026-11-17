@@ -130,9 +130,8 @@ that is not published here yet, it:
 1. applies the patch series to the upstream tag; a conflict stops the run
    before anything is built;
 2. runs the extension tests (Linux);
-3. builds `codex` for `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
-   `aarch64-apple-darwin` and `x86_64-apple-darwin`, with the build settings of
-   the upstream release workflow;
+3. builds `codex` for `x86_64-unknown-linux-musl`, the only published
+   platform, with the build settings of the upstream release workflow;
 4. installs each package with `install.sh` on its own platform and runs the
    smoke tests in [`tests/e2e/`](tests/e2e);
 5. publishes the release only if every step passed.
