@@ -1,0 +1,1344 @@
+From 17cc2f03f149f3b8c8d4c007b4d85a9941e619b4 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 19:47:40 +0100
+Subject: [PATCH 1/3] rmcp-client: observe connections and hold stdio
+ relaunches
+
+Number a client's connections as their initialize responses arrive, and
+tag each subscribed custom notification with the connection that read it.
+Add the client's current experimental capabilities to every initialize,
+those of recovered connections included, and count notifications dropped
+by full subscriber queues.
+
+Expose the connection's phase, generation and process ID, with a revision
+that changes on every transition, including the exit of a connection that
+is not recovered. While launches are held, recovery starts no replacement
+and stops one that is still initializing; held time spends none of the
+restart budget.
+---
+ codex-rs/rmcp-client/src/connection_status.rs | 141 +++++++++++++
+ .../rmcp-client/src/custom_notifications.rs   | 184 +++++++++++++++--
+ .../src/custom_notifications_tests.rs         | 107 +++++++++-
+ codex-rs/rmcp-client/src/lib.rs               |   3 +
+ codex-rs/rmcp-client/src/rmcp_client.rs       |  59 ++++--
+ codex-rs/rmcp-client/src/stdio_restart.rs     | 188 +++++++++++++++++-
+ .../rmcp-client/src/stdio_server_launcher.rs  |  13 +-
+ codex-rs/rmcp-client/tests/stdio_restart.rs   | 161 ++++++++++++++-
+ 8 files changed, 807 insertions(+), 49 deletions(-)
+ create mode 100644 codex-rs/rmcp-client/src/connection_status.rs
+
+diff --git a/codex-rs/rmcp-client/src/connection_status.rs b/codex-rs/rmcp-client/src/connection_status.rs
+new file mode 100644
+index 0000000000..a6e3ab04e4
+--- /dev/null
++++ b/codex-rs/rmcp-client/src/connection_status.rs
+@@ -0,0 +1,141 @@
++//! Observable lifecycle of a client's connection: phase, generation and server process.
++
++use std::collections::BTreeMap;
++use std::sync::Arc;
++use std::sync::PoisonError;
++use std::sync::atomic::AtomicU64;
++
++use rmcp::model::JsonObject;
++use tokio::sync::watch;
++
++use super::ClientState;
++use super::RmcpClient;
++
++/// Lifecycle phase of a client's connection.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ConnectionPhase {
++    /// The first connection, or a replacement, is being launched and initialized.
++    Launching,
++    /// A connection is installed and open.
++    Ready,
++    /// The connection ended and a replacement is pending.
++    Recovering,
++    /// The connection ended and launches are held; see [`RmcpClient::hold_launches`].
++    Held,
++    /// The connection ended and recovery gave up.
++    GaveUp,
++    /// The connection ended without recovery, or the client shut down.
++    Closed,
++}
++
++/// A snapshot of a client's connection.
++#[derive(Clone, Debug, PartialEq)]
++pub struct ConnectionStatus {
++    /// Number of the installed connection, 0 before the first handshake succeeds. Connections
++    /// are numbered as their `initialize` responses arrive.
++    pub generation: u64,
++    /// Local OS process ID of the latest stdio server process, if any.
++    pub pid: Option<u32>,
++    pub phase: ConnectionPhase,
++    /// Experimental client capabilities added to the installed connection's `initialize`.
++    pub initialize_experimental: BTreeMap<String, JsonObject>,
++    /// Experimental capabilities declared by the installed connection's server.
++    pub server_experimental: Vec<String>,
++}
++
++impl RmcpClient {
++    /// A revision that changes whenever the connection's phase or generation may have changed.
++    pub fn connection_changes(&self) -> watch::Receiver<u64> {
++        self.connection_changes.subscribe()
++    }
++
++    /// The connection's current phase, generation and process.
++    pub async fn connection_status(&self) -> ConnectionStatus {
++        let installed = self
++            .ready_connection
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .clone()
++            .unwrap_or_default();
++        let phase = self.connection_phase().await;
++        let pid = match &self.stdio_process {
++            Some(slot) => slot.lock().await.process().pid(),
++            None => None,
++        };
++        ConnectionStatus {
++            generation: installed.generation,
++            pid,
++            phase,
++            initialize_experimental: installed.sent,
++            server_experimental: installed.declared,
++        }
++    }
++
++    /// Whether an initialized connection ended and its replacement is pending, launching or
++    /// held.
++    pub async fn is_recovering(&self) -> bool {
++        let state = self.state.lock().await;
++        let (ClientState::Ready { service, .. }, Some(restart)) = (&*state, &self.stdio_restart)
++        else {
++            return false;
++        };
++        let ended = service.is_closed() || service.peer().is_transport_closed();
++        matches!(
++            restart.phase(ended),
++            ConnectionPhase::Recovering | ConnectionPhase::Launching | ConnectionPhase::Held
++        )
++    }
++
++    /// Adds `value` under `key` to the experimental client capabilities of every later
++    /// `initialize`, those of recovered connections included, or stops adding it.
++    pub fn set_initialize_experimental(&self, key: impl Into<String>, value: Option<JsonObject>) {
++        self.custom_notifications
++            .set_initialize_experimental(key.into(), value);
++    }
++
++    /// Numbers this client's connections from `generations`, which the clients that precede
++    /// or replace it can share. Call before `initialize`.
++    pub fn share_connection_generations(&self, generations: Arc<AtomicU64>) {
++        self.custom_notifications.share_generations(generations);
++    }
++
++    /// While held, recovery launches no replacement for an ended stdio connection, and stops a
++    /// replacement that is still initializing. Held time spends none of the restart budget.
++    /// Clients without stdio recovery ignore this.
++    pub fn hold_launches(&self, hold: bool) {
++        if let Some(restart) = &self.stdio_restart {
++            restart.hold(hold);
++        }
++    }
++
++    pub(super) fn connection_changed(&self) {
++        self.connection_changes
++            .send_modify(|revision| *revision = revision.wrapping_add(1));
++    }
++
++    /// Records the connection that a successful handshake just installed.
++    pub(super) fn connection_installed(&self) {
++        *self
++            .ready_connection
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner) =
++            self.custom_notifications.latest_connection();
++        self.connection_changed();
++    }
++
++    async fn connection_phase(&self) -> ConnectionPhase {
++        let state = self.state.lock().await;
++        match &*state {
++            ClientState::Connecting { .. } => ConnectionPhase::Launching,
++            ClientState::Closed => ConnectionPhase::Closed,
++            ClientState::Ready { service, .. } => {
++                let ended = service.is_closed() || service.peer().is_transport_closed();
++                match &self.stdio_restart {
++                    Some(restart) => restart.phase(ended),
++                    None if ended => ConnectionPhase::Closed,
++                    None => ConnectionPhase::Ready,
++                }
++            }
++        }
++    }
++}
+diff --git a/codex-rs/rmcp-client/src/custom_notifications.rs b/codex-rs/rmcp-client/src/custom_notifications.rs
+index f7078d83b3..77c05f3fb3 100644
+--- a/codex-rs/rmcp-client/src/custom_notifications.rs
++++ b/codex-rs/rmcp-client/src/custom_notifications.rs
+@@ -4,14 +4,22 @@
+ //! The SDK handles each server notification in a task of its own, so notifications sent back to
+ //! back can reach the handler in any order. Subscribed notifications are therefore taken from the
+ //! transport, in the order the server sent them, before the SDK dispatches anything.
++//!
++//! The same wrapper numbers the connections of a client as their `initialize` responses arrive,
++//! tags each subscribed notification with the number of the connection that read it, and adds
++//! the client's current experimental capabilities to every `initialize` it sends.
+ 
++use std::collections::BTreeMap;
+ use std::future::Future;
+ use std::sync::Arc;
+ use std::sync::Mutex;
+ use std::sync::PoisonError;
++use std::sync::atomic::AtomicU64;
++use std::sync::atomic::Ordering;
+ 
+ use rmcp::model::ClientRequest;
+ use rmcp::model::CustomNotification;
++use rmcp::model::JsonObject;
+ use rmcp::model::JsonRpcMessage;
+ use rmcp::model::RequestId;
+ use rmcp::model::ServerNotification;
+@@ -26,14 +34,44 @@ use tokio::sync::mpsc::error::TrySendError;
+ use tracing::debug;
+ use tracing::warn;
+ 
+-/// One subscriber: notification method, required capability and destination.
+-type Tap = (String, String, mpsc::Sender<CustomNotification>);
++/// The connection that read a subscribed notification, found in the notification's
++/// `extensions`. Connections are numbered from 1 as their `initialize` responses arrive.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct ConnectionGeneration(pub u64);
++
++/// One subscriber: notification method, required capability, destination and the counter of
++/// notifications dropped because the destination was full.
++struct Tap {
++    method: String,
++    capability: String,
++    sender: mpsc::Sender<CustomNotification>,
++    dropped: Arc<AtomicU64>,
++}
++
++/// What one initialized connection carried and declared.
++#[derive(Clone, Debug, Default, PartialEq)]
++pub(crate) struct InitializedConnection {
++    pub(crate) generation: u64,
++    /// Experimental client capabilities added to the connection's `initialize`.
++    pub(crate) sent: BTreeMap<String, JsonObject>,
++    /// Experimental capabilities the server declared.
++    pub(crate) declared: Vec<String>,
++}
++
++#[derive(Default)]
++struct Connections {
++    /// Experimental client capabilities to add to every later `initialize`.
++    initialize_experimental: BTreeMap<String, JsonObject>,
++    generations: Arc<AtomicU64>,
++    latest: Option<InitializedConnection>,
++}
+ 
+ /// Subscribers by notification method. Clones share one set, so a subscription made before
+ /// `initialize` also covers every later connection of the same client.
+ #[derive(Clone, Default)]
+ pub(crate) struct CustomNotificationTaps {
+     taps: Arc<Mutex<Vec<Tap>>>,
++    connections: Arc<Mutex<Connections>>,
+ }
+ 
+ impl CustomNotificationTaps {
+@@ -43,14 +81,88 @@ impl CustomNotificationTaps {
+         method: String,
+         capability: String,
+         capacity: usize,
++    ) -> mpsc::Receiver<CustomNotification> {
++        self.subscribe_counting(method, capability, capacity, Arc::default())
++    }
++
++    /// Like [`Self::subscribe`], also counting in `dropped` the notifications dropped because
++    /// the subscriber's queue was full.
++    pub(crate) fn subscribe_counting(
++        &self,
++        method: String,
++        capability: String,
++        capacity: usize,
++        dropped: Arc<AtomicU64>,
+     ) -> mpsc::Receiver<CustomNotification> {
+         let (sender, receiver) = mpsc::channel(capacity.max(1));
+         let mut taps = self.taps.lock().unwrap_or_else(PoisonError::into_inner);
+-        taps.retain(|(subscribed, _, _)| *subscribed != method);
+-        taps.push((method, capability, sender));
++        taps.retain(|tap| tap.method != method);
++        taps.push(Tap {
++            method,
++            capability,
++            sender,
++            dropped,
++        });
+         receiver
+     }
+ 
++    /// Adds `value` under `key` to the experimental capabilities of every later `initialize`,
++    /// or stops adding it.
++    pub(crate) fn set_initialize_experimental(&self, key: String, value: Option<JsonObject>) {
++        let mut connections = self
++            .connections
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner);
++        match value {
++            Some(value) => {
++                connections.initialize_experimental.insert(key, value);
++            }
++            None => {
++                connections.initialize_experimental.remove(&key);
++            }
++        }
++    }
++
++    /// Numbers later connections from `generations`, which other clients may share.
++    pub(crate) fn share_generations(&self, generations: Arc<AtomicU64>) {
++        self.connections
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .generations = generations;
++    }
++
++    /// The most recently initialized connection.
++    pub(crate) fn latest_connection(&self) -> Option<InitializedConnection> {
++        self.connections
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .latest
++            .clone()
++    }
++
++    fn initialize_experimental(&self) -> BTreeMap<String, JsonObject> {
++        self.connections
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .initialize_experimental
++            .clone()
++    }
++
++    /// Numbers a connection whose `initialize` succeeded and records it as the latest.
++    fn initialized(&self, sent: BTreeMap<String, JsonObject>, declared: Vec<String>) -> u64 {
++        let mut connections = self
++            .connections
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner);
++        let generation = connections.generations.fetch_add(1, Ordering::AcqRel) + 1;
++        connections.latest = Some(InitializedConnection {
++            generation,
++            sent,
++            declared,
++        });
++        generation
++    }
++
+     /// Wraps `transport` so that subscribed notifications go to their subscribers as they are
+     /// received, and never reach the SDK. Every other message passes through unchanged.
+     pub(crate) fn capture<T, E, A>(
+@@ -66,24 +178,37 @@ impl CustomNotificationTaps {
+             taps: self.clone(),
+             initialize_id: None,
+             declared: Vec::new(),
++            sent: BTreeMap::new(),
++            generation: 0,
+         }
+     }
+ 
+-    /// Whether `notification` has a subscriber. Such a notification is consumed; when the
+-    /// subscriber's queue is full it is dropped.
+-    pub(crate) fn offer(&self, notification: &CustomNotification, declared: &[String]) -> bool {
++    /// Whether `notification`, read by connection `generation`, has a subscriber. Such a
++    /// notification is consumed; when the subscriber's queue is full it is dropped.
++    pub(crate) fn offer(
++        &self,
++        notification: &CustomNotification,
++        declared: &[String],
++        generation: u64,
++    ) -> bool {
+         let taps = self.taps.lock().unwrap_or_else(PoisonError::into_inner);
+-        let Some((_, _, sender)) = taps.iter().find(|(method, capability, _)| {
+-            *method == notification.method && declared.contains(capability)
+-        }) else {
++        let Some(tap) = taps
++            .iter()
++            .find(|tap| tap.method == notification.method && declared.contains(&tap.capability))
++        else {
+             return false;
+         };
+-        match sender.try_send(notification.clone()) {
++        let mut tagged = notification.clone();
++        tagged.extensions.insert(ConnectionGeneration(generation));
++        match tap.sender.try_send(tagged) {
+             Ok(()) => {}
+-            Err(TrySendError::Full(_)) => warn!(
+-                method = %notification.method,
+-                "dropping MCP server notification: its subscriber is not keeping up"
+-            ),
++            Err(TrySendError::Full(_)) => {
++                tap.dropped.fetch_add(1, Ordering::Relaxed);
++                warn!(
++                    method = %notification.method,
++                    "dropping MCP server notification: its subscriber is not keeping up"
++                );
++            }
+             Err(TrySendError::Closed(_)) => debug!(
+                 method = %notification.method,
+                 "dropping MCP server notification: its subscriber is gone"
+@@ -98,6 +223,10 @@ struct CustomNotificationTransport<T> {
+     taps: CustomNotificationTaps,
+     initialize_id: Option<RequestId>,
+     declared: Vec<String>,
++    /// Experimental capabilities added to this connection's `initialize`.
++    sent: BTreeMap<String, JsonObject>,
++    /// This connection's number, once its `initialize` succeeded.
++    generation: u64,
+ }
+ 
+ impl<T: Transport<RoleClient> + 'static> Transport<RoleClient> for CustomNotificationTransport<T> {
+@@ -105,13 +234,25 @@ impl<T: Transport<RoleClient> + 'static> Transport<RoleClient> for CustomNotific
+ 
+     fn send(
+         &mut self,
+-        message: TxJsonRpcMessage<RoleClient>,
++        mut message: TxJsonRpcMessage<RoleClient>,
+     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+-        if let JsonRpcMessage::Request(request) = &message
+-            && matches!(request.request, ClientRequest::InitializeRequest(_))
++        if let JsonRpcMessage::Request(request) = &mut message
++            && let ClientRequest::InitializeRequest(initialize) = &mut request.request
+         {
+             self.initialize_id = Some(request.id.clone());
+             self.declared.clear();
++            // Read at send time, so a replacement connection carries the current values.
++            self.sent = self.taps.initialize_experimental();
++            if !self.sent.is_empty() {
++                let experimental = initialize
++                    .params
++                    .capabilities
++                    .experimental
++                    .get_or_insert_default();
++                for (key, value) in &self.sent {
++                    experimental.insert(key.clone(), value.clone());
++                }
++            }
+         }
+         self.inner.send(message)
+     }
+@@ -132,11 +273,16 @@ impl<T: Transport<RoleClient> + 'static> Transport<RoleClient> for CustomNotific
+                         .as_ref()
+                         .map(|experimental| experimental.keys().cloned().collect())
+                         .unwrap_or_default();
++                    self.generation = self
++                        .taps
++                        .initialized(self.sent.clone(), self.declared.clone());
+                 }
+             }
+             if let JsonRpcMessage::Notification(envelope) = &message
+                 && let ServerNotification::CustomNotification(notification) = &envelope.notification
+-                && self.taps.offer(notification, &self.declared)
++                && self
++                    .taps
++                    .offer(notification, &self.declared, self.generation)
+             {
+                 continue;
+             }
+diff --git a/codex-rs/rmcp-client/src/custom_notifications_tests.rs b/codex-rs/rmcp-client/src/custom_notifications_tests.rs
+index 8725f2730e..5c34d1bf69 100644
+--- a/codex-rs/rmcp-client/src/custom_notifications_tests.rs
++++ b/codex-rs/rmcp-client/src/custom_notifications_tests.rs
+@@ -1,8 +1,12 @@
+ use std::collections::VecDeque;
+ use std::future::Future;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::sync::atomic::AtomicU64;
+ 
+ use pretty_assertions::assert_eq;
+ use rmcp::model::CustomNotification;
++use rmcp::model::JsonObject;
+ use rmcp::model::JsonRpcMessage;
+ use rmcp::model::ServerNotification;
+ use rmcp::service::RoleClient;
+@@ -12,6 +16,7 @@ use rmcp::transport::Transport;
+ use serde_json::Value;
+ use serde_json::json;
+ 
++use super::ConnectionGeneration;
+ use super::CustomNotificationTaps;
+ 
+ const EVENT: &str = "notifications/example/event";
+@@ -102,6 +107,94 @@ async fn each_connection_requires_its_own_declared_capability() -> anyhow::Resul
+     Ok(())
+ }
+ 
++/// Records what the client sends, and receives like [`Scripted`].
++struct Recording {
++    sent: Arc<Mutex<Vec<Value>>>,
++    script: Scripted,
++}
++
++impl Transport<RoleClient> for Recording {
++    type Error = std::io::Error;
++
++    fn send(
++        &mut self,
++        message: TxJsonRpcMessage<RoleClient>,
++    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
++        let recorded = serde_json::to_value(&message)
++            .map(|value| self.sent.lock().expect("sent messages").push(value))
++            .map_err(std::io::Error::other);
++        std::future::ready(recorded)
++    }
++
++    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
++        self.script.0.pop_front()
++    }
++
++    async fn close(&mut self) -> Result<(), Self::Error> {
++        Ok(())
++    }
++}
++
++fn flag(closed: bool) -> JsonObject {
++    json!({ "closed": closed })
++        .as_object()
++        .cloned()
++        .expect("flag object")
++}
++
++#[tokio::test]
++async fn initialize_carries_the_current_flags_and_connections_are_numbered() -> anyhow::Result<()> {
++    let taps = CustomNotificationTaps::default();
++    let mut receiver = taps.subscribe(EVENT.to_string(), CAPABILITY.to_string(), 4);
++    taps.share_generations(Arc::new(AtomicU64::new(41)));
++    for (sent_flag, generation) in [(Some(true), 42), (Some(false), 43), (None, 44)] {
++        taps.set_initialize_experimental("example/flag".to_string(), sent_flag.map(flag));
++        let sent = Arc::new(Mutex::new(Vec::new()));
++        let mut transport = taps.capture(Recording {
++            sent: Arc::clone(&sent),
++            script: scripted(true, vec![notification(EVENT, generation)])?,
++        });
++        initialize_transport(&mut transport).await?;
++        assert!(transport.receive().await.is_none());
++
++        let initialize = sent.lock().expect("sent messages")[0].clone();
++        let carried = &initialize["params"]["capabilities"]["experimental"]["example/flag"];
++        match sent_flag {
++            Some(closed) => assert_eq!(carried, &json!({ "closed": closed })),
++            None => assert_eq!(carried, &Value::Null),
++        }
++        let delivered = receiver.try_recv()?;
++        assert_eq!(
++            delivered.extensions.get::<ConnectionGeneration>(),
++            Some(&ConnectionGeneration(generation))
++        );
++        let latest = taps.latest_connection().expect("latest connection");
++        assert_eq!(latest.generation, generation);
++        assert_eq!(
++            latest.sent.get("example/flag"),
++            sent_flag.map(flag).as_ref()
++        );
++        assert_eq!(latest.declared, vec![CAPABILITY.to_string()]);
++    }
++    Ok(())
++}
++
++#[test]
++fn full_queue_drops_are_counted() {
++    let taps = CustomNotificationTaps::default();
++    let dropped = Arc::new(AtomicU64::new(0));
++    let _receiver = taps.subscribe_counting(
++        EVENT.to_string(),
++        CAPABILITY.to_string(),
++        1,
++        Arc::clone(&dropped),
++    );
++    for n in 1..=3 {
++        assert!(taps.offer(&notification(EVENT, n), &[CAPABILITY.to_string()], 0));
++    }
++    assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 2);
++}
++
+ #[tokio::test]
+ async fn notification_before_initialize_is_not_claimed() {
+     let taps = CustomNotificationTaps::default();
+@@ -167,9 +260,9 @@ async fn subscribed_method_is_delivered_in_order_and_others_pass_through() {
+     let taps = CustomNotificationTaps::default();
+     let mut receiver = taps.subscribe(EVENT.to_string(), CAPABILITY.to_string(), 4);
+ 
+-    assert!(taps.offer(&notification(EVENT, 1), &[CAPABILITY.to_string()]));
+-    assert!(taps.offer(&notification(EVENT, 2), &[CAPABILITY.to_string()]));
+-    assert!(!taps.offer(&notification(OTHER, 3), &[CAPABILITY.to_string()]));
++    assert!(taps.offer(&notification(EVENT, 1), &[CAPABILITY.to_string()], 0));
++    assert!(taps.offer(&notification(EVENT, 2), &[CAPABILITY.to_string()], 0));
++    assert!(!taps.offer(&notification(OTHER, 3), &[CAPABILITY.to_string()], 0));
+ 
+     let first = receiver.recv().await.expect("first notification");
+     let second = receiver.recv().await.expect("second notification");
+@@ -183,8 +276,8 @@ async fn full_queue_drops_new_notifications_but_still_claims_them() {
+     let taps = CustomNotificationTaps::default();
+     let mut receiver = taps.subscribe(EVENT.to_string(), CAPABILITY.to_string(), 1);
+ 
+-    assert!(taps.offer(&notification(EVENT, 1), &[CAPABILITY.to_string()]));
+-    assert!(taps.offer(&notification(EVENT, 2), &[CAPABILITY.to_string()]));
++    assert!(taps.offer(&notification(EVENT, 1), &[CAPABILITY.to_string()], 0));
++    assert!(taps.offer(&notification(EVENT, 2), &[CAPABILITY.to_string()], 0));
+ 
+     let kept = receiver.recv().await.expect("kept notification");
+     assert_eq!(kept.params, Some(json!({ "n": 1 })));
+@@ -196,7 +289,7 @@ async fn closed_subscriber_still_claims_its_method() {
+     let taps = CustomNotificationTaps::default();
+     drop(taps.subscribe(EVENT.to_string(), CAPABILITY.to_string(), 1));
+ 
+-    assert!(taps.offer(&notification(EVENT, 1), &[CAPABILITY.to_string()]));
++    assert!(taps.offer(&notification(EVENT, 1), &[CAPABILITY.to_string()], 0));
+ }
+ 
+ #[tokio::test]
+@@ -207,7 +300,7 @@ async fn later_subscription_replaces_the_earlier_one() {
+         .clone()
+         .subscribe(EVENT.to_string(), CAPABILITY.to_string(), 1);
+ 
+-    assert!(taps.offer(&notification(EVENT, 1), &[CAPABILITY.to_string()]));
++    assert!(taps.offer(&notification(EVENT, 1), &[CAPABILITY.to_string()], 0));
+ 
+     assert!(first.recv().await.is_none());
+     let delivered = second.recv().await.expect("replacement subscriber");
+diff --git a/codex-rs/rmcp-client/src/lib.rs b/codex-rs/rmcp-client/src/lib.rs
+index 149a486585..60af5f6ef5 100644
+--- a/codex-rs/rmcp-client/src/lib.rs
++++ b/codex-rs/rmcp-client/src/lib.rs
+@@ -51,6 +51,7 @@ pub use auth_status::determine_streamable_http_auth_status;
+ pub use auth_status::determine_streamable_http_auth_status_from_credentials;
+ pub use auth_status::discover_streamable_http_oauth;
+ pub use codex_protocol::protocol::McpAuthStatus;
++pub use custom_notifications::ConnectionGeneration;
+ pub use ema_auth::EmaAuthTokenExchangeRequest;
+ pub use ema_auth::exchange_ema_auth_token;
+ pub use ema_auth_policy::EmaAuthFailure;
+@@ -112,6 +113,8 @@ pub use rmcp_client::RmcpClient;
+ pub use rmcp_client::SendElicitation;
+ pub use rmcp_client::StreamableHttpBearerToken;
+ pub use rmcp_client::ToolWithConnectorId;
++pub use rmcp_client::connection_status::ConnectionPhase;
++pub use rmcp_client::connection_status::ConnectionStatus;
+ pub use rmcp_client::stdio_restart::StdioRestartGuard;
+ pub use rmcp_client::stdio_restart::StdioRestartPolicy;
+ pub use service_error::is_retryable_transport_error;
+diff --git a/codex-rs/rmcp-client/src/rmcp_client.rs b/codex-rs/rmcp-client/src/rmcp_client.rs
+index 3e1166ff54..45fbca344c 100644
+--- a/codex-rs/rmcp-client/src/rmcp_client.rs
++++ b/codex-rs/rmcp-client/src/rmcp_client.rs
+@@ -113,6 +113,8 @@ use crate::tool_list_changes::track_tool_list_changes;
+ use crate::utils::build_default_headers;
+ use codex_config::types::OAuthCredentialsStoreMode;
+ 
++#[path = "connection_status.rs"]
++pub(crate) mod connection_status;
+ #[path = "stdio_handshake.rs"]
+ mod stdio_handshake;
+ #[path = "stdio_restart.rs"]
+@@ -429,6 +431,10 @@ pub struct RmcpClient {
+     tool_list_revision: Arc<AtomicU64>,
+     cancel_requests_on_drop: AtomicBool,
+     custom_notifications: CustomNotificationTaps,
++    /// Revision that changes with the connection's lifecycle; see [`Self::connection_changes`].
++    connection_changes: Arc<watch::Sender<u64>>,
++    /// The connection installed by the latest successful handshake.
++    ready_connection: StdMutex<Option<crate::custom_notifications::InitializedConnection>>,
+ }
+ 
+ impl RmcpClient {
+@@ -483,6 +489,23 @@ impl RmcpClient {
+             .subscribe(method.into(), capability.into(), capacity)
+     }
+ 
++    /// Like [`Self::subscribe_custom_notifications`], also counting in `dropped` the
++    /// notifications dropped because the receiver fell behind.
++    pub fn subscribe_custom_notifications_counting(
++        &self,
++        method: impl Into<String>,
++        capability: impl Into<String>,
++        capacity: usize,
++        dropped: Arc<AtomicU64>,
++    ) -> tokio::sync::mpsc::Receiver<CustomNotification> {
++        self.custom_notifications.subscribe_counting(
++            method.into(),
++            capability.into(),
++            capacity,
++            dropped,
++        )
++    }
++
+     pub async fn new_in_process_client(
+         factory: Arc<dyn InProcessTransportFactory>,
+     ) -> io::Result<Self> {
+@@ -506,6 +529,8 @@ impl RmcpClient {
+             tool_list_revision: Arc::default(),
+             cancel_requests_on_drop: AtomicBool::new(false),
+             custom_notifications: CustomNotificationTaps::default(),
++            connection_changes: Arc::new(watch::channel(0).0),
++            ready_connection: StdMutex::new(None),
+         })
+     }
+ 
+@@ -584,6 +609,8 @@ impl RmcpClient {
+             tool_list_revision: Arc::default(),
+             cancel_requests_on_drop: AtomicBool::new(false),
+             custom_notifications: CustomNotificationTaps::default(),
++            connection_changes: Arc::new(watch::channel(0).0),
++            ready_connection: StdMutex::new(None),
+         })
+     }
+ 
+@@ -695,6 +722,8 @@ impl RmcpClient {
+             tool_list_revision: Arc::default(),
+             cancel_requests_on_drop: AtomicBool::new(false),
+             custom_notifications: CustomNotificationTaps::default(),
++            connection_changes: Arc::new(watch::channel(0).0),
++            ready_connection: StdMutex::new(None),
+         })
+     }
+ 
+@@ -753,6 +782,7 @@ impl RmcpClient {
+         if let Some(restart) = &self.stdio_restart {
+             restart.mark_ready();
+         }
++        self.connection_installed();
+ 
+         if let Some(OAuthRuntime::Legacy(runtime)) = oauth_runtime
+             && let Err(error) = runtime.persist_if_needed().await
+@@ -1390,6 +1420,7 @@ impl RmcpClient {
+             let mut guard = self.state.lock().await;
+             std::mem::replace(&mut *guard, ClientState::Closed)
+         };
++        self.connection_changed();
+ 
+         let process = match &self.stdio_process {
+             Some(slot) => Some(slot.lock().await.close()),
+@@ -1655,18 +1686,21 @@ impl RmcpClient {
+                     .capture(OrderedByteTransport::new(transport)),
+                 Arc::clone(&self.tool_list_revision),
+             );
+-            if let Some(restart) = &self.stdio_restart {
+-                client_service()
+-                    .serve_with_lifecycle(
+-                        stdio_restart::watch_exit(transport, restart.watch_connection()),
+-                        lifecycle,
+-                    )
+-                    .boxed()
+-            } else {
+-                client_service()
+-                    .serve_with_lifecycle(transport, lifecycle)
+-                    .boxed()
+-            }
++            // Recovery watches the exit; observers learn of it either way.
++            let exit = match &self.stdio_restart {
++                Some(restart) => restart.watch_connection(),
++                None => tokio_util::sync::CancellationToken::new(),
++            };
++            client_service()
++                .serve_with_lifecycle(
++                    stdio_restart::watch_exit(
++                        transport,
++                        exit,
++                        Arc::clone(&self.connection_changes),
++                    ),
++                    lifecycle,
++                )
++                .boxed()
+         };
+         let mut discovery = None;
+         let (transport, oauth_runtime) = match pending_transport {
+@@ -2037,6 +2071,7 @@ impl RmcpClient {
+                 oauth: oauth_runtime.clone(),
+             };
+         }
++        self.connection_installed();
+ 
+         if let Some(OAuthRuntime::Legacy(runtime)) = oauth_runtime
+             && let Err(error) = runtime.persist_if_needed().await
+diff --git a/codex-rs/rmcp-client/src/stdio_restart.rs b/codex-rs/rmcp-client/src/stdio_restart.rs
+index 87c36360e4..cd30e67409 100644
+--- a/codex-rs/rmcp-client/src/stdio_restart.rs
++++ b/codex-rs/rmcp-client/src/stdio_restart.rs
+@@ -16,6 +16,7 @@ use rmcp::service::RunningService;
+ use rmcp::service::RxJsonRpcMessage;
+ use rmcp::service::TxJsonRpcMessage;
+ use rmcp::transport::Transport;
++use tokio::sync::watch;
+ use tokio::time::Instant;
+ use tokio_util::sync::CancellationToken;
+ use tokio_util::sync::DropGuard;
+@@ -26,6 +27,7 @@ use tracing::warn;
+ use super::ClientState;
+ use super::RmcpClient;
+ use super::TransportRecipe;
++use super::connection_status::ConnectionPhase;
+ use crate::elicitation_client_service::ElicitationClientService;
+ use crate::stdio_server_launcher::StdioTermination;
+ 
+@@ -58,6 +60,8 @@ pub(super) struct StdioRestart {
+     supervising: AtomicBool,
+     state: Mutex<RestartState>,
+     changed: tokio::sync::Notify,
++    /// Whether launches are held; see [`RmcpClient::hold_launches`].
++    hold: watch::Sender<bool>,
+ }
+ 
+ #[derive(Default)]
+@@ -67,6 +71,10 @@ struct RestartState {
+     gave_up: Option<String>,
+     exit: Option<CancellationToken>,
+     recovering: bool,
++    /// Recovery is waiting for launches to be released.
++    held: bool,
++    /// A replacement is being launched and initialized.
++    launching: bool,
+ }
+ 
+ impl StdioRestart {
+@@ -77,9 +85,64 @@ impl StdioRestart {
+             supervising: AtomicBool::new(false),
+             state: Mutex::new(RestartState::default()),
+             changed: tokio::sync::Notify::new(),
++            hold: watch::channel(false).0,
+         }
+     }
+ 
++    pub(super) fn hold(&self, hold: bool) {
++        self.hold.send_if_modified(|held| {
++            let changed = *held != hold;
++            *held = hold;
++            changed
++        });
++    }
++
++    /// The phase of a client whose state holds an installed service; `ended` tells whether
++    /// that service's transport has closed.
++    pub(super) fn phase(&self, ended: bool) -> ConnectionPhase {
++        if self.shutdown.is_cancelled() {
++            return ConnectionPhase::Closed;
++        }
++        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
++        if state.gave_up.is_some() {
++            ConnectionPhase::GaveUp
++        } else if state.held {
++            ConnectionPhase::Held
++        } else if state.launching {
++            ConnectionPhase::Launching
++        } else if ended
++            || state.recovering
++            || state
++                .exit
++                .as_ref()
++                .is_some_and(CancellationToken::is_cancelled)
++        {
++            ConnectionPhase::Recovering
++        } else {
++            ConnectionPhase::Ready
++        }
++    }
++
++    fn set_held(&self, held: bool) {
++        self.state
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .held = held;
++    }
++
++    fn set_launching(&self, launching: bool) {
++        self.state
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++            .launching = launching;
++    }
++
++    /// Returns an attempt that a hold interrupted before its replacement could serve.
++    fn refund_attempt(&self) {
++        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
++        state.attempts = state.attempts.saturating_sub(1);
++    }
++
+     pub(super) fn watch_connection(&self) -> CancellationToken {
+         let exit = CancellationToken::new();
+         self.state
+@@ -349,17 +412,31 @@ impl RmcpClient {
+             .clone()
+             .context("MCP client cannot recover before initialize succeeds")?;
+         restart.reset_after_stable_connection();
++        self.connection_changed();
++        let mut held = restart.hold.subscribe();
+         let mut last_error = anyhow!("stdio transport closed");
+-        while let Some((attempt, delay)) = restart.next_attempt() {
++        loop {
++            // Held time spends none of the budget.
++            self.wait_while_held(restart, &mut held).await?;
++            let Some((attempt, delay)) = restart.next_attempt() else {
++                break;
++            };
+             // Also clean up failed handshakes before attempting another launch.
+             self.stop_stdio_process()
+                 .await
+                 .map_err(|error| restart.cleanup_failed(error))?;
+-            tokio::select! {
++            let held_in_backoff = tokio::select! {
+                 biased;
+                 () = restart.shutdown.cancelled() => return Err(anyhow!("MCP client is shut down")),
+-                () = tokio::time::sleep(delay) => {}
++                () = hold_requested(&mut held) => true,
++                () = tokio::time::sleep(delay) => false,
++            };
++            if held_in_backoff {
++                restart.refund_attempt();
++                continue;
+             }
++            restart.set_launching(true);
++            self.connection_changed();
+             let connect = async {
+                 let transport = Self::create_pending_transport(&self.transport_recipe).await?;
+                 self.connect_pending_transport_with_initialize_retries(transport, &context)
+@@ -368,13 +445,24 @@ impl RmcpClient {
+             let result = tokio::select! {
+                 biased;
+                 () = restart.shutdown.cancelled() => return Err(anyhow!("MCP client is shut down")),
++                () = hold_requested(&mut held) => None,
+                 result = async {
+                     match context.timeout {
+                         Some(timeout) => tokio::time::timeout(timeout, connect).await
+                             .context("timed out restarting MCP server")?,
+                         None => connect.await,
+                     }
+-                } => result,
++                } => Some(result),
++            };
++            restart.set_launching(false);
++            let Some(result) = result else {
++                // A held replacement must not serve: stop it before it can accept anything.
++                restart.refund_attempt();
++                self.stop_stdio_process()
++                    .await
++                    .map_err(|error| restart.cleanup_failed(error))?;
++                self.connection_changed();
++                continue;
+             };
+             match result {
+                 Ok((service, oauth)) => {
+@@ -384,6 +472,7 @@ impl RmcpClient {
+                     }
+                     *state = ClientState::Ready { service, oauth };
+                     restart.mark_ready();
++                    self.connection_installed();
+                     self.tool_list_revision.fetch_add(1, Ordering::AcqRel);
+                     info!(attempt, "restarted MCP stdio server");
+                     return Ok(());
+@@ -391,13 +480,47 @@ impl RmcpClient {
+                 Err(error) => {
+                     warn!(attempt, error = %error, "failed to restart MCP stdio server");
+                     last_error = error;
++                    self.connection_changed();
+                 }
+             }
+         }
+         self.stop_stdio_process()
+             .await
+             .map_err(|error| restart.cleanup_failed(error))?;
+-        Err(restart.give_up(&last_error))
++        let error = restart.give_up(&last_error);
++        self.connection_changed();
++        Err(error)
++    }
++
++    /// Waits until launches are no longer held.
++    async fn wait_while_held(
++        &self,
++        restart: &StdioRestart,
++        held: &mut watch::Receiver<bool>,
++    ) -> Result<()> {
++        if !*held.borrow_and_update() {
++            return Ok(());
++        }
++        restart.set_held(true);
++        self.connection_changed();
++        info!("holding MCP stdio server restart");
++        let result = loop {
++            if !*held.borrow_and_update() {
++                break Ok(());
++            }
++            tokio::select! {
++                biased;
++                () = restart.shutdown.cancelled() => break Err(anyhow!("MCP client is shut down")),
++                changed = held.changed() => {
++                    if changed.is_err() {
++                        break Err(anyhow!("MCP client is shut down"));
++                    }
++                }
++            }
++        };
++        restart.set_held(false);
++        self.connection_changed();
++        result
+     }
+ }
+ 
+@@ -409,21 +532,47 @@ impl Drop for RmcpClient {
+     }
+ }
+ 
++/// Resolves once launches are held.
++async fn hold_requested(held: &mut watch::Receiver<bool>) {
++    loop {
++        if *held.borrow_and_update() {
++            return;
++        }
++        if held.changed().await.is_err() {
++            std::future::pending::<()>().await;
++        }
++    }
++}
++
++/// Cancels `exit` and advances `changes` when the connection ends.
+ pub(super) fn watch_exit<T: Transport<RoleClient> + 'static>(
+     inner: T,
+     exit: CancellationToken,
++    changes: Arc<watch::Sender<u64>>,
+ ) -> impl Transport<RoleClient, Error = T::Error> {
+-    ExitWatch { inner, exit }
++    ExitWatch {
++        inner,
++        exit,
++        changes,
++    }
+ }
+ 
+ struct ExitWatch<T> {
+     inner: T,
+     exit: CancellationToken,
++    changes: Arc<watch::Sender<u64>>,
++}
++
++fn signal_exit(exit: &CancellationToken, changes: &watch::Sender<u64>) {
++    if !exit.is_cancelled() {
++        exit.cancel();
++        changes.send_modify(|revision| *revision = revision.wrapping_add(1));
++    }
+ }
+ 
+ impl<T> Drop for ExitWatch<T> {
+     fn drop(&mut self) {
+-        self.exit.cancel();
++        signal_exit(&self.exit, &self.changes);
+     }
+ }
+ 
+@@ -436,10 +585,11 @@ impl<T: Transport<RoleClient> + 'static> Transport<RoleClient> for ExitWatch<T>
+     ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send + 'static {
+         let send = self.inner.send(message);
+         let exit = self.exit.clone();
++        let changes = Arc::clone(&self.changes);
+         async move {
+             let result = send.await;
+             if result.is_err() {
+-                exit.cancel();
++                signal_exit(&exit, &changes);
+             }
+             result
+         }
+@@ -448,7 +598,7 @@ impl<T: Transport<RoleClient> + 'static> Transport<RoleClient> for ExitWatch<T>
+     async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+         let result = self.inner.receive().await;
+         if result.is_none() {
+-            self.exit.cancel();
++            signal_exit(&self.exit, &self.changes);
+         }
+         result
+     }
+@@ -476,4 +626,24 @@ mod tests {
+         restart.reset_after_stable_connection();
+         assert_eq!(restart.next_attempt(), Some((1, Duration::from_secs(1))));
+     }
++
++    #[test]
++    fn a_held_attempt_is_refunded_and_the_phase_follows_recovery() {
++        let restart = StdioRestart::new(StdioRestartPolicy::default());
++        assert_eq!(restart.phase(/*ended*/ false), ConnectionPhase::Ready);
++        assert_eq!(restart.phase(/*ended*/ true), ConnectionPhase::Recovering);
++        assert_eq!(restart.next_attempt(), Some((1, Duration::from_secs(1))));
++        restart.refund_attempt();
++        assert_eq!(restart.next_attempt(), Some((1, Duration::from_secs(1))));
++        restart.set_launching(true);
++        assert_eq!(restart.phase(/*ended*/ true), ConnectionPhase::Launching);
++        restart.set_launching(false);
++        restart.set_held(true);
++        assert_eq!(restart.phase(/*ended*/ true), ConnectionPhase::Held);
++        restart.set_held(false);
++        restart.mark_ready();
++        assert_eq!(restart.phase(/*ended*/ false), ConnectionPhase::Ready);
++        restart.shutdown.cancel();
++        assert_eq!(restart.phase(/*ended*/ false), ConnectionPhase::Closed);
++    }
+ }
+diff --git a/codex-rs/rmcp-client/src/stdio_server_launcher.rs b/codex-rs/rmcp-client/src/stdio_server_launcher.rs
+index 2f8ad6cd15..172599a733 100644
+--- a/codex-rs/rmcp-client/src/stdio_server_launcher.rs
++++ b/codex-rs/rmcp-client/src/stdio_server_launcher.rs
+@@ -222,6 +222,11 @@ pub(super) struct StdioProcessRef {
+ }
+ 
+ impl StdioProcessRef {
++    /// The local OS process ID, while its handle is alive.
++    pub(super) fn pid(&self) -> Option<u32> {
++        self.process.upgrade().and_then(|process| process.pid)
++    }
++
+     pub(super) async fn terminate(&self, reason: StdioTermination) -> io::Result<()> {
+         if let Some(cleanup) = &self.discovery_cleanup {
+             let result = cleanup.start(&Handle::current(), reason);
+@@ -507,6 +512,8 @@ struct LocalProcessTerminator;
+ 
+ pub(crate) struct StdioServerProcessHandle {
+     program_name: String,
++    // Local OS process ID, reported to observers; executor processes have none.
++    pid: Option<u32>,
+     kind: StdioServerProcessKind,
+     terminated: AtomicBool,
+     // An escaped descendant can keep stderr open after the MCP server exits.
+@@ -699,7 +706,8 @@ impl LocalStdioServerLauncher {
+             }));
+             stop_tx
+         });
+-        let process = StdioServerProcessHandle::local(program_name, terminator, stderr_reader);
++        let process =
++            StdioServerProcessHandle::local(program_name, process_id, terminator, stderr_reader);
+         let discovery_cleanup = discovery_owned.then(|| {
+             Arc::new(DiscoveryCleanup {
+                 process: Arc::downgrade(&process),
+@@ -841,11 +849,13 @@ impl LocalProcessTerminator {
+ impl StdioServerProcessHandle {
+     fn local(
+         program_name: String,
++        pid: Option<u32>,
+         terminator: Option<LocalProcessTerminator>,
+         stderr_reader: Option<watch::Sender<()>>,
+     ) -> Arc<Self> {
+         Arc::new(Self {
+             program_name,
++            pid,
+             kind: StdioServerProcessKind::Local(terminator),
+             terminated: AtomicBool::new(false),
+             stderr_reader,
+@@ -855,6 +865,7 @@ impl StdioServerProcessHandle {
+     pub(crate) fn executor(program_name: String, process: Arc<dyn ExecProcess>) -> Arc<Self> {
+         Arc::new(Self {
+             program_name,
++            pid: None,
+             kind: StdioServerProcessKind::Executor(process),
+             terminated: AtomicBool::new(false),
+             stderr_reader: None,
+diff --git a/codex-rs/rmcp-client/tests/stdio_restart.rs b/codex-rs/rmcp-client/tests/stdio_restart.rs
+index 16c4995411..595fc371dc 100644
+--- a/codex-rs/rmcp-client/tests/stdio_restart.rs
++++ b/codex-rs/rmcp-client/tests/stdio_restart.rs
+@@ -11,6 +11,8 @@ use std::time::Duration;
+ use anyhow::Context;
+ use anyhow::Result;
+ use codex_exec_server::Environment;
++use codex_rmcp_client::ConnectionPhase;
++use codex_rmcp_client::ConnectionStatus;
+ use codex_rmcp_client::ExecutorStdioServerLauncher;
+ use codex_rmcp_client::LocalStdioServerLauncher;
+ use codex_rmcp_client::McpProtocolMode;
+@@ -52,7 +54,16 @@ impl Fixture {
+     }
+ 
+     fn launches(&self) -> Result<Vec<Value>> {
+-        let path = self.path().join("launches");
++        self.records("launches")
++    }
++
++    /// The experimental client capabilities of each `initialize` the fixture received.
++    fn initializes(&self) -> Result<Vec<Value>> {
++        self.records("initialize")
++    }
++
++    fn records(&self, name: &str) -> Result<Vec<Value>> {
++        let path = self.path().join(name);
+         if !path.exists() {
+             return Ok(Vec::new());
+         }
+@@ -157,6 +168,23 @@ async fn wait_revision(client: &RmcpClient, revision: u64) -> Result<()> {
+     Ok(())
+ }
+ 
++async fn wait_status(
++    client: &RmcpClient,
++    wanted: impl Fn(&ConnectionStatus) -> bool,
++) -> Result<ConnectionStatus> {
++    tokio::time::timeout(WAIT, async {
++        loop {
++            let status = client.connection_status().await;
++            if wanted(&status) {
++                return status;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .context("connection status did not reach the expected state")
++}
++
+ async fn wait_closed(client: &RmcpClient) -> Result<()> {
+     tokio::time::timeout(WAIT, async {
+         while !client.is_closed().await {
+@@ -428,6 +456,134 @@ async fn shutdown_and_owner_drop_stop_a_replacement_during_initialize() -> Resul
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn recovery_is_observable_and_numbers_each_connection() -> Result<()> {
++    let fixture = Fixture::new("normal")?;
++    let mut policy = fast_policy();
++    policy.backoff = [Duration::from_millis(500); 3];
++    let (client, _supervisor) = fixture
++        .client(Some(policy), false, McpProtocolMode::Legacy)
++        .await?;
++    let first = echo(&client).await?;
++    let status = client.connection_status().await;
++    assert_eq!(status.phase, ConnectionPhase::Ready);
++    assert_eq!(status.generation, 1);
++    assert_eq!(status.pid, Some(u32::try_from(pid(&first)?)?));
++    assert!(!client.is_recovering().await);
++    // A new receiver has seen the current revision.
++    let changes = client.connection_changes();
++    kill(&first)?;
++    let status = wait_status(&client, |status| {
++        status.phase == ConnectionPhase::Recovering
++    })
++    .await?;
++    assert_eq!(status.generation, 1);
++    assert!(changes.has_changed()?);
++    assert!(client.is_recovering().await);
++    assert!(!client.is_closed().await);
++    wait_status(&client, |status| {
++        status.phase == ConnectionPhase::Ready && status.generation == 2
++    })
++    .await?;
++    assert!(!client.is_recovering().await);
++    let second = echo(&client).await?;
++    assert_eq!(
++        client.connection_status().await.pid,
++        Some(u32::try_from(pid(&second)?)?)
++    );
++    client.shutdown().await;
++    assert_eq!(
++        client.connection_status().await.phase,
++        ConnectionPhase::Closed
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn every_launch_carries_the_current_initialize_capabilities() -> Result<()> {
++    let fixture = Fixture::new("normal")?;
++    let (client, _supervisor) = fixture
++        .client(Some(fast_policy()), false, McpProtocolMode::Legacy)
++        .await?;
++    let first = echo(&client).await?;
++    let flag = json!({ "closed": true, "token": "fence-1" });
++    client.set_initialize_experimental("channel/fence", flag.as_object().cloned());
++    kill(&first)?;
++    let status = wait_status(&client, |status| {
++        status.phase == ConnectionPhase::Ready && status.generation == 2
++    })
++    .await?;
++    assert_eq!(
++        status.initialize_experimental.get("channel/fence"),
++        flag.as_object()
++    );
++    let initializes = fixture.initializes()?;
++    assert_eq!(initializes.len(), 2);
++    assert_eq!(initializes[0].get("channel/fence"), None);
++    assert_eq!(initializes[1]["channel/fence"], flag);
++    client.shutdown().await;
++    Ok(())
++}
++
++#[tokio::test]
++async fn holding_launches_defers_recovery_without_spending_the_budget() -> Result<()> {
++    let fixture = Fixture::new("normal")?;
++    let mut policy = fast_policy();
++    policy.backoff = [Duration::from_millis(300); 3];
++    let (client, _supervisor) = fixture
++        .client(Some(policy), false, McpProtocolMode::Legacy)
++        .await?;
++    let first = echo(&client).await?;
++    kill(&first)?;
++    // More interrupted backoffs than the budget of three launches would allow.
++    for _ in 0..5 {
++        wait_status(&client, |status| {
++            status.phase == ConnectionPhase::Recovering
++        })
++        .await?;
++        client.hold_launches(true);
++        wait_status(&client, |status| status.phase == ConnectionPhase::Held).await?;
++        tokio::time::sleep(SETTLE).await;
++        assert_eq!(fixture.launches()?.len(), 1);
++        client.hold_launches(false);
++    }
++    wait_status(&client, |status| {
++        status.phase == ConnectionPhase::Ready && status.generation == 2
++    })
++    .await?;
++    assert_eq!(fixture.launches()?.len(), 2);
++    assert_ne!(echo(&client).await?["pid"], first["pid"]);
++    client.shutdown().await;
++    Ok(())
++}
++
++#[tokio::test]
++async fn holding_launches_stops_a_replacement_during_initialize() -> Result<()> {
++    let fixture = Fixture::new("hang_restart")?;
++    let (client, _supervisor) = fixture
++        .client(Some(fast_policy()), false, McpProtocolMode::Legacy)
++        .await?;
++    kill(&echo(&client).await?)?;
++    let launches = fixture.wait_launches(2).await?;
++    tokio::time::timeout(WAIT, async {
++        while !fixture.path().join("blocked").exists() {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await?;
++    assert_eq!(
++        client.connection_status().await.phase,
++        ConnectionPhase::Launching
++    );
++    client.hold_launches(true);
++    wait_gone(pid(&launches[1])?).await?;
++    wait_status(&client, |status| status.phase == ConnectionPhase::Held).await?;
++    tokio::time::sleep(SETTLE).await;
++    assert_eq!(fixture.launches()?.len(), 2);
++    client.shutdown().await;
++    Ok(())
++}
++
+ const SERVER: &str = r#"import json
+ import os
+ import pathlib
+@@ -456,6 +612,9 @@ def main() -> None:
+             continue
+         method = request["method"]
+         if method == "initialize":
++            experimental = request["params"]["capabilities"].get("experimental") or {}
++            with (root / "initialize").open("a") as stream:
++                stream.write(json.dumps(experimental) + "\n")
+             if (root / "mode").read_text() == "hang_restart" and count > 1:
+                 (root / "blocked").touch()
+                 time.sleep(60)
+-- 
+2.53.0
+

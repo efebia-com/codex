@@ -1,0 +1,1207 @@
+From bd61ba1e6be445557be268b3b1b963fc3075c027 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 19:47:40 +0100
+Subject: [PATCH 3/3] mcp: fence the input of channel servers
+
+Give each thread a fence over the input of its channel servers. Closing it
+asks every channel server that declares the channel/fence experimental
+capability to stop accepting input, emit what it already accepted and then
+a marker carrying the fence token. Every initialize carries the current
+fence, so a server that restarts or reconnects while it is closed starts
+closed, and each connection that becomes ready meanwhile is asked again.
+A server without the capability gets no new process, from recovery or
+from a new connection, until the fence opens.
+
+The fence reports each channel server's connection, generation, process
+and progress, and counts notifications dropped by full queues. Channel
+notifications carry the generation of the connection that read them.
+---
+ codex-rs/codex-mcp/src/channel.rs             |  36 +-
+ codex-rs/codex-mcp/src/channel_fence.rs       | 521 ++++++++++++++++++
+ codex-rs/codex-mcp/src/channel_fence_tests.rs | 378 +++++++++++++
+ codex-rs/codex-mcp/src/channel_tests.rs       |   1 +
+ codex-rs/codex-mcp/src/lib.rs                 |   8 +
+ codex-rs/codex-mcp/src/resource_client.rs     |   6 +
+ codex-rs/codex-mcp/src/rmcp_client.rs         |  15 +-
+ codex-rs/codex-mcp/src/runtime.rs             |  12 +
+ codex-rs/ext/channels/src/delivery_tests.rs   |   2 +
+ codex-rs/ext/channels/src/render_tests.rs     |   2 +
+ 10 files changed, 970 insertions(+), 11 deletions(-)
+ create mode 100644 codex-rs/codex-mcp/src/channel_fence.rs
+ create mode 100644 codex-rs/codex-mcp/src/channel_fence_tests.rs
+
+diff --git a/codex-rs/codex-mcp/src/channel.rs b/codex-rs/codex-mcp/src/channel.rs
+index 3fba9aa16d..b7e5ed5841 100644
+--- a/codex-rs/codex-mcp/src/channel.rs
++++ b/codex-rs/codex-mcp/src/channel.rs
+@@ -5,14 +5,17 @@
+ //! server, and once the server declares it too over a session with an `initialize` handshake,
+ //! forwards each notification with the server's name to the thread's [`ChannelHub`]. Whoever
+ //! takes the hub's receiver decides how notifications reach the model. Queues are bounded: a
+-//! notification that finds one full is dropped.
++//! notification that finds one full is dropped and counted. The thread's
++//! [`ChannelFence`](crate::ChannelFence) lives with the hub.
+ 
+ use std::sync::Arc;
+ use std::sync::Mutex;
+ use std::sync::PoisonError;
++use std::sync::atomic::Ordering;
+ 
+ use codex_config::ConfigLayerStack;
+ use codex_config::TomlValue;
++use codex_rmcp_client::ConnectionGeneration;
+ use codex_rmcp_client::RmcpClient;
+ use rmcp::model::CustomNotification;
+ use rmcp::model::InitializeRequestParams;
+@@ -24,6 +27,8 @@ use tokio::sync::mpsc::error::TrySendError;
+ use tracing::info;
+ use tracing::warn;
+ 
++use crate::channel_fence::ChannelFence;
++
+ /// Experimental capability declared by both sides of a channel.
+ pub const CHANNEL_CAPABILITY: &str = "claude/channel";
+ /// Notification a channel server sends for each event.
+@@ -36,6 +41,9 @@ pub const CHANNEL_QUEUE_CAPACITY: usize = 64;
+ pub struct ChannelNotification {
+     /// Name of the server in the MCP configuration.
+     pub server: String,
++    /// The server's connection that read it; see [`crate::ChannelServerState::generation`].
++    /// Every notification of a connection precedes those of later connections.
++    pub generation: u64,
+     /// The notification's `params`, unvalidated.
+     pub params: Option<Value>,
+ }
+@@ -88,6 +96,7 @@ pub fn channel_servers(config_layer_stack: &ConfigLayerStack) -> Vec<String> {
+ pub(crate) struct ChannelHub {
+     sender: mpsc::Sender<ChannelNotification>,
+     receiver: Arc<Mutex<Option<mpsc::Receiver<ChannelNotification>>>>,
++    fence: ChannelFence,
+ }
+ 
+ impl Default for ChannelHub {
+@@ -96,11 +105,17 @@ impl Default for ChannelHub {
+         Self {
+             sender,
+             receiver: Arc::new(Mutex::new(Some(receiver))),
++            fence: ChannelFence::default(),
+         }
+     }
+ }
+ 
+ impl ChannelHub {
++    /// The thread's fence on the input of its channel servers.
++    pub(crate) fn fence(&self) -> ChannelFence {
++        self.fence.clone()
++    }
++
+     /// The receiver, to the first caller only.
+     pub(crate) fn take_receiver(&self) -> Option<mpsc::Receiver<ChannelNotification>> {
+         self.receiver
+@@ -129,10 +144,11 @@ impl ChannelSubscription {
+             .experimental
+             .get_or_insert_default()
+             .insert(CHANNEL_CAPABILITY.to_string(), Default::default());
+-        let notifications = client.subscribe_custom_notifications(
++        let notifications = client.subscribe_custom_notifications_counting(
+             CHANNEL_NOTIFICATION_METHOD,
+             CHANNEL_CAPABILITY,
+             CHANNEL_QUEUE_CAPACITY,
++            hub.fence.dropped_counter(),
+         );
+         Some(Self { hub, notifications })
+     }
+@@ -158,16 +174,24 @@ impl ChannelSubscription {
+         } = self;
+         tokio::spawn(async move {
+             while let Some(notification) = notifications.recv().await {
++                let generation = notification
++                    .extensions
++                    .get::<ConnectionGeneration>()
++                    .map_or(0, |generation| generation.0);
+                 let notification = ChannelNotification {
+                     server: server.clone(),
++                    generation,
+                     params: notification.params,
+                 };
+                 match hub.sender.try_send(notification) {
+                     Ok(()) => {}
+-                    Err(TrySendError::Full(_)) => warn!(
+-                        server = %server,
+-                        "dropping MCP channel notification: the thread's queue is full"
+-                    ),
++                    Err(TrySendError::Full(_)) => {
++                        hub.fence.dropped_counter().fetch_add(1, Ordering::Relaxed);
++                        warn!(
++                            server = %server,
++                            "dropping MCP channel notification: the thread's queue is full"
++                        );
++                    }
+                     Err(TrySendError::Closed(_)) => return,
+                 }
+             }
+diff --git a/codex-rs/codex-mcp/src/channel_fence.rs b/codex-rs/codex-mcp/src/channel_fence.rs
+new file mode 100644
+index 0000000000..8273c67d10
+--- /dev/null
++++ b/codex-rs/codex-mcp/src/channel_fence.rs
+@@ -0,0 +1,521 @@
++//! A thread's fence on the input of its channel servers.
++//!
++//! Closing the fence asks every channel server that declares the `channel/fence` experimental
++//! capability to stop accepting input, emit what it already accepted, and then emit a marker:
++//! a `notifications/claude/channel` notification whose `meta.fence` is the fence token. Every
++//! `initialize` carries the current fence, so a server that restarts or reconnects while the
++//! fence is closed starts closed; each connection that becomes ready while the fence is closed
++//! is asked again. A server without the capability cannot fence itself: while the fence is
++//! closed, no process is launched for it, neither by recovery nor by a new connection.
++//!
++//! The fence belongs to the thread, not to any client of the app server, and survives every
++//! runtime refresh of the thread's MCP connections.
++
++use std::collections::BTreeMap;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::sync::MutexGuard;
++use std::sync::PoisonError;
++use std::sync::Weak;
++use std::sync::atomic::AtomicU64;
++use std::sync::atomic::Ordering;
++use std::time::Duration;
++
++use codex_rmcp_client::ConnectionPhase;
++use codex_rmcp_client::RmcpClient;
++use rmcp::model::JsonObject;
++use serde_json::Value;
++use serde_json::json;
++use tokio::sync::watch;
++use tracing::warn;
++
++/// Experimental capability declared by a server that can fence its input, and by Codex with
++/// the current fence: `{"closed": bool, "token": string | null}`.
++pub const CHANNEL_FENCE_CAPABILITY: &str = "channel/fence";
++/// Request that closes or opens a server's fence: `{"closed": bool, "token": string | null}`.
++pub const CHANNEL_FENCE_METHOD: &str = "channel/fence";
++
++const FENCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
++
++/// The fence an `initialize` carried.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct InitFence {
++    pub closed: bool,
++    pub token: Option<String>,
++}
++
++/// A channel server's connection, as the fence sees it.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ChannelConnection {
++    /// The first connection, or a replacement, is being launched and initialized.
++    Launching,
++    Ready,
++    /// The connection ended and a replacement is pending.
++    Recovering,
++    /// No process runs, and none is launched while the fence stays closed.
++    FencedWaiting,
++    /// The connection ended and recovery gave up.
++    GaveUp,
++    /// The connection ended without recovery, or was shut down.
++    Closed,
++}
++
++/// A channel server's fence, for its current connection and the current token.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum ServerFence {
++    /// The fence is open.
++    Open,
++    /// The fence is closed and the server has not answered yet.
++    Requested,
++    /// The server answered: its marker for the token precedes the answer.
++    Acknowledged,
++    /// The current connection did not declare the capability, or there is none.
++    Unsupported,
++    /// The request failed on the current connection.
++    Failed(String),
++}
++
++/// One channel server of the thread.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ChannelServerState {
++    pub server: String,
++    /// The current connection, numbered per server as connections initialize; 0 before the
++    /// first. It changes when a connection becomes ready.
++    pub generation: u64,
++    /// Local OS process ID of the server's latest process.
++    pub pid: Option<u32>,
++    pub connection: ChannelConnection,
++    /// What the current connection's `initialize` carried.
++    pub init_fence: Option<InitFence>,
++    pub fence: ServerFence,
++}
++
++/// The fence of one thread's channel servers. Clones share the same fence.
++#[derive(Clone, Default)]
++pub struct ChannelFence {
++    inner: Arc<Inner>,
++}
++
++struct Inner {
++    state: Mutex<FenceState>,
++    revision: watch::Sender<u64>,
++    dropped: Arc<AtomicU64>,
++}
++
++impl Default for Inner {
++    fn default() -> Self {
++        Self {
++            state: Mutex::default(),
++            revision: watch::channel(0).0,
++            dropped: Arc::default(),
++        }
++    }
++}
++
++#[derive(Default)]
++struct FenceState {
++    token: Option<String>,
++    servers: BTreeMap<String, ServerEntry>,
++}
++
++#[derive(Default)]
++struct ServerEntry {
++    /// The server's current client, once one is attached.
++    client: Option<Weak<RmcpClient>>,
++    /// Numbers the connections of every client of this server.
++    generations: Arc<AtomicU64>,
++    /// The latest connection observed ready.
++    ready_generation: u64,
++    /// Whether that connection declared the capability.
++    supported: bool,
++    /// A new connection waits for the fence to open.
++    waiting_launch: bool,
++    request: Option<FenceRequest>,
++}
++
++struct FenceRequest {
++    generation: u64,
++    token: Option<String>,
++    outcome: RequestOutcome,
++}
++
++#[derive(Clone)]
++enum RequestOutcome {
++    Pending,
++    Acknowledged,
++    Failed(String),
++}
++
++impl ChannelFence {
++    /// Closes the fence with `token`, or opens it. Returns at once; the servers are asked in
++    /// the background, and [`Self::servers`] shows their progress.
++    pub fn set(&self, token: Option<String>) {
++        let requests = {
++            let mut state = self.lock();
++            if state.token == token {
++                return;
++            }
++            state.token.clone_from(&token);
++            let flag = initialize_flag(token.as_deref());
++            let mut requests = Vec::new();
++            for (server, entry) in &mut state.servers {
++                let Some(client) = entry.client.as_ref().and_then(Weak::upgrade) else {
++                    continue;
++                };
++                client.set_initialize_experimental(CHANNEL_FENCE_CAPABILITY, Some(flag.clone()));
++                client.hold_launches(token.is_some() && !entry.supported);
++                if entry.supported && entry.ready_generation > 0 {
++                    entry.request = Some(FenceRequest {
++                        generation: entry.ready_generation,
++                        token: token.clone(),
++                        outcome: RequestOutcome::Pending,
++                    });
++                    requests.push((server.clone(), client, entry.ready_generation));
++                }
++            }
++            requests
++        };
++        self.changed();
++        for (server, client, generation) in requests {
++            self.request(server, client, generation, token.clone());
++        }
++    }
++
++    /// The current token, while the fence is closed.
++    pub fn token(&self) -> Option<String> {
++        self.lock().token.clone()
++    }
++
++    /// The channel servers of the thread that have started at least once.
++    pub async fn servers(&self) -> Vec<ChannelServerState> {
++        let (token, entries) = {
++            let state = self.lock();
++            let entries: Vec<_> = state
++                .servers
++                .iter()
++                .map(|(server, entry)| {
++                    (
++                        server.clone(),
++                        entry.client.clone(),
++                        entry.ready_generation,
++                        entry.waiting_launch,
++                        entry.request.as_ref().map(|request| {
++                            (
++                                request.generation,
++                                request.token.clone(),
++                                request.outcome.clone(),
++                            )
++                        }),
++                    )
++                })
++                .collect();
++            (state.token.clone(), entries)
++        };
++        let mut servers = Vec::with_capacity(entries.len());
++        for (server, client, ready_generation, waiting_launch, request) in entries {
++            let status = match client.as_ref().map(Weak::upgrade) {
++                Some(Some(client)) => Some(client.connection_status().await),
++                Some(None) | None => None,
++            };
++            let connection = if waiting_launch {
++                ChannelConnection::FencedWaiting
++            } else {
++                match (&client, &status) {
++                    (None, _) => ChannelConnection::Launching,
++                    (Some(_), None) => ChannelConnection::Closed,
++                    (Some(_), Some(status)) => match status.phase {
++                        ConnectionPhase::Launching => ChannelConnection::Launching,
++                        ConnectionPhase::Ready => ChannelConnection::Ready,
++                        ConnectionPhase::Recovering => ChannelConnection::Recovering,
++                        ConnectionPhase::Held => ChannelConnection::FencedWaiting,
++                        ConnectionPhase::GaveUp => ChannelConnection::GaveUp,
++                        ConnectionPhase::Closed => ChannelConnection::Closed,
++                    },
++                }
++            };
++            let generation = status
++                .as_ref()
++                .map_or(ready_generation, |status| status.generation);
++            let supported = status.as_ref().is_some_and(|status| {
++                status
++                    .server_experimental
++                    .iter()
++                    .any(|key| key == CHANNEL_FENCE_CAPABILITY)
++            });
++            let fence = match &token {
++                None => ServerFence::Open,
++                Some(_) if generation == 0 || !supported => ServerFence::Unsupported,
++                Some(token) => match request {
++                    Some((requested, Some(requested_token), outcome))
++                        if requested == generation && requested_token == *token =>
++                    {
++                        match outcome {
++                            RequestOutcome::Pending => ServerFence::Requested,
++                            RequestOutcome::Acknowledged => ServerFence::Acknowledged,
++                            RequestOutcome::Failed(error) => ServerFence::Failed(error),
++                        }
++                    }
++                    _ => ServerFence::Requested,
++                },
++            };
++            let init_fence = status.as_ref().and_then(|status| {
++                status
++                    .initialize_experimental
++                    .get(CHANNEL_FENCE_CAPABILITY)
++                    .map(parse_initialize_flag)
++            });
++            servers.push(ChannelServerState {
++                server,
++                generation,
++                pid: status.as_ref().and_then(|status| status.pid),
++                connection,
++                init_fence,
++                fence,
++            });
++        }
++        servers
++    }
++
++    /// A revision that changes whenever the fence or a server's state may have changed.
++    pub fn subscribe(&self) -> watch::Receiver<u64> {
++        self.inner.revision.subscribe()
++    }
++
++    /// Channel notifications of the thread dropped so far because a queue was full.
++    pub fn dropped(&self) -> u64 {
++        self.inner.dropped.load(Ordering::Relaxed)
++    }
++
++    pub(crate) fn dropped_counter(&self) -> Arc<AtomicU64> {
++        Arc::clone(&self.inner.dropped)
++    }
++
++    /// Waits while the fence is closed and `server` cannot fence itself, before a new
++    /// connection launches its process.
++    pub(crate) async fn wait_for_launch(&self, server: &str) {
++        let mut revision = self.subscribe();
++        let mut waiting: Option<WaitingLaunch> = None;
++        loop {
++            let hold = {
++                let mut state = self.lock();
++                let closed = state.token.is_some();
++                let entry = state.servers.entry(server.to_string()).or_default();
++                closed && !entry.supported
++            };
++            if !hold {
++                return;
++            }
++            if waiting.is_none() {
++                waiting = Some(WaitingLaunch::new(self.clone(), server.to_string()));
++            }
++            if revision.changed().await.is_err() {
++                return;
++            }
++        }
++    }
++
++    /// Makes `client` the server's current client. Call before `initialize`.
++    pub(crate) fn attach(&self, server: &str, client: &Arc<RmcpClient>) {
++        {
++            let mut state = self.lock();
++            let token = state.token.clone();
++            let entry = state.servers.entry(server.to_string()).or_default();
++            entry.client = Some(Arc::downgrade(client));
++            client.share_connection_generations(Arc::clone(&entry.generations));
++            client.set_initialize_experimental(
++                CHANNEL_FENCE_CAPABILITY,
++                Some(initialize_flag(token.as_deref())),
++            );
++            client.hold_launches(token.is_some() && !entry.supported);
++        }
++        self.changed();
++        let fence = self.clone();
++        let server = server.to_string();
++        let weak = Arc::downgrade(client);
++        let mut changes = client.connection_changes();
++        tokio::spawn(async move {
++            loop {
++                let Some(client) = weak.upgrade() else {
++                    break;
++                };
++                fence.observe(&server, &client).await;
++                drop(client);
++                if changes.changed().await.is_err() {
++                    break;
++                }
++            }
++            fence.changed();
++        });
++    }
++
++    /// Asks a connection that became ready while the fence is closed.
++    async fn observe(&self, server: &str, client: &Arc<RmcpClient>) {
++        let status = client.connection_status().await;
++        let request = {
++            let mut state = self.lock();
++            let token = state.token.clone();
++            let Some(entry) = state.servers.get_mut(server) else {
++                return;
++            };
++            let current = entry
++                .client
++                .as_ref()
++                .is_some_and(|current| std::ptr::eq(current.as_ptr(), Arc::as_ptr(client)));
++            if !current
++                || status.phase != ConnectionPhase::Ready
++                || status.generation <= entry.ready_generation
++            {
++                None
++            } else {
++                entry.ready_generation = status.generation;
++                entry.supported = status
++                    .server_experimental
++                    .iter()
++                    .any(|key| key == CHANNEL_FENCE_CAPABILITY);
++                client.hold_launches(token.is_some() && !entry.supported);
++                match token {
++                    Some(token) if entry.supported => {
++                        entry.request = Some(FenceRequest {
++                            generation: status.generation,
++                            token: Some(token.clone()),
++                            outcome: RequestOutcome::Pending,
++                        });
++                        Some((status.generation, token))
++                    }
++                    _ => None,
++                }
++            }
++        };
++        self.changed();
++        if let Some((generation, token)) = request {
++            self.request(
++                server.to_string(),
++                Arc::clone(client),
++                generation,
++                Some(token),
++            );
++        }
++    }
++
++    fn request(
++        &self,
++        server: String,
++        client: Arc<RmcpClient>,
++        generation: u64,
++        token: Option<String>,
++    ) {
++        let fence = self.clone();
++        tokio::spawn(async move {
++            let params = json!({ "closed": token.is_some(), "token": token });
++            let result = client
++                .send_custom_request_with_timeout(
++                    CHANNEL_FENCE_METHOD,
++                    Some(params),
++                    Some(FENCE_REQUEST_TIMEOUT),
++                )
++                .await;
++            drop(client);
++            fence.finish_request(&server, generation, token.as_deref(), result.map(|_| ()));
++        });
++    }
++
++    fn finish_request(
++        &self,
++        server: &str,
++        generation: u64,
++        token: Option<&str>,
++        result: anyhow::Result<()>,
++    ) {
++        {
++            let mut state = self.lock();
++            let Some(request) = state
++                .servers
++                .get_mut(server)
++                .and_then(|entry| entry.request.as_mut())
++            else {
++                return;
++            };
++            if request.generation != generation || request.token.as_deref() != token {
++                return;
++            }
++            request.outcome = match result {
++                Ok(()) => RequestOutcome::Acknowledged,
++                Err(error) => {
++                    warn!(
++                        server,
++                        generation, "MCP channel fence request failed: {error:#}"
++                    );
++                    RequestOutcome::Failed(format!("{error:#}"))
++                }
++            };
++        }
++        self.changed();
++    }
++
++    fn changed(&self) {
++        self.inner
++            .revision
++            .send_modify(|revision| *revision = revision.wrapping_add(1));
++    }
++
++    fn lock(&self) -> MutexGuard<'_, FenceState> {
++        self.inner
++            .state
++            .lock()
++            .unwrap_or_else(PoisonError::into_inner)
++    }
++}
++
++/// Marks a new connection of `server` as held by the fence until dropped.
++struct WaitingLaunch {
++    fence: ChannelFence,
++    server: String,
++}
++
++impl WaitingLaunch {
++    fn new(fence: ChannelFence, server: String) -> Self {
++        fence.set_waiting(&server, /*waiting*/ true);
++        Self { fence, server }
++    }
++}
++
++impl Drop for WaitingLaunch {
++    fn drop(&mut self) {
++        self.fence.set_waiting(&self.server, /*waiting*/ false);
++    }
++}
++
++impl ChannelFence {
++    fn set_waiting(&self, server: &str, waiting: bool) {
++        self.lock()
++            .servers
++            .entry(server.to_string())
++            .or_default()
++            .waiting_launch = waiting;
++        self.changed();
++    }
++}
++
++fn initialize_flag(token: Option<&str>) -> JsonObject {
++    let mut flag = JsonObject::new();
++    flag.insert("closed".to_string(), Value::Bool(token.is_some()));
++    flag.insert(
++        "token".to_string(),
++        token.map_or(Value::Null, |token| Value::String(token.to_string())),
++    );
++    flag
++}
++
++fn parse_initialize_flag(flag: &JsonObject) -> InitFence {
++    InitFence {
++        closed: flag.get("closed").and_then(Value::as_bool).unwrap_or(false),
++        token: flag
++            .get("token")
++            .and_then(Value::as_str)
++            .map(str::to_string),
++    }
++}
++
++#[cfg(test)]
++#[path = "channel_fence_tests.rs"]
++mod tests;
+diff --git a/codex-rs/codex-mcp/src/channel_fence_tests.rs b/codex-rs/codex-mcp/src/channel_fence_tests.rs
+new file mode 100644
+index 0000000000..959dfcfd85
+--- /dev/null
++++ b/codex-rs/codex-mcp/src/channel_fence_tests.rs
+@@ -0,0 +1,378 @@
++use std::sync::Arc;
++use std::time::Duration;
++
++use anyhow::Context;
++use codex_rmcp_client::InProcessTransportFactory;
++use codex_rmcp_client::RmcpClient;
++use futures::FutureExt;
++use futures::future::BoxFuture;
++use pretty_assertions::assert_eq;
++use rmcp::ServiceExt;
++use rmcp::model::ClientCapabilities;
++use rmcp::model::CustomNotification;
++use rmcp::model::CustomRequest;
++use rmcp::model::CustomResult;
++use rmcp::model::Implementation;
++use rmcp::model::InitializeRequestParams;
++use rmcp::model::ServerNotification;
++use rmcp::service::NotificationContext;
++use rmcp::service::RequestContext;
++use rmcp::service::RoleServer;
++use serde_json::json;
++use tokio::sync::mpsc;
++use tokio::time::timeout;
++
++use super::*;
++use crate::channel::CHANNEL_CAPABILITY;
++use crate::channel::CHANNEL_NOTIFICATION_METHOD;
++use crate::channel::ChannelHub;
++use crate::channel::ChannelNotification;
++use crate::channel::ChannelSubscription;
++
++const WAIT: Duration = Duration::from_secs(5);
++const QUIET: Duration = Duration::from_millis(200);
++
++/// A channel server that says hello unless it starts fenced, and follows `channel/fence`.
++#[derive(Clone)]
++struct FenceServer {
++    declares_fence: bool,
++    client_capabilities: mpsc::Sender<Value>,
++    requests: mpsc::Sender<Value>,
++}
++
++fn channel_notification(params: Value) -> ServerNotification {
++    ServerNotification::CustomNotification(CustomNotification::new(
++        CHANNEL_NOTIFICATION_METHOD,
++        Some(params),
++    ))
++}
++
++impl rmcp::ServerHandler for FenceServer {
++    fn get_info(&self) -> rmcp::model::ServerConfig {
++        let mut experimental = std::collections::BTreeMap::new();
++        experimental.insert(CHANNEL_CAPABILITY.to_string(), Default::default());
++        if self.declares_fence {
++            experimental.insert(CHANNEL_FENCE_CAPABILITY.to_string(), Default::default());
++        }
++        let mut capabilities = rmcp::model::ServerCapabilities::default();
++        capabilities.experimental = Some(experimental);
++        rmcp::model::ServerConfig::new(capabilities)
++    }
++
++    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
++        let capabilities = context
++            .peer
++            .peer_info()
++            .map(|info| json!(info.capabilities))
++            .unwrap_or_default();
++        let fenced =
++            capabilities["experimental"][CHANNEL_FENCE_CAPABILITY]["closed"] == json!(true);
++        self.client_capabilities
++            .send(capabilities)
++            .await
++            .expect("record client capabilities");
++        if !fenced {
++            context
++                .peer
++                .send_notification(channel_notification(json!({ "content": "hello" })))
++                .await
++                .expect("send hello");
++        }
++    }
++
++    async fn on_custom_request(
++        &self,
++        request: CustomRequest,
++        context: RequestContext<RoleServer>,
++    ) -> Result<CustomResult, rmcp::ErrorData> {
++        let params = request.params.unwrap_or_default();
++        if params["closed"] == json!(true) {
++            context
++                .peer
++                .send_notification(channel_notification(
++                    json!({ "content": "", "meta": { "fence": params["token"] } }),
++                ))
++                .await
++                .expect("send marker");
++        }
++        self.requests.send(params).await.expect("record request");
++        Ok(CustomResult::new(json!({})))
++    }
++}
++
++impl InProcessTransportFactory for FenceServer {
++    fn open(&self) -> BoxFuture<'static, std::io::Result<tokio::io::DuplexStream>> {
++        let server = self.clone();
++        async move {
++            let (client, transport) = tokio::io::duplex(/*max_buf_size*/ 4096);
++            tokio::spawn(async move {
++                let service = server.serve(transport).await.expect("serve");
++                let _ = service.waiting().await;
++            });
++            Ok(client)
++        }
++        .boxed()
++    }
++}
++
++struct Connection {
++    client: Arc<RmcpClient>,
++    client_capabilities: mpsc::Receiver<Value>,
++    requests: mpsc::Receiver<Value>,
++}
++
++/// Connects server `srv` of `hub`'s thread the way a runtime does.
++async fn connect(hub: &ChannelHub, declares_fence: bool) -> anyhow::Result<Connection> {
++    let (capabilities_sender, client_capabilities) = mpsc::channel(4);
++    let (requests_sender, requests) = mpsc::channel(4);
++    let client = Arc::new(
++        RmcpClient::new_in_process_client(Arc::new(FenceServer {
++            declares_fence,
++            client_capabilities: capabilities_sender,
++            requests: requests_sender,
++        }))
++        .await?,
++    );
++    hub.fence().attach("srv", &client);
++    let mut params = InitializeRequestParams::new(
++        ClientCapabilities::default(),
++        Implementation::new("test", "1"),
++    );
++    let channel = ChannelSubscription::prepare(Some(hub.clone()), &client, &mut params);
++    let initialize_result = client
++        .initialize(
++            params,
++            Some(WAIT),
++            Box::new(|_, _| async { anyhow::bail!("unexpected elicitation") }.boxed()),
++        )
++        .await?;
++    if let Some(channel) = channel {
++        channel.connect("srv".to_string(), &initialize_result);
++    }
++    Ok(Connection {
++        client,
++        client_capabilities,
++        requests,
++    })
++}
++
++async fn wait_for(
++    fence: &ChannelFence,
++    wanted: impl Fn(&[ChannelServerState]) -> bool,
++) -> anyhow::Result<Vec<ChannelServerState>> {
++    let mut revision = fence.subscribe();
++    timeout(WAIT, async {
++        loop {
++            let servers = fence.servers().await;
++            if wanted(&servers) {
++                return servers;
++            }
++            // Phases are read on demand, so poll as well.
++            let _ = timeout(Duration::from_millis(50), revision.changed()).await;
++        }
++    })
++    .await
++    .context("the channel fence did not reach the expected state")
++}
++
++async fn next(receiver: &mut mpsc::Receiver<Value>) -> anyhow::Result<Value> {
++    timeout(WAIT, receiver.recv())
++        .await?
++        .context("the server stopped recording")
++}
++
++async fn next_notification(
++    receiver: &mut mpsc::Receiver<ChannelNotification>,
++) -> anyhow::Result<ChannelNotification> {
++    timeout(WAIT, receiver.recv())
++        .await?
++        .context("the hub closed")
++}
++
++fn marker(generation: u64, token: &str) -> ChannelNotification {
++    ChannelNotification {
++        server: "srv".to_string(),
++        generation,
++        params: Some(json!({ "content": "", "meta": { "fence": token } })),
++    }
++}
++
++#[tokio::test]
++async fn closing_asks_a_ready_server_and_opening_releases_it() -> anyhow::Result<()> {
++    let hub = ChannelHub::default();
++    let mut notifications = hub.take_receiver().context("hub receiver")?;
++    let fence = hub.fence();
++    let mut connection = connect(&hub, /*declares_fence*/ true).await?;
++
++    let capabilities = next(&mut connection.client_capabilities).await?;
++    assert_eq!(
++        capabilities["experimental"][CHANNEL_FENCE_CAPABILITY],
++        json!({ "closed": false, "token": null })
++    );
++    let hello = next_notification(&mut notifications).await?;
++    assert_eq!(hello.generation, 1);
++    wait_for(&fence, |servers| {
++        servers.len() == 1 && servers[0].connection == ChannelConnection::Ready
++    })
++    .await?;
++
++    fence.set(Some("fence-1".to_string()));
++    assert_eq!(
++        next(&mut connection.requests).await?,
++        json!({ "closed": true, "token": "fence-1" })
++    );
++    assert_eq!(
++        next_notification(&mut notifications).await?,
++        marker(1, "fence-1")
++    );
++    let servers = wait_for(&fence, |servers| {
++        servers[0].fence == ServerFence::Acknowledged
++    })
++    .await?;
++    assert_eq!(
++        servers,
++        vec![ChannelServerState {
++            server: "srv".to_string(),
++            generation: 1,
++            pid: None,
++            connection: ChannelConnection::Ready,
++            init_fence: Some(InitFence {
++                closed: false,
++                token: None,
++            }),
++            fence: ServerFence::Acknowledged,
++        }]
++    );
++    assert_eq!(fence.token(), Some("fence-1".to_string()));
++
++    // Closing again with the same token asks nothing.
++    fence.set(Some("fence-1".to_string()));
++    assert!(timeout(QUIET, connection.requests.recv()).await.is_err());
++
++    fence.set(None);
++    assert_eq!(
++        next(&mut connection.requests).await?,
++        json!({ "closed": false, "token": null })
++    );
++    wait_for(&fence, |servers| servers[0].fence == ServerFence::Open).await?;
++    assert_eq!(fence.dropped(), 0);
++    connection.client.shutdown().await;
++    wait_for(&fence, |servers| {
++        servers[0].connection == ChannelConnection::Closed
++    })
++    .await?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn a_connection_made_while_closed_starts_closed_and_is_asked_again() -> anyhow::Result<()> {
++    let hub = ChannelHub::default();
++    let mut notifications = hub.take_receiver().context("hub receiver")?;
++    let fence = hub.fence();
++    let mut first = connect(&hub, /*declares_fence*/ true).await?;
++    assert_eq!(next_notification(&mut notifications).await?.generation, 1);
++    wait_for(&fence, |servers| {
++        servers[0].connection == ChannelConnection::Ready
++    })
++    .await?;
++    fence.set(Some("fence-2".to_string()));
++    next(&mut first.requests).await?;
++    assert_eq!(
++        next_notification(&mut notifications).await?,
++        marker(1, "fence-2")
++    );
++
++    // A refresh replaces the connection while the fence is closed.
++    first.client.shutdown().await;
++    let mut second = connect(&hub, /*declares_fence*/ true).await?;
++    assert_eq!(
++        next(&mut second.client_capabilities).await?["experimental"][CHANNEL_FENCE_CAPABILITY],
++        json!({ "closed": true, "token": "fence-2" })
++    );
++    assert_eq!(
++        next(&mut second.requests).await?,
++        json!({ "closed": true, "token": "fence-2" })
++    );
++    // The fenced server sent no hello: its marker is the next notification.
++    assert_eq!(
++        next_notification(&mut notifications).await?,
++        marker(2, "fence-2")
++    );
++    let servers = wait_for(&fence, |servers| {
++        servers[0].generation == 2 && servers[0].fence == ServerFence::Acknowledged
++    })
++    .await?;
++    assert_eq!(
++        servers[0].init_fence,
++        Some(InitFence {
++            closed: true,
++            token: Some("fence-2".to_string()),
++        })
++    );
++    assert!(timeout(QUIET, first.requests.recv()).await.is_err());
++    second.client.shutdown().await;
++    Ok(())
++}
++
++#[tokio::test]
++async fn a_server_without_the_capability_is_unsupported_and_its_launches_wait() -> anyhow::Result<()>
++{
++    let hub = ChannelHub::default();
++    let fence = hub.fence();
++    let mut connection = connect(&hub, /*declares_fence*/ false).await?;
++    wait_for(&fence, |servers| {
++        servers[0].connection == ChannelConnection::Ready
++    })
++    .await?;
++
++    fence.set(Some("fence-3".to_string()));
++    wait_for(&fence, |servers| {
++        servers[0].fence == ServerFence::Unsupported
++    })
++    .await?;
++    assert!(timeout(QUIET, connection.requests.recv()).await.is_err());
++
++    // A new connection of this server waits until the fence opens.
++    let launch = tokio::spawn({
++        let fence = fence.clone();
++        async move { fence.wait_for_launch("srv").await }
++    });
++    wait_for(&fence, |servers| {
++        servers[0].connection == ChannelConnection::FencedWaiting
++    })
++    .await?;
++    tokio::time::sleep(QUIET).await;
++    assert!(!launch.is_finished());
++
++    fence.set(None);
++    timeout(WAIT, launch).await??;
++    wait_for(&fence, |servers| {
++        servers[0].connection == ChannelConnection::Ready && servers[0].fence == ServerFence::Open
++    })
++    .await?;
++    connection.client.shutdown().await;
++    Ok(())
++}
++
++#[tokio::test]
++async fn a_cancelled_launch_stops_waiting() -> anyhow::Result<()> {
++    let fence = ChannelFence::default();
++    fence.set(Some("fence-4".to_string()));
++    let launch = tokio::spawn({
++        let fence = fence.clone();
++        async move { fence.wait_for_launch("never-connected").await }
++    });
++    let servers = wait_for(&fence, |servers| {
++        servers.len() == 1 && servers[0].connection == ChannelConnection::FencedWaiting
++    })
++    .await?;
++    assert_eq!(servers[0].fence, ServerFence::Unsupported);
++    assert_eq!(servers[0].generation, 0);
++    launch.abort();
++    let servers = wait_for(&fence, |servers| {
++        servers[0].connection != ChannelConnection::FencedWaiting
++    })
++    .await?;
++    assert_eq!(servers[0].connection, ChannelConnection::Launching);
++    Ok(())
++}
+diff --git a/codex-rs/codex-mcp/src/channel_tests.rs b/codex-rs/codex-mcp/src/channel_tests.rs
+index 944a64abf8..ce487e0d86 100644
+--- a/codex-rs/codex-mcp/src/channel_tests.rs
++++ b/codex-rs/codex-mcp/src/channel_tests.rs
+@@ -196,6 +196,7 @@ async fn enabled_channel_declares_the_capability_and_forwards_in_order() -> anyh
+             notification,
+             ChannelNotification {
+                 server: "srv".to_string(),
++                generation: 1,
+                 params: Some(json!({ "content": format!("event {n}") })),
+             }
+         );
+diff --git a/codex-rs/codex-mcp/src/lib.rs b/codex-rs/codex-mcp/src/lib.rs
+index 7be2afafa2..62cdb8ab44 100644
+--- a/codex-rs/codex-mcp/src/lib.rs
++++ b/codex-rs/codex-mcp/src/lib.rs
+@@ -12,6 +12,13 @@ pub use channel::ChannelNotification;
+ pub use channel::channel_during_turn;
+ pub use channel::channel_enabled;
+ pub use channel::channel_servers;
++pub use channel_fence::CHANNEL_FENCE_CAPABILITY;
++pub use channel_fence::CHANNEL_FENCE_METHOD;
++pub use channel_fence::ChannelConnection;
++pub use channel_fence::ChannelFence;
++pub use channel_fence::ChannelServerState;
++pub use channel_fence::InitFence;
++pub use channel_fence::ServerFence;
+ pub use client_capabilities::client_mcp_extensions;
+ pub use client_tool_catalog::CodexAppsToolSnapshot;
+ pub use codex_rmcp_client::McpProtocolMode;
+@@ -134,6 +141,7 @@ mod binding;
+ pub(crate) mod binding_clients;
+ mod catalog;
+ mod channel;
++mod channel_fence;
+ mod client_capabilities;
+ mod client_tool_catalog;
+ pub(crate) mod codex_apps;
+diff --git a/codex-rs/codex-mcp/src/resource_client.rs b/codex-rs/codex-mcp/src/resource_client.rs
+index f5b024bb3f..da178090d7 100644
+--- a/codex-rs/codex-mcp/src/resource_client.rs
++++ b/codex-rs/codex-mcp/src/resource_client.rs
+@@ -260,6 +260,12 @@ impl McpResourceClient {
+         self.runtime.take_channel_notifications()
+     }
+ 
++    /// The thread's fence on the input of its channel servers (see [`crate::ChannelFence`]);
++    /// `None` when the thread's configuration enables no channel server.
++    pub fn channel_fence(&self) -> Option<crate::ChannelFence> {
++        self.runtime.channel_fence()
++    }
++
+     /// Returns the identity of the connection set used by this client.
+     pub fn cache_key(&self) -> McpResourceClientCacheKey {
+         McpResourceClientCacheKey(Arc::downgrade(&self.runtime.latest_connections()))
+diff --git a/codex-rs/codex-mcp/src/rmcp_client.rs b/codex-rs/codex-mcp/src/rmcp_client.rs
+index 397954c210..b30bdbd6cb 100644
+--- a/codex-rs/codex-mcp/src/rmcp_client.rs
++++ b/codex-rs/codex-mcp/src/rmcp_client.rs
+@@ -346,6 +346,11 @@ impl ManagedClientStartup {
+                 if let Err(error) = validate_mcp_server_name(&server_name) {
+                     return Err(error.into());
+                 }
++                // While the thread's channel fence is closed, a channel server that cannot
++                // fence itself must not get a process that could accept input.
++                if let Some(hub) = elicitation_requests.channel_hub_for(&server_name) {
++                    hub.fence().wait_for_launch(&server_name).await;
++                }
+ 
+                 let client = match tokio::time::timeout(
+                     startup_timeout,
+@@ -1182,11 +1187,11 @@ async fn start_server_task(
+             );
+     }
+ 
+-    let channel = crate::channel::ChannelSubscription::prepare(
+-        elicitation_requests.channel_hub_for(&server_name),
+-        &client,
+-        &mut params,
+-    );
++    let channel_hub = elicitation_requests.channel_hub_for(&server_name);
++    if let Some(hub) = &channel_hub {
++        hub.fence().attach(&server_name, &client);
++    }
++    let channel = crate::channel::ChannelSubscription::prepare(channel_hub, &client, &mut params);
+ 
+     let requested_capabilities = params.capabilities.clone();
+     let started_at = Instant::now();
+diff --git a/codex-rs/codex-mcp/src/runtime.rs b/codex-rs/codex-mcp/src/runtime.rs
+index 6ad9416182..1f3d41f65d 100644
+--- a/codex-rs/codex-mcp/src/runtime.rs
++++ b/codex-rs/codex-mcp/src/runtime.rs
+@@ -740,6 +740,18 @@ impl McpRuntime {
+         self.elicitation_router.channels.take_receiver()
+     }
+ 
++    /// The thread's fence on the input of its channel servers; `None` when the current
++    /// configuration enables no channel server. Before the first publication it is returned.
++    pub fn channel_fence(&self) -> Option<crate::ChannelFence> {
++        let current = self.current.load();
++        if current.config.as_ref().is_some_and(|config| {
++            crate::channel::channel_servers(&config.config_layer_stack).is_empty()
++        }) {
++            return None;
++        }
++        Some(self.elicitation_router.channels.fence())
++    }
++
+     pub fn enable_full_access_form_input(&self) {
+         self.elicitation_router.enable_full_access_form_input();
+     }
+diff --git a/codex-rs/ext/channels/src/delivery_tests.rs b/codex-rs/ext/channels/src/delivery_tests.rs
+index fe0f9cc6c1..457fc00e27 100644
+--- a/codex-rs/ext/channels/src/delivery_tests.rs
++++ b/codex-rs/ext/channels/src/delivery_tests.rs
+@@ -76,6 +76,7 @@ fn harness(outcomes: Vec<DeliveryOutcome>) -> Harness {
+ fn event(content: &str) -> ChannelNotification {
+     ChannelNotification {
+         server: "srv".to_string(),
++        generation: 0,
+         params: Some(json!({ "content": content })),
+     }
+ }
+@@ -156,6 +157,7 @@ async fn rejected_notifications_never_reach_the_thread() {
+         .notifications
+         .send(ChannelNotification {
+             server: "srv".to_string(),
++            generation: 0,
+             params: Some(json!({ "meta": { "k": "v" } })),
+         })
+         .await
+diff --git a/codex-rs/ext/channels/src/render_tests.rs b/codex-rs/ext/channels/src/render_tests.rs
+index 01a28b5576..6a9ab8cc07 100644
+--- a/codex-rs/ext/channels/src/render_tests.rs
++++ b/codex-rs/ext/channels/src/render_tests.rs
+@@ -10,6 +10,7 @@ use super::render;
+ fn notification(params: serde_json::Value) -> ChannelNotification {
+     ChannelNotification {
+         server: "webhook".to_string(),
++        generation: 0,
+         params: Some(params),
+     }
+ }
+@@ -79,6 +80,7 @@ fn notification_without_string_content_is_rejected() {
+     assert_eq!(
+         render(&ChannelNotification {
+             server: "webhook".to_string(),
++            generation: 0,
+             params: None,
+         }),
+         Err(Rejected::NoContent)
+-- 
+2.53.0
+

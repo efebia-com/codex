@@ -11,3 +11,4 @@ channels-inject
 channels-inject-tests
 mcp-restart
 mcp-restart-tests
+mcp-fence

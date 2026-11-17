@@ -1,0 +1,576 @@
+From f7ade5520dee7a2673eac9ad6cdedeb4f8b94ede Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 19:34:25 +0100
+Subject: [PATCH] channels: keep idle-started channel input until it is
+ recorded
+
+Idle delivery tagged nothing and dropped a batch as soon as the thread
+accepted a new turn, so an interrupt before recording lost it. Both paths
+now tag the user message with the batch id and keep the batch until the
+core confirms it was recorded. An aborted turn returns its batch to the
+head of the queue; a turn cancelled before it started returns it when the
+next regular turn starts; a completed turn that did not record it still
+discards it, so a blocking input hook cannot cause a retry loop.
+---
+ codex-rs/ext/channels/README.md             |  14 +-
+ codex-rs/ext/channels/src/delivery.rs       | 162 ++++++++++++++------
+ codex-rs/ext/channels/src/delivery_tests.rs | 140 +++++++++++++++--
+ codex-rs/ext/channels/src/lib.rs            |   6 +-
+ 4 files changed, 256 insertions(+), 66 deletions(-)
+
+diff --git a/codex-rs/ext/channels/README.md b/codex-rs/ext/channels/README.md
+index 1a554b4db9..81670f1bb6 100644
+--- a/codex-rs/ext/channels/README.md
++++ b/codex-rs/ext/channels/README.md
+@@ -21,17 +21,15 @@ pending tool results, keep their server's FIFO order, and are visible in history
+ resumed threads. No additional turn starts. Notifications from other servers wait for idle.
+ Review, compact, finishing and other turns that reject steering use the existing idle path.
+ 
+-A steered batch stays in memory until the core confirms that its user message was recorded.
+-On interrupt, unconfirmed batches return to the head of the queue in order. Interrupt does not
++A batch stays in memory until the core confirms that its user message was recorded. This
++holds for batches steered into an active turn and for batches that start their own turn when
++the thread is idle, including the idle fallback when `channel_during_turn = true`. On
++interrupt, unconfirmed batches return to the head of the queue in order. A batch whose turn
++was cancelled before it started returns when the next regular turn starts. Interrupt does not
+ restart work: they wait for a new notification, a completed turn or the next regular turn.
+ A normal turn completion discards unconfirmed input with a warning, so an input hook that
+ blocks a message cannot create a retry loop. The limit of 64 waiting events includes
+-unconfirmed steered batches.
+-
+-Idle delivery removes a batch from the queue as soon as the thread accepts a new turn, without
+-waiting for a recording confirmation. An abort before recording can therefore lose that batch.
+-This also applies to the idle fallback when `channel_during_turn = true`; recovery applies only
+-to batches accepted by steering an active turn.
++unconfirmed batches.
+ 
+ Pending and unconfirmed events have no durability after process exit. A cancellation between
+ recording and confirmation may cause a repeat. Recorded user input follows ordinary history,
+diff --git a/codex-rs/ext/channels/src/delivery.rs b/codex-rs/ext/channels/src/delivery.rs
+index e93e8cbe25..d4d240a596 100644
+--- a/codex-rs/ext/channels/src/delivery.rs
++++ b/codex-rs/ext/channels/src/delivery.rs
+@@ -30,17 +30,22 @@ use crate::render::render;
+ pub const MAX_PENDING: usize = 64;
+ 
+ /// What became of an attempt to hand the waiting notifications to the thread.
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[derive(Clone, Debug, PartialEq, Eq)]
+ pub enum DeliveryOutcome {
+-    /// The thread accepted them. Steered batches still need a recording confirmation.
+-    Delivered,
++    /// The turn `turn_id` accepted them; they wait for a recording confirmation.
++    Delivered { turn_id: String },
+     /// Nothing was handed over; retry at the next wake.
+     Later,
+ }
+ 
+-/// How rendered notifications reach a thread, oldest first.
++/// How rendered notifications reach a thread, oldest first. Both paths tag the recorded user
++/// message with `batch_id` as `channels` extension data, which confirms the batch.
+ pub trait Delivery: Send + Sync + 'static {
+-    fn deliver<'a>(&'a self, notifications: &'a [String]) -> ExtensionFuture<'a, DeliveryOutcome>;
++    fn deliver<'a>(
++        &'a self,
++        notifications: &'a [String],
++        batch_id: u64,
++    ) -> ExtensionFuture<'a, DeliveryOutcome>;
+ 
+     fn steer<'a>(
+         &'a self,
+@@ -70,8 +75,8 @@ impl ThreadDelivery {
+     }
+ }
+ 
+-fn request(notifications: &[String]) -> TurnInputRequest {
+-    TurnInputRequest::new(TurnInput::UserInput {
++fn request(notifications: &[String], batch_id: u64) -> TurnInputRequest {
++    let mut request = TurnInputRequest::new(TurnInput::UserInput {
+         content: notifications
+             .iter()
+             .map(|text| UserInput::Text {
+@@ -80,11 +85,22 @@ fn request(notifications: &[String]) -> TurnInputRequest {
+             })
+             .collect(),
+         client_id: None,
+-    })
++    });
++    request
++        .user_input_extension_data
++        .insert(BATCH_KEY.to_string(), batch_id.into());
++    request
+ }
+ 
++/// Extension data key of the batch id on the recorded user message.
++pub(crate) const BATCH_KEY: &str = "channels";
++
+ impl Delivery for ThreadDelivery {
+-    fn deliver<'a>(&'a self, notifications: &'a [String]) -> ExtensionFuture<'a, DeliveryOutcome> {
++    fn deliver<'a>(
++        &'a self,
++        notifications: &'a [String],
++        batch_id: u64,
++    ) -> ExtensionFuture<'a, DeliveryOutcome> {
+         Box::pin(async move {
+             let Some(manager) = self.thread_manager.get().and_then(Weak::upgrade) else {
+                 return DeliveryOutcome::Later;
+@@ -93,12 +109,14 @@ impl Delivery for ThreadDelivery {
+                 debug!(thread_id = %self.thread_id, "MCP channel delivery waits for its thread");
+                 return DeliveryOutcome::Later;
+             };
+-            let request = request(notifications).on_start(TurnStartOptions {
++            let request = request(notifications, batch_id).on_start(TurnStartOptions {
+                 turn_trigger: Some(CHANNEL_TURN_TRIGGER.to_string()),
+                 ..Default::default()
+             });
+             match thread.start_turn_if_idle(request).await {
+-                Ok(StartIfIdleSubmission::Started { .. }) => DeliveryOutcome::Delivered,
++                Ok(StartIfIdleSubmission::Started { turn_id, .. }) => {
++                    DeliveryOutcome::Delivered { turn_id }
++                }
+                 Ok(StartIfIdleSubmission::NotSubmitted { reason }) => {
+                     debug!(thread_id = %self.thread_id, ?reason, "MCP channel delivery waits");
+                     DeliveryOutcome::Later
+@@ -124,12 +142,11 @@ impl Delivery for ThreadDelivery {
+             let Ok(thread) = manager.get_thread(self.thread_id).await else {
+                 return DeliveryOutcome::Later;
+             };
+-            let mut request = request(notifications);
+-            request
+-                .user_input_extension_data
+-                .insert("channels".to_string(), batch_id.into());
+-            match thread.steer_turn(request, turn_id.to_string()).await {
+-                Ok(SteerSubmission::Steered { .. }) => {
++            match thread
++                .steer_turn(request(notifications, batch_id), turn_id.to_string())
++                .await
++            {
++                Ok(SteerSubmission::Steered { turn_id: steered }) => {
+                     debug!(
+                         event.name = "channels.input_steered",
+                         thread_id = %self.thread_id,
+@@ -138,7 +155,7 @@ impl Delivery for ThreadDelivery {
+                         count = notifications.len(),
+                         "MCP channel input accepted by the active turn"
+                     );
+-                    DeliveryOutcome::Delivered
++                    DeliveryOutcome::Delivered { turn_id: steered }
+                 }
+                 Ok(SteerSubmission::NotSubmitted { reason }) => {
+                     debug!(thread_id = %self.thread_id, ?reason, "MCP channel steer declined; trying idle delivery");
+@@ -237,6 +254,10 @@ struct Item {
+ struct Batch {
+     id: u64,
+     items: Vec<Item>,
++    /// The turn that accepted the batch.
++    turn: String,
++    /// Whether that turn has started. A turn started for an idle batch reports its start later.
++    started: bool,
+ }
+ 
+ #[derive(Default)]
+@@ -281,6 +302,7 @@ impl Queue {
+         match event {
+             WorkerEvent::Wake => true,
+             WorkerEvent::TurnStarted(id) => {
++                self.turn_started(&id);
+                 self.active_turn = Some(id);
+                 true
+             }
+@@ -289,38 +311,65 @@ impl Queue {
+                 false
+             }
+             WorkerEvent::TurnEnded { turn_id, aborted } => {
+-                if self.active_turn.as_ref() != Some(&turn_id) {
+-                    return false;
++                if self.active_turn.as_ref() == Some(&turn_id) {
++                    self.active_turn = None;
+                 }
+-                self.active_turn = None;
++                let (ended, current) = self.take_in_flight(|batch| batch.turn == turn_id);
++                self.in_flight = current;
+                 if aborted {
+-                    let mut recovered: VecDeque<Item> = self
+-                        .in_flight
+-                        .drain(..)
+-                        .flat_map(|batch| batch.items)
+-                        .collect();
+-                    recovered.append(&mut self.pending);
+-                    self.pending = recovered;
++                    self.requeue(ended);
+                 } else {
+-                    let count: usize = self.in_flight.iter().map(|batch| batch.items.len()).sum();
+-                    if count > 0 {
+-                        warn!(
+-                            count,
+-                            "discarding unconfirmed MCP channel input after turn completion"
+-                        );
+-                    }
+-                    self.in_flight.clear();
++                    discard(ended);
+                 }
+                 false
+             }
+         }
+     }
+ 
++    /// Only one regular turn runs at a time. Unconfirmed batches of another turn are settled:
++    /// a turn that never started recorded nothing, so its batches return to the queue; a turn
++    /// that started and ended unreported is treated like a completed turn.
++    fn turn_started(&mut self, turn_id: &str) {
++        let (mut current, earlier) = self.take_in_flight(|batch| batch.turn == turn_id);
++        for batch in &mut current {
++            batch.started = true;
++        }
++        self.in_flight = current;
++        let (never_started, ended): (Vec<Batch>, Vec<Batch>) =
++            earlier.into_iter().partition(|batch| !batch.started);
++        self.requeue(never_started);
++        discard(ended);
++    }
++
++    /// Splits the unconfirmed batches, in order, into those matching `select` and the rest.
++    fn take_in_flight(&mut self, select: impl Fn(&Batch) -> bool) -> (Vec<Batch>, Vec<Batch>) {
++        std::mem::take(&mut self.in_flight)
++            .into_iter()
++            .partition(|batch| select(batch))
++    }
++
++    /// Unconfirmed batches go back to the head of the queue, oldest first.
++    fn requeue(&mut self, batches: Vec<Batch>) {
++        if batches.is_empty() {
++            return;
++        }
++        let mut recovered: VecDeque<Item> =
++            batches.into_iter().flat_map(|batch| batch.items).collect();
++        recovered.append(&mut self.pending);
++        self.pending = recovered;
++    }
++
++    fn next_batch_id(&mut self) -> u64 {
++        let id = self.next_id;
++        self.next_id += 1;
++        id
++    }
++
+     async fn deliver(&mut self, delivery: &dyn Delivery) {
+         if self.pending.is_empty() {
+             return;
+         }
+-        if let Some(turn_id) = &self.active_turn {
++        if let Some(active_turn) = self.active_turn.clone() {
+             let items: Vec<Item> = self
+                 .pending
+                 .iter()
+@@ -330,27 +379,52 @@ impl Queue {
+             if !items.is_empty() {
+                 let rendered: Vec<String> =
+                     items.iter().map(|item| item.rendered.clone()).collect();
+-                let id = self.next_id;
+-                self.next_id += 1;
+-                if delivery.steer(&rendered, turn_id, id).await == DeliveryOutcome::Delivered {
++                let id = self.next_batch_id();
++                if let DeliveryOutcome::Delivered { turn_id } =
++                    delivery.steer(&rendered, &active_turn, id).await
++                {
+                     self.pending.retain(|item| !item.during_turn);
+-                    self.in_flight.push(Batch { id, items });
++                    self.in_flight.push(Batch {
++                        id,
++                        items,
++                        turn: turn_id,
++                        started: true,
++                    });
+                     return;
+                 }
+             }
+         }
+-        // Preserve the original idle path: acceptance empties pending without confirmation.
++        // An idle batch starts its own turn and waits for the recording confirmation too.
+         let rendered: Vec<String> = self
+             .pending
+             .iter()
+             .map(|item| item.rendered.clone())
+             .collect();
+-        if delivery.deliver(&rendered).await == DeliveryOutcome::Delivered {
+-            self.pending.clear();
++        let id = self.next_batch_id();
++        if let DeliveryOutcome::Delivered { turn_id } = delivery.deliver(&rendered, id).await {
++            let items = self.pending.drain(..).collect();
++            self.in_flight.push(Batch {
++                id,
++                items,
++                turn: turn_id,
++                started: false,
++            });
+         }
+     }
+ }
+ 
++/// A completed turn that did not record its input (for example, an input hook blocked it)
++/// does not get it again, so a blocking hook cannot cause a retry loop.
++fn discard(batches: Vec<Batch>) {
++    let count: usize = batches.iter().map(|batch| batch.items.len()).sum();
++    if count > 0 {
++        warn!(
++            count,
++            "discarding unconfirmed MCP channel input after turn completion"
++        );
++    }
++}
++
+ impl Drop for Queue {
+     fn drop(&mut self) {
+         let count = self.len();
+diff --git a/codex-rs/ext/channels/src/delivery_tests.rs b/codex-rs/ext/channels/src/delivery_tests.rs
+index 3cfff9e0f6..fe0f9cc6c1 100644
+--- a/codex-rs/ext/channels/src/delivery_tests.rs
++++ b/codex-rs/ext/channels/src/delivery_tests.rs
+@@ -18,6 +18,12 @@ use super::Worker;
+ 
+ const WAIT: Duration = Duration::from_secs(5);
+ 
++fn delivered(turn_id: &str) -> DeliveryOutcome {
++    DeliveryOutcome::Delivered {
++        turn_id: turn_id.to_string(),
++    }
++}
++
+ /// Answers with scripted outcomes (then `Delivered`) and reports each attempt.
+ struct ScriptedDelivery {
+     outcomes: Mutex<VecDeque<DeliveryOutcome>>,
+@@ -25,7 +31,11 @@ struct ScriptedDelivery {
+ }
+ 
+ impl Delivery for ScriptedDelivery {
+-    fn deliver<'a>(&'a self, notifications: &'a [String]) -> ExtensionFuture<'a, DeliveryOutcome> {
++    fn deliver<'a>(
++        &'a self,
++        notifications: &'a [String],
++        _batch_id: u64,
++    ) -> ExtensionFuture<'a, DeliveryOutcome> {
+         Box::pin(async move {
+             self.attempts
+                 .send(notifications.to_vec())
+@@ -34,7 +44,7 @@ impl Delivery for ScriptedDelivery {
+                 .lock()
+                 .expect("outcomes")
+                 .pop_front()
+-                .unwrap_or(DeliveryOutcome::Delivered)
++                .unwrap_or_else(|| delivered("turn"))
+         })
+     }
+ }
+@@ -194,7 +204,11 @@ async fn dropping_the_worker_stops_delivery() {
+ struct NeverDelivery;
+ 
+ impl Delivery for NeverDelivery {
+-    fn deliver<'a>(&'a self, _notifications: &'a [String]) -> ExtensionFuture<'a, DeliveryOutcome> {
++    fn deliver<'a>(
++        &'a self,
++        _notifications: &'a [String],
++        _batch_id: u64,
++    ) -> ExtensionFuture<'a, DeliveryOutcome> {
+         Box::pin(async { DeliveryOutcome::Later })
+     }
+ }
+@@ -216,13 +230,17 @@ struct SteeringDelivery {
+ }
+ 
+ impl Delivery for SteeringDelivery {
+-    fn deliver<'a>(&'a self, texts: &'a [String]) -> ExtensionFuture<'a, DeliveryOutcome> {
++    fn deliver<'a>(
++        &'a self,
++        texts: &'a [String],
++        _batch_id: u64,
++    ) -> ExtensionFuture<'a, DeliveryOutcome> {
+         Box::pin(async move {
+             self.attempts
+                 .lock()
+                 .expect("attempts")
+                 .push(Attempt::Idle(texts.to_vec()));
+-            self.idle
++            self.idle.clone()
+         })
+     }
+ 
+@@ -242,7 +260,7 @@ impl Delivery for SteeringDelivery {
+                     batch,
+                 });
+             if self.accepted {
+-                DeliveryOutcome::Delivered
++                delivered(turn)
+             } else {
+                 DeliveryOutcome::Later
+             }
+@@ -370,8 +388,12 @@ async fn rejected_steer_falls_back_to_the_original_idle_batch_without_losing_inp
+     );
+     assert_eq!(queue.len(), 2);
+     assert!(queue.in_flight.is_empty());
+-    delivery.idle = DeliveryOutcome::Delivered;
++    delivery.idle = delivered("channel turn");
+     queue.deliver(&delivery).await;
++    assert!(queue.pending.is_empty());
++    assert_eq!(queue.in_flight.len(), 1);
++    let id = queue.in_flight[0].id;
++    queue.event(WorkerEvent::Confirmed(id));
+     assert_eq!(queue.len(), 0);
+ }
+ 
+@@ -420,17 +442,21 @@ struct ConfirmingDelivery {
+ }
+ 
+ impl Delivery for ConfirmingDelivery {
+-    fn deliver<'a>(&'a self, _texts: &'a [String]) -> ExtensionFuture<'a, DeliveryOutcome> {
++    fn deliver<'a>(
++        &'a self,
++        _texts: &'a [String],
++        _batch_id: u64,
++    ) -> ExtensionFuture<'a, DeliveryOutcome> {
+         Box::pin(async move {
+             self.attempts.send("idle").expect("attempts");
+-            DeliveryOutcome::Delivered
++            delivered("turn")
+         })
+     }
+ 
+     fn steer<'a>(
+         &'a self,
+         _texts: &'a [String],
+-        _turn: &'a str,
++        turn: &'a str,
+         batch: u64,
+     ) -> ExtensionFuture<'a, DeliveryOutcome> {
+         Box::pin(async move {
+@@ -440,7 +466,7 @@ impl Delivery for ConfirmingDelivery {
+                 .send(super::WorkerEvent::Confirmed(batch))
+                 .expect("worker alive");
+             self.attempts.send("steer").expect("attempts");
+-            DeliveryOutcome::Delivered
++            delivered(turn)
+         })
+     }
+ }
+@@ -481,3 +507,95 @@ async fn confirmation_during_submission_is_processed_before_abort_and_new_delive
+             .is_err()
+     );
+ }
++
++fn idle(turn_id: &str) -> SteeringDelivery {
++    SteeringDelivery {
++        accepted: false,
++        idle: delivered(turn_id),
++        attempts: Mutex::new(Vec::new()),
++    }
++}
++
++#[tokio::test]
++async fn idle_batches_wait_for_their_recording_confirmation() {
++    use super::Queue;
++    use super::WorkerEvent;
++
++    let delivery = idle("channel turn");
++    let mut queue = Queue::default();
++    queue.push(&event("one"), false);
++    queue.deliver(&delivery).await;
++    assert!(queue.pending.is_empty());
++    assert_eq!(queue.len(), 1);
++    assert!(queue.event(WorkerEvent::TurnStarted("channel turn".to_string())));
++    queue.event(WorkerEvent::Confirmed(0));
++    assert_eq!(queue.len(), 0);
++}
++
++#[tokio::test]
++async fn an_aborted_channel_turn_returns_its_unrecorded_batch_to_the_head_of_the_queue() {
++    use super::Queue;
++    use super::WorkerEvent;
++
++    let delivery = idle("channel turn");
++    let mut queue = Queue::default();
++    queue.push(&event("one"), false);
++    queue.deliver(&delivery).await;
++    queue.push(&event("two"), false);
++    queue.event(WorkerEvent::TurnStarted("channel turn".to_string()));
++    assert!(!queue.event(WorkerEvent::TurnEnded {
++        turn_id: "channel turn".to_string(),
++        aborted: true,
++    }));
++    assert!(queue.in_flight.is_empty());
++    let pending: Vec<&str> = queue
++        .pending
++        .iter()
++        .map(|item| item.rendered.as_str())
++        .collect();
++    assert_eq!(pending, vec![rendered("one"), rendered("two")]);
++}
++
++#[tokio::test]
++async fn a_batch_whose_turn_never_started_returns_when_another_turn_starts() {
++    use super::Queue;
++    use super::WorkerEvent;
++
++    let delivery = idle("cancelled before start");
++    let mut queue = Queue::default();
++    queue.push(&event("kept"), false);
++    queue.deliver(&delivery).await;
++    queue.event(WorkerEvent::TurnStarted("next".to_string()));
++    assert!(queue.in_flight.is_empty());
++    assert_eq!(queue.pending.len(), 1);
++    assert_eq!(queue.pending[0].rendered, rendered("kept"));
++    assert_eq!(queue.active_turn.as_deref(), Some("next"));
++}
++
++#[tokio::test]
++async fn a_completed_channel_turn_without_recording_does_not_replay_its_batch() {
++    use super::Queue;
++    use super::WorkerEvent;
++
++    let delivery = idle("blocked by a hook");
++    let mut queue = Queue::default();
++    queue.push(&event("blocked"), false);
++    queue.deliver(&delivery).await;
++    queue.event(WorkerEvent::TurnStarted("blocked by a hook".to_string()));
++    queue.event(WorkerEvent::TurnEnded {
++        turn_id: "blocked by a hook".to_string(),
++        aborted: false,
++    });
++    assert_eq!(queue.len(), 0);
++    queue.deliver(&delivery).await;
++    assert_eq!(delivery.attempts.lock().expect("attempts").len(), 1);
++}
++
++#[test]
++fn both_paths_tag_the_recorded_message_with_the_batch_id() {
++    let request = super::request(&["text".to_string()], 7);
++    assert_eq!(
++        request.user_input_extension_data.get(super::BATCH_KEY),
++        Some(&json!(7))
++    );
++}
+diff --git a/codex-rs/ext/channels/src/lib.rs b/codex-rs/ext/channels/src/lib.rs
+index 2d7c877444..7001833134 100644
+--- a/codex-rs/ext/channels/src/lib.rs
++++ b/codex-rs/ext/channels/src/lib.rs
+@@ -10,8 +10,8 @@
+ //! arrive during a turn wait, in order, and start one turn together when the thread is next
+ //! idle; after an interrupted turn they wait for the next notification or completed turn.
+ //! With `channel_during_turn = true`, a server's events instead steer the active regular turn.
+-//! Steered input is retained until recorded; an interrupt returns unrecorded input to the queue
+-//! without restarting work. Other turn kinds retain the idle behavior.
++//! Other turn kinds retain the idle behavior. On both paths input is retained until recorded;
++//! an interrupt returns unrecorded input to the queue without restarting work.
+ //! Sub-agent and other non-root threads do not start channel servers at all, so a server never
+ //! runs twice for one chat.
+ 
+@@ -201,7 +201,7 @@ impl TurnLifecycleContributor for ChannelsExtension {
+         Box::pin(async move {
+             if matches!(item, TurnItem::UserMessage(_))
+                 && let Some(id) = metadata
+-                    .and_then(|data| data.get("channels"))
++                    .and_then(|data| data.get(delivery::BATCH_KEY))
+                     .and_then(serde_json::Value::as_u64)
+                 && let Some(worker) = thread_store.get::<Worker>()
+             {
+-- 
+2.53.0
+

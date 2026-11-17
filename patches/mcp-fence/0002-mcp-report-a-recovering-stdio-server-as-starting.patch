@@ -1,0 +1,28 @@
+From d1301092e7628fa04b9c50876606dfa0a1833a41 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 19:47:40 +0100
+Subject: [PATCH 2/3] mcp: report a recovering stdio server as starting
+
+A stdio server that exited and is being restarted reported connected in
+the MCP server status. Report starting until the replacement is ready.
+---
+ codex-rs/codex-mcp/src/rmcp_client/status.rs | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/codex-rs/codex-mcp/src/rmcp_client/status.rs b/codex-rs/codex-mcp/src/rmcp_client/status.rs
+index 6bb9af07a3..c67af924eb 100644
+--- a/codex-rs/codex-mcp/src/rmcp_client/status.rs
++++ b/codex-rs/codex-mcp/src/rmcp_client/status.rs
+@@ -31,6 +31,9 @@ impl AsyncManagedClient {
+             Some(Ok(client)) => {
+                 if client.client.is_closed().await {
+                     Status::Failed
++                } else if client.client.is_recovering().await {
++                    // An opted-in stdio server is being restarted.
++                    Status::Starting
+                 } else {
+                     Status::Connected
+                 }
+-- 
+2.53.0
+

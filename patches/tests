@@ -41,3 +41,13 @@ mcp-restart: -p codex-rmcp-client --test mcp_2026_stdio
 mcp-restart: -p codex-core --lib config::schema::tests
 
 mcp-restart-tests: -p codex-app-server --test all suite::v2::mcp_restart::
+
+mcp-fence: -p codex-rmcp-client --lib custom_notifications::
+mcp-fence: -p codex-rmcp-client --lib stdio_restart::
+mcp-fence: -p codex-rmcp-client --test stdio_restart
+mcp-fence: -p codex-mcp --lib channel_fence::
+mcp-fence: -p codex-mcp --lib channel::
+mcp-fence: -p codex-mcp --lib restart::
+mcp-fence: -p codex-channels-extension
+mcp-fence: -p codex-app-server --test all suite::v2::mcp_restart::
+mcp-fence: -p codex-app-server --test all suite::v2::mcp_channels::
