@@ -1,4 +1,4 @@
-From 9617ed49b22a67984d9de68e13acd4aa09313eac Mon Sep 17 00:00:00 2001
+From bb516a15385cadcc51e85a78c8253894a332d2d5 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 11:55:16 +0100
 Subject: [PATCH 1/2] mcp: opt in to bounded stdio server recovery
@@ -10,7 +10,7 @@ Subject: [PATCH 1/2] mcp: opt in to bounded stdio server recovery
  codex-rs/codex-mcp/src/elicitation.rs         |  13 +
  codex-rs/codex-mcp/src/lib.rs                 |   1 +
  codex-rs/codex-mcp/src/restart.rs             |  65 +++
- codex-rs/codex-mcp/src/rmcp_client.rs         |  17 +-
+ codex-rs/codex-mcp/src/rmcp_client.rs         |  22 +-
  .../src/rmcp_client/managed_client.rs         |   1 +
  codex-rs/codex-mcp/src/server.rs              |   8 +
  codex-rs/codex-mcp/src/server_tests.rs        |  10 +
@@ -19,9 +19,9 @@ Subject: [PATCH 1/2] mcp: opt in to bounded stdio server recovery
  codex-rs/rmcp-client/src/lib.rs               |   2 +
  .../rmcp-client/src/local_stdio_transport.rs  |   5 +
  codex-rs/rmcp-client/src/rmcp_client.rs       |  70 ++-
- codex-rs/rmcp-client/src/stdio_restart.rs     | 464 ++++++++++++++++++
+ codex-rs/rmcp-client/src/stdio_restart.rs     | 479 ++++++++++++++++++
  .../rmcp-client/src/stdio_server_launcher.rs  | 160 +++++-
- 17 files changed, 805 insertions(+), 38 deletions(-)
+ 17 files changed, 825 insertions(+), 38 deletions(-)
  create mode 100644 codex-rs/codex-mcp/src/restart.rs
  create mode 100644 codex-rs/rmcp-client/src/stdio_restart.rs
 
@@ -211,7 +211,7 @@ index 0000000000..697f2ce0a8
 +    }
 +}
 diff --git a/codex-rs/codex-mcp/src/rmcp_client.rs b/codex-rs/codex-mcp/src/rmcp_client.rs
-index 94c272fedc..06ae06f654 100644
+index 94c272fedc..397954c210 100644
 --- a/codex-rs/codex-mcp/src/rmcp_client.rs
 +++ b/codex-rs/codex-mcp/src/rmcp_client.rs
 @@ -364,9 +364,18 @@ impl ManagedClientStartup {
@@ -236,15 +236,33 @@ index 94c272fedc..06ae06f654 100644
                      Err(_) => {
                          return Err(StartupOutcomeError::from(anyhow!(
                              "MCP client startup timed out after {startup_timeout:?}"
-@@ -1189,6 +1198,7 @@ async fn start_server_task(
+@@ -380,6 +389,7 @@ impl ManagedClientStartup {
+                     server_name.clone(),
+                     client,
+                     StartServerTaskParams {
++                        restart_cancellation: cancel_token_for_fut.clone(),
+                         sharing_declined,
+                         publish_apps,
+                         is_codex_apps_mcp_server,
+@@ -1126,6 +1136,7 @@ async fn start_server_task(
+     params: StartServerTaskParams,
+ ) -> Result<ManagedClient, StartupOutcomeError> {
+     let StartServerTaskParams {
++        restart_cancellation,
+         sharing_declined,
+         publish_apps,
+         is_codex_apps_mcp_server,
+@@ -1189,6 +1200,9 @@ async fn start_server_task(
          &initialize_result,
      );
      let initialize_result = initialize_result.map_err(StartupOutcomeError::from)?;
-+    let stdio_restart = client.supervise_stdio_restarts().map(Arc::new);
++    let stdio_restart = client
++        .supervise_stdio_restarts_with_cancellation(restart_cancellation)
++        .map(Arc::new);
      if let Some(channel) = channel {
          channel.connect(server_name.clone(), &initialize_result);
      }
-@@ -1312,6 +1322,7 @@ async fn start_server_task(
+@@ -1312,6 +1326,7 @@ async fn start_server_task(
          connection_sharing,
          shared_elicitation: None,
          _auth_change_notifications: auth_change_notifications,
@@ -252,6 +270,14 @@ index 94c272fedc..06ae06f654 100644
          client: Arc::clone(&client),
          server_info,
          tool_catalog: Arc::new(ClientToolCatalog::new(
+@@ -1416,6 +1431,7 @@ fn mcp_server_info_from_implementation(
+ }
+ 
+ struct StartServerTaskParams {
++    restart_cancellation: CancellationToken,
+     publish_apps: Option<watch::Sender<Option<std::sync::Weak<RmcpClient>>>>,
+     sharing_declined: Option<CancellationToken>,
+     server_capabilities: Arc<StdMutex<Option<serde_json::Value>>>,
 diff --git a/codex-rs/codex-mcp/src/rmcp_client/managed_client.rs b/codex-rs/codex-mcp/src/rmcp_client/managed_client.rs
 index 7c3d830dc2..7f95714fc3 100644
 --- a/codex-rs/codex-mcp/src/rmcp_client/managed_client.rs
@@ -540,10 +566,10 @@ index 1f4a273673..c44d234ad9 100644
          let (transport, oauth_runtime) = match pending_transport {
 diff --git a/codex-rs/rmcp-client/src/stdio_restart.rs b/codex-rs/rmcp-client/src/stdio_restart.rs
 new file mode 100644
-index 0000000000..2300d74df5
+index 0000000000..87c36360e4
 --- /dev/null
 +++ b/codex-rs/rmcp-client/src/stdio_restart.rs
-@@ -0,0 +1,464 @@
+@@ -0,0 +1,479 @@
 +//! Bounded recovery of an opted-in stdio connection, without replaying requests.
 +
 +use std::future::Future;
@@ -797,6 +823,14 @@ index 0000000000..2300d74df5
 +
 +    /// Start proactive exit detection after initialize and return its ownership guard.
 +    pub fn supervise_stdio_restarts(self: &Arc<Self>) -> Option<StdioRestartGuard> {
++        self.supervise_stdio_restarts_with_cancellation(CancellationToken::new())
++    }
++
++    /// Also stop recovery when the owning connection is retired by a runtime refresh.
++    pub fn supervise_stdio_restarts_with_cancellation(
++        self: &Arc<Self>,
++        cancellation: CancellationToken,
++    ) -> Option<StdioRestartGuard> {
 +        let restart = self.stdio_restart.as_ref()?;
 +        if restart.supervising.swap(true, Ordering::AcqRel) {
 +            return None;
@@ -808,13 +842,20 @@ index 0000000000..2300d74df5
 +        };
 +        tokio::spawn(
 +            async move {
++                let cancelled = async {
++                    tokio::select! {
++                        () = restart.shutdown.cancelled() => {}
++                        () = cancellation.cancelled() => restart.shutdown.cancel(),
++                    }
++                };
++                tokio::pin!(cancelled);
 +                loop {
 +                    let Some(exit) = restart.exit() else {
 +                        return;
 +                    };
 +                    tokio::select! {
 +                        biased;
-+                        () = restart.shutdown.cancelled() => {
++                        () = &mut cancelled => {
 +                            if let Some(client) = weak.upgrade() { client.shutdown().await; }
 +                            return;
 +                        }
@@ -825,7 +866,7 @@ index 0000000000..2300d74df5
 +                    };
 +                    tokio::select! {
 +                        biased;
-+                        () = restart.shutdown.cancelled() => {
++                        () = &mut cancelled => {
 +                            client.shutdown().await;
 +                            return;
 +                        }

@@ -1,7 +1,7 @@
 # Restart exited stdio MCP servers
 
 Apply these two patches after channels-inject through `3520f1ce49`.
-Source commits: `9617ed49b2` (implementation and unit tests), `712d443bc8` (integration tests).
+Source commits: `bb516a1538` (implementation and unit tests), `b5f7857095` (integration tests).
 
 ```toml
 [mcp_servers.example]
@@ -26,7 +26,8 @@ can subsequently create a new connection. No additional UI events are emitted.
 Replacements reuse the first launch's arguments, working directory and host-resolved environment,
 including requested session/thread ids. Executor-owned variables follow the executor's policy.
 The previous process is terminated and its cleanup awaited before a replacement starts. Refresh,
-shutdown and release of the connection owner cancel the supervisor, its backoff and its handshake.
+shutdown, the connection cancellation token and release of the connection owner cancel the supervisor,
+its backoff and its handshake. Cancellation applies even while a caller retains a connection binding.
 Local Windows servers require process containment to support awaited restart cleanup.
 
 Every replacement passes through the usual initialize and notification capture. The preceding

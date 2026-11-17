@@ -1,19 +1,19 @@
-From 712d443bc8da25b11b3bf4e713a437530702fd7d Mon Sep 17 00:00:00 2001
+From b5f78570954699f14fe215682e1d99836262224f Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 11:55:16 +0100
 Subject: [PATCH 2/2] mcp: test stdio recovery and cancellation
 
 ---
- codex-rs/rmcp-client/tests/stdio_restart.rs | 400 ++++++++++++++++++++
- 1 file changed, 400 insertions(+)
+ codex-rs/rmcp-client/tests/stdio_restart.rs | 454 ++++++++++++++++++++
+ 1 file changed, 454 insertions(+)
  create mode 100644 codex-rs/rmcp-client/tests/stdio_restart.rs
 
 diff --git a/codex-rs/rmcp-client/tests/stdio_restart.rs b/codex-rs/rmcp-client/tests/stdio_restart.rs
 new file mode 100644
-index 0000000000..89e807d178
+index 0000000000..25d0fe55d8
 --- /dev/null
 +++ b/codex-rs/rmcp-client/tests/stdio_restart.rs
-@@ -0,0 +1,400 @@
+@@ -0,0 +1,454 @@
 +//! Recovery owns one stdio connection and never replays a tool invocation.
 +
 +#![cfg(unix)]
@@ -41,12 +41,14 @@ index 0000000000..89e807d178
 +use rmcp::model::ProtocolVersion;
 +use serde_json::Value;
 +use serde_json::json;
++use tokio_util::sync::CancellationToken;
 +
 +const WAIT: Duration = Duration::from_secs(30);
 +const SETTLE: Duration = Duration::from_millis(250);
 +
 +struct Fixture {
 +    temporary: tempfile::TempDir,
++    cancellation: CancellationToken,
 +}
 +
 +impl Fixture {
@@ -54,7 +56,10 @@ index 0000000000..89e807d178
 +        let temporary = tempfile::tempdir()?;
 +        fs::write(temporary.path().join("mode"), mode)?;
 +        fs::write(temporary.path().join("main.py"), SERVER)?;
-+        Ok(Self { temporary })
++        Ok(Self {
++            temporary,
++            cancellation: CancellationToken::new(),
++        })
 +    }
 +
 +    fn path(&self) -> &Path {
@@ -129,7 +134,8 @@ index 0000000000..89e807d178
 +                Box::new(|_, _| async { anyhow::bail!("unexpected elicitation") }.boxed()),
 +            )
 +            .await?;
-+        let supervisor = client.supervise_stdio_restarts();
++        let supervisor =
++            client.supervise_stdio_restarts_with_cancellation(self.cancellation.clone());
 +        Ok((client, supervisor))
 +    }
 +}
@@ -220,6 +226,25 @@ index 0000000000..89e807d178
 +    fixture.wait_launches(2).await?;
 +    echo(&client).await?;
 +    assert_eq!(fs::read_to_string(fixture.path().join("calls"))?, "crash\n");
++    client.shutdown().await;
++    Ok(())
++}
++
++#[tokio::test]
++async fn an_eof_with_a_live_process_is_cleaned_up_before_replacement() -> Result<()> {
++    let fixture = Fixture::new("normal")?;
++    let (client, _supervisor) = fixture
++        .client(Some(fast_policy()), false, McpProtocolMode::Legacy)
++        .await?;
++    let first = echo(&client).await?;
++    client
++        .call_tool("close".to_string(), None, |_| Ok(None), Some(WAIT))
++        .await
++        .expect_err("closing stdout fails the call");
++    fixture.wait_launches(2).await?;
++    // The old process ignores TERM and must be killed before a new one is launched.
++    assert_eq!(unsafe { libc::kill(pid(&first), 0) }, -1);
++    assert_ne!(echo(&client).await?["pid"], first["pid"]);
 +    client.shutdown().await;
 +    Ok(())
 +}
@@ -324,6 +349,30 @@ index 0000000000..89e807d178
 +}
 +
 +#[tokio::test]
++async fn retiring_a_connection_cancels_recovery_while_a_caller_keeps_it_alive() -> Result<()> {
++    let fixture = Fixture::new("hang_restart")?;
++    let (client, _supervisor) = fixture
++        .client(Some(fast_policy()), false, McpProtocolMode::Legacy)
++        .await?;
++    kill(&echo(&client).await?);
++    let launches = fixture.wait_launches(2).await?;
++    fixture.cancellation.cancel();
++    for launch in &launches {
++        wait_gone(pid(launch)).await?;
++    }
++    tokio::time::timeout(WAIT, async {
++        while !client.is_closed().await {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await?;
++    assert!(echo(&client).await.is_err());
++    tokio::time::sleep(SETTLE).await;
++    assert_eq!(fixture.launches()?.len(), 2);
++    Ok(())
++}
++
++#[tokio::test]
 +async fn shutdown_and_owner_drop_stop_a_replacement_during_initialize() -> Result<()> {
 +    for drop_owner in [false, true] {
 +        let fixture = Fixture::new("hang_restart")?;
@@ -401,6 +450,11 @@ index 0000000000..89e807d178
 +        elif method == "tools/list":
 +            result = {"tools": []}
 +        elif method == "tools/call":
++            if request["params"]["name"] == "close":
++                signal.signal(signal.SIGTERM, signal.SIG_IGN)
++                os.close(sys.stdout.fileno())
++                time.sleep(60)
++                return
 +            if request["params"]["name"] == "crash":
 +                with (root / "calls").open("a") as stream:
 +                    stream.write("crash\n")
