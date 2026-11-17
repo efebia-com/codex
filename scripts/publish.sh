@@ -30,12 +30,16 @@ cp "${DIST_ROOT}/install.sh" "${assets}/install.sh"
 ) | LC_ALL=C sort -k 2 >"${assets}/SHA256SUMS"
 
 first="$(basename "${archives[0]}" .tar.gz)"
+platforms=Linux
+for archive in "${archives[@]}"; do
+  if [[ "$archive" == *-apple-darwin.tar.gz ]]; then platforms="Linux and macOS"; fi
+done
 notes="$(mktemp)"
 trap 'rm -f "$notes"' EXIT
 {
   echo "Codex ${version}: upstream [${tag}](https://github.com/${UPSTREAM_REPO}/releases/tag/${tag}) with the extensions below."
   echo
-  echo "Install or update (Linux and macOS):"
+  echo "Install or update (${platforms}):"
   echo
   echo '```sh'
   echo "curl -fsSL https://github.com/${repo}/releases/latest/download/install.sh | sh"

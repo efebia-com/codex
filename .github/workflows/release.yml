@@ -26,6 +26,10 @@ on:
         description: "Publish a new revision even if this upstream version is already published"
         type: boolean
         default: false
+      macos:
+        description: "Build and publish the macOS packages too (off: Linux only)"
+        type: boolean
+        default: true
 
 # One release run at a time; a scheduled run that arrives meanwhile waits and
 # then finds the release already published.
@@ -55,6 +59,8 @@ jobs:
       build: ${{ steps.check.outputs.build }}
       upstream_tag: ${{ steps.check.outputs.upstream_tag }}
       version: ${{ steps.check.outputs.version }}
+      macos: ${{ steps.targets.outputs.macos }}
+      smoke: ${{ steps.targets.outputs.smoke }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -79,6 +85,17 @@ jobs:
           if [[ "${INPUT_FORCE:-}" == "true" ]]; then args+=(--force); fi
           if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then args+=(--scheduled); fi
           scripts/check-release.sh "${args[@]}" | tee -a "$GITHUB_OUTPUT"
+      - name: Choose the targets
+        id: targets
+        env:
+          # Scheduled runs have no inputs: they build every target.
+          MACOS: ${{ github.event_name != 'workflow_dispatch' || inputs.macos }}
+        run: |
+          linux='{"target":"x86_64-unknown-linux-musl","runner":"ubuntu-24.04"},{"target":"aarch64-unknown-linux-musl","runner":"ubuntu-24.04-arm"}'
+          macos='{"target":"aarch64-apple-darwin","runner":"macos-15"},{"target":"x86_64-apple-darwin","runner":"macos-15-intel"}'
+          if [[ "$MACOS" == true ]]; then smoke="[${linux},${macos}]"; else smoke="[${linux}]"; fi
+          echo "macos=${MACOS}" >>"$GITHUB_OUTPUT"
+          echo "smoke=${smoke}" >>"$GITHUB_OUTPUT"
       - name: Check that the patches apply
         if: steps.check.outputs.build == 'true'
         run: scripts/prepare-source.sh --skip-lock "${{ steps.check.outputs.upstream_tag }}" "$SOURCE_DIR"
@@ -195,7 +212,7 @@ jobs:
     # Runners are free for a public repository: build alongside the tests, which
     # still gate the publish job.
     needs: plan
-    if: needs.plan.outputs.build == 'true'
+    if: needs.plan.outputs.build == 'true' && needs.plan.outputs.macos == 'true'
     name: build (${{ matrix.target }})
     runs-on: macos-15
     # Upstream builds this in ~45 min on 6-core runners; standard runners have 3.
@@ -234,6 +251,8 @@ jobs:
 
   smoke:
     needs: [plan, build-linux, build-macos]
+    # build-macos is skipped in a Linux-only run; any failure still stops here.
+    if: ${{ !cancelled() && !failure() && needs.plan.outputs.build == 'true' }}
     name: smoke (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -241,15 +260,7 @@ jobs:
       fail-fast: false
       matrix:
         # Each package runs natively on its own platform.
-        include:
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-          - target: aarch64-apple-darwin
-            runner: macos-15
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
+        include: ${{ fromJSON(needs.plan.outputs.smoke) }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -268,6 +279,7 @@ jobs:
 
   publish:
     needs: [plan, test, build-linux, build-macos, smoke]
+    if: ${{ !cancelled() && !failure() && needs.plan.outputs.build == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
