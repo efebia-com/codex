@@ -1,0 +1,30 @@
+From 31c49e5ba96497e23a070f6f235c716273c78bdb Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Tue, 17 Nov 2026 11:55:33 +0100
+Subject: [PATCH 5/5] docs: scope channel abort recovery to steered input
+
+---
+ codex-rs/ext/channels/README.md | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/codex-rs/ext/channels/README.md b/codex-rs/ext/channels/README.md
+index 6e918e19f4..1a554b4db9 100644
+--- a/codex-rs/ext/channels/README.md
++++ b/codex-rs/ext/channels/README.md
+@@ -26,7 +26,12 @@ On interrupt, unconfirmed batches return to the head of the queue in order. Inte
+ restart work: they wait for a new notification, a completed turn or the next regular turn.
+ A normal turn completion discards unconfirmed input with a warning, so an input hook that
+ blocks a message cannot create a retry loop. The limit of 64 waiting events includes
+-unconfirmed batches. Idle delivery retains its original acceptance behavior.
++unconfirmed steered batches.
++
++Idle delivery removes a batch from the queue as soon as the thread accepts a new turn, without
++waiting for a recording confirmation. An abort before recording can therefore lose that batch.
++This also applies to the idle fallback when `channel_during_turn = true`; recovery applies only
++to batches accepted by steering an active turn.
+ 
+ Pending and unconfirmed events have no durability after process exit. A cancellation between
+ recording and confirmation may cause a repeat. Recorded user input follows ordinary history,
+-- 
+2.53.0
+

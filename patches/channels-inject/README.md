@@ -26,7 +26,12 @@ On interrupt, unconfirmed batches return to the head of the queue in order. Inte
 restart work: they wait for a new notification, a completed turn or the next regular turn.
 A normal turn completion discards unconfirmed input with a warning, so an input hook that
 blocks a message cannot create a retry loop. The limit of 64 waiting events includes
-unconfirmed batches. Idle delivery retains its original acceptance behavior.
+unconfirmed steered batches.
+
+Idle delivery removes a batch from the queue as soon as the thread accepts a new turn, without
+waiting for a recording confirmation. An abort before recording can therefore lose that batch.
+This also applies to the idle fallback when `channel_during_turn = true`; recovery applies only
+to batches accepted by steering an active turn.
 
 Pending and unconfirmed events have no durability after process exit. A cancellation between
 recording and confirmation may cause a repeat. Recorded user input follows ordinary history,
