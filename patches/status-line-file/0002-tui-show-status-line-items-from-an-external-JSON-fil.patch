@@ -1,4 +1,4 @@
-From 15b2b5139fdeeaea98d5230265b00ecb007bf0f4 Mon Sep 17 00:00:00 2001
+From 32bbac20aaae86e18eeab19c8437c93e02835036 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 15:50:07 +0100
 Subject: [PATCH 2/2] tui: show status line items from an external JSON file
@@ -36,8 +36,8 @@ them as unknown ids.
  .../tests/status_line_file_tests.rs           | 148 ++++++
  codex-rs/tui/src/lib.rs                       |   1 +
  codex-rs/tui/src/status_line_file.rs          | 459 ++++++++++++++++++
- codex-rs/tui/src/status_line_file_tests.rs    | 354 ++++++++++++++
- 18 files changed, 1197 insertions(+), 32 deletions(-)
+ codex-rs/tui/src/status_line_file_tests.rs    | 360 ++++++++++++++
+ 18 files changed, 1203 insertions(+), 32 deletions(-)
  create mode 100644 codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__status_line_setup__tests__setup_view_snapshot_includes_status_line_file_fields.snap
  create mode 100644 codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_file_fields_footer.snap
  create mode 100644 codex-rs/tui/src/chatwidget/status_line_file.rs
@@ -1309,10 +1309,10 @@ index 0000000000..280851ab75
 +mod tests;
 diff --git a/codex-rs/tui/src/status_line_file_tests.rs b/codex-rs/tui/src/status_line_file_tests.rs
 new file mode 100644
-index 0000000000..34795fe4a3
+index 0000000000..a92a57ee56
 --- /dev/null
 +++ b/codex-rs/tui/src/status_line_file_tests.rs
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,360 @@
 +use super::*;
 +use pretty_assertions::assert_eq;
 +use std::time::Instant;
@@ -1637,9 +1637,11 @@ index 0000000000..34795fe4a3
 +    test.wait_for(&fields(&[("build", "first")]));
 +
 +    test.watcher.set_path(Some(second));
++    // The watcher thread may already have read the new file, but never shows the old one again.
++    let switched = test.watcher.fields();
 +    assert!(
-+        test.watcher.fields().is_empty(),
-+        "fields of the previous file are dropped immediately"
++        switched.is_empty() || *switched == fields(&[("build", "second")]),
++        "fields of the previous file are dropped immediately, have {switched:?}"
 +    );
 +    test.wait_for(&fields(&[("build", "second")]));
 +
@@ -1654,9 +1656,13 @@ index 0000000000..34795fe4a3
 +    write_atomically(&path, r#"{"fields": {"build": "ok"}}"#);
 +    let mut test = TestWatcher::spawn();
 +    test.watcher.set_path(Some(path.clone()));
-+    test.wait_for(&fields(&[("build", "ok")]));
++    // The first read is the only change so far. Its notification follows the publish, so wait for
++    // the notification itself rather than for the values.
++    test.changes
++        .recv_timeout(TEST_TIMEOUT)
++        .expect("change reported for the first read");
 +    let snapshot = test.watcher.fields();
-+    while test.changes.try_recv().is_ok() {}
++    assert_eq!(*snapshot, fields(&[("build", "ok")]));
 +
 +    // Same visible values with different formatting and an ignored key.
 +    write_atomically(&path, r#"{"fields": {"build": " ok ", "flag": false}}"#);
