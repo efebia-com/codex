@@ -1,0 +1,89 @@
+From 0c601f2cf00a9c4d2dbbc3142711d3d0d9c64bdb Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Wed, 18 Nov 2026 12:18:32 +0100
+Subject: [PATCH 2/2] tui: keep the process status file up to date
+
+Start the process status file before the app runs and remove it when
+the app returns. Each frame reports the conversation shown, the root
+thread that /new, /clear, /resume and /fork replace, which side chats,
+sub-agents and summary threads leave alone, and its working directory;
+thread status notifications report when its turns start and end. The
+file is only written when one of these changes.
+---
+ codex-rs/tui/Cargo.toml                   | 1 +
+ codex-rs/tui/src/app.rs                   | 4 ++++
+ codex-rs/tui/src/app/app_server_events.rs | 4 ++++
+ codex-rs/tui/src/lib.rs                   | 8 ++++++++
+ 4 files changed, 17 insertions(+)
+
+diff --git a/codex-rs/tui/Cargo.toml b/codex-rs/tui/Cargo.toml
+index 6e5c58f..81d485a 100644
+--- a/codex-rs/tui/Cargo.toml
++++ b/codex-rs/tui/Cargo.toml
+@@ -55,6 +55,7 @@ codex-model-provider-info = { workspace = true }
+ codex-models-manager = { workspace = true }
+ codex-otel = { workspace = true }
+ codex-plugin = { workspace = true }
++codex-process-status-file = { workspace = true }
+ codex-protocol = { workspace = true }
+ codex-realtime-webrtc = { workspace = true }
+ futures = { workspace = true }
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index 4a11d5b..ac27116 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -1319,6 +1319,10 @@ impl App {
+                     );
+                     self.chat_widget.pre_draw_tick();
+                     self.refresh_agents_overview_usage(app_server, tui.frame_requester());
++                    codex_process_status_file::show(
++                        self.primary_thread_id.as_ref().map(ToString::to_string),
++                        self.chat_widget.config_ref().cwd.as_path(),
++                    );
+                     let rendered_area = self.render_chat_widget_frame(tui, screen_size)?;
+                     if tui.is_owned_screen()
+                         && self.transcript_view.history
+diff --git a/codex-rs/tui/src/app/app_server_events.rs b/codex-rs/tui/src/app/app_server_events.rs
+index 8f179f3..f1eb1af 100644
+--- a/codex-rs/tui/src/app/app_server_events.rs
++++ b/codex-rs/tui/src/app/app_server_events.rs
+@@ -214,6 +214,10 @@ impl App {
+ 
+         if let ServerNotification::ThreadStatusChanged(status) = &notification {
+             let _ = self.dynamic_tool_status_updates.send(status.clone());
++            codex_process_status_file::thread_status(
++                &status.thread_id,
++                matches!(status.status, ThreadStatus::Active { .. }),
++            );
+         }
+ 
+         if let ServerNotification::ThreadStarted(started) = &notification
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 7a4528a..5a54a82 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -2359,6 +2359,13 @@ async fn run_ratatui_app(
+         }
+     }
+ 
++    // Tells other programs which conversation this process shows; removed when the TUI exits.
++    let process_status_file = codex_process_status_file::start(
++        config.codex_home.as_path(),
++        config.cwd.as_path(),
++        crate::version::CODEX_CLI_VERSION,
++    );
++
+     // Keep the large event-loop future out of the enclosing startup futures so session
+     // transitions have enough stack headroom to rebuild configuration and the chat widget.
+     let app_result = boxed_future!(App::run(
+@@ -2390,6 +2397,7 @@ async fn run_ratatui_app(
+         daemon_cli_executable,
+     ))
+     .await;
++    drop(process_status_file);
+ 
+     terminal_restore_guard.restore_silently();
+     // Mark the end of the recorded session.
+-- 
+2.53.0
+

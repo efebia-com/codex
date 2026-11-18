@@ -55,3 +55,5 @@ mcp-fence: -p codex-app-server --test all suite::v2::mcp_channels::
 channels-fence: -p codex-channels-extension
 channels-fence: -p codex-app-server --test all mcp_channels::fence
 channels-fence: -p codex-app-server-protocol --lib schema_fixtures
+
+process-status-file: -p codex-process-status-file

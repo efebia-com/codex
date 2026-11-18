@@ -1,0 +1,767 @@
+From 2c4d245b742231518fc818f63e452d819ce2a5a8 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Wed, 18 Nov 2026 12:18:32 +0100
+Subject: [PATCH 1/2] process-status-file: a status file for each interactive
+ process
+
+While the TUI runs, $CODEX_HOME/processes/<pid>.json tells which
+conversation the process shows, its working directory and terminal
+pane, and whether a turn is running in it, with the field names other
+tools already read: pid, procStart, sessionId, cwd, tmux, status,
+kind, version, startedAt, updatedAt and statusUpdatedAt.
+
+The file is written atomically (a temporary file in the same directory,
+then a rename) with private permissions, only when something changes,
+and removed by a guard when the TUI exits. procStart, field 22 of
+/proc/<pid>/stat, tells a reused pid from the original process. Files
+left by processes that were killed are removed by the next start, on a
+background thread that also asks tmux for the pane's location.
+
+CODEX_PROCESS_STATUS_FILE=0 (or false, off, no) turns it off. Errors
+are ignored: the file is a hint for other programs and never stops
+Codex.
+---
+ codex-rs/Cargo.toml                       |   2 +
+ codex-rs/process-status-file/Cargo.toml   |  20 ++
+ codex-rs/process-status-file/src/lib.rs   | 362 ++++++++++++++++++++++
+ codex-rs/process-status-file/src/tests.rs | 312 +++++++++++++++++++
+ 4 files changed, 696 insertions(+)
+ create mode 100644 codex-rs/process-status-file/Cargo.toml
+ create mode 100644 codex-rs/process-status-file/src/lib.rs
+ create mode 100644 codex-rs/process-status-file/src/tests.rs
+
+diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
+index 71567d4..89d3519 100644
+--- a/codex-rs/Cargo.toml
++++ b/codex-rs/Cargo.toml
+@@ -101,6 +101,7 @@ members = [
+     "network-proxy",
+     "ollama",
+     "process-hardening",
++    "process-status-file",
+     "realtime-webrtc",
+     "voice-host",
+     "protocol",
+@@ -285,6 +286,7 @@ codex-otel-trace-websocket = { path = "otel-trace-websocket" }
+ codex-plugin = { path = "plugin" }
+ codex-model-provider = { path = "model-provider" }
+ codex-process-hardening = { path = "process-hardening" }
++codex-process-status-file = { path = "process-status-file" }
+ codex-protocol = { path = "protocol" }
+ codex-protocol-test-support = { path = "protocol/tests/support" }
+ codex-prompts = { path = "prompts" }
+diff --git a/codex-rs/process-status-file/Cargo.toml b/codex-rs/process-status-file/Cargo.toml
+new file mode 100644
+index 0000000..cee4ab9
+--- /dev/null
++++ b/codex-rs/process-status-file/Cargo.toml
+@@ -0,0 +1,20 @@
++[package]
++name = "codex-process-status-file"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++
++[lib]
++name = "codex_process_status_file"
++path = "src/lib.rs"
++doctest = false
++
++[lints]
++workspace = true
++
++[dependencies]
++serde_json = { workspace = true }
++
++[dev-dependencies]
++pretty_assertions = { workspace = true }
++tempfile = { workspace = true }
+diff --git a/codex-rs/process-status-file/src/lib.rs b/codex-rs/process-status-file/src/lib.rs
+new file mode 100644
+index 0000000..f734e94
+--- /dev/null
++++ b/codex-rs/process-status-file/src/lib.rs
+@@ -0,0 +1,362 @@
++//! A status file for each running interactive Codex process.
++//!
++//! While the TUI runs, `$CODEX_HOME/processes/<pid>.json` tells which conversation the process
++//! shows, in which directory and terminal pane, and whether a turn is running in it. Other
++//! programs can map a process or a pane to its conversation without asking Codex. The file is
++//! replaced atomically on every change and removed when the TUI exits; files left by processes
++//! that were killed are removed by the next Codex that starts. Setting
++//! `CODEX_PROCESS_STATUS_FILE=0` turns it off.
++
++use std::collections::HashSet;
++use std::fs;
++use std::io;
++use std::io::Write;
++use std::path::Path;
++use std::path::PathBuf;
++use std::process::Command;
++use std::process::Stdio;
++use std::sync::Mutex;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
++
++use serde_json::Value;
++use serde_json::json;
++
++/// Directory under `CODEX_HOME` with one file per running process.
++pub const DIRECTORY: &str = "processes";
++
++/// Environment variable that turns the file off when set to `0`, `false`, `off` or `no`.
++pub const DISABLE_ENV: &str = "CODEX_PROCESS_STATUS_FILE";
++
++const KIND: &str = "interactive";
++
++static CARD: Mutex<Option<Card>> = Mutex::new(None);
++
++/// Removes this process's file when dropped. Keep it alive while the TUI runs.
++#[must_use = "the status file is removed when the guard is dropped"]
++pub struct Guard {
++    _private: (),
++}
++
++impl Drop for Guard {
++    fn drop(&mut self) {
++        let card = match CARD.lock() {
++            Ok(mut slot) => slot.take(),
++            Err(_) => None,
++        };
++        if let Some(card) = card {
++            card.remove();
++        }
++    }
++}
++
++/// Writes this process's file, unless [`DISABLE_ENV`] turns it off.
++///
++/// The terminal pane is looked up, and the files of ended processes are removed, on a background
++/// thread, so this never waits for other programs.
++pub fn start(codex_home: &Path, cwd: &Path, version: &str) -> Guard {
++    let guard = Guard { _private: () };
++    if !enabled(std::env::var(DISABLE_ENV).ok().as_deref()) {
++        return guard;
++    }
++    let dir = codex_home.join(DIRECTORY);
++    let pid = std::process::id();
++    let card = Card::new(dir.clone(), pid, proc_start_of(pid), version, cwd, now_ms());
++    card.write();
++    if let Ok(mut slot) = CARD.lock() {
++        *slot = Some(card);
++    }
++    let _ = std::thread::Builder::new()
++        .name("process-status-file".to_string())
++        .spawn(move || {
++            let tmux = tmux_location();
++            update(|card| card.set_tmux(tmux, now_ms()));
++            sweep(&dir, pid, proc_start_of);
++        });
++    guard
++}
++
++/// Records the conversation shown by the TUI and its working directory. Cheap when nothing
++/// changed, so it can run on every frame.
++pub fn show(session_id: Option<String>, cwd: &Path) {
++    update(|card| card.show(session_id, cwd, now_ms()));
++}
++
++/// Records whether a turn is running in a thread. Only the shown conversation's thread sets the
++/// file's status.
++pub fn thread_status(thread_id: &str, busy: bool) {
++    update(|card| card.thread_status(thread_id, busy, now_ms()));
++}
++
++fn update(change: impl FnOnce(&mut Card) -> bool) {
++    if let Ok(mut slot) = CARD.lock()
++        && let Some(card) = slot.as_mut()
++        && change(card)
++    {
++        card.write();
++    }
++}
++
++fn enabled(value: Option<&str>) -> bool {
++    !matches!(
++        value
++            .map(|value| value.trim().to_ascii_lowercase())
++            .as_deref(),
++        Some("0" | "false" | "off" | "no")
++    )
++}
++
++fn now_ms() -> u64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
++        .unwrap_or(0)
++}
++
++struct Card {
++    dir: PathBuf,
++    pid: u32,
++    proc_start: Option<String>,
++    version: String,
++    session_id: Option<String>,
++    cwd: PathBuf,
++    tmux: Option<String>,
++    busy_threads: HashSet<String>,
++    busy: bool,
++    started_at: u64,
++    updated_at: u64,
++    status_updated_at: u64,
++}
++
++impl Card {
++    fn new(
++        dir: PathBuf,
++        pid: u32,
++        proc_start: Option<String>,
++        version: &str,
++        cwd: &Path,
++        now: u64,
++    ) -> Self {
++        Self {
++            dir,
++            pid,
++            proc_start,
++            version: version.to_string(),
++            session_id: None,
++            cwd: cwd.to_path_buf(),
++            tmux: None,
++            busy_threads: HashSet::new(),
++            busy: false,
++            started_at: now,
++            updated_at: now,
++            status_updated_at: now,
++        }
++    }
++
++    /// Returns whether the file must be written again.
++    fn show(&mut self, session_id: Option<String>, cwd: &Path, now: u64) -> bool {
++        if self.session_id == session_id && self.cwd.as_path() == cwd {
++            return false;
++        }
++        self.session_id = session_id;
++        self.cwd = cwd.to_path_buf();
++        self.refresh_status(now);
++        self.updated_at = now;
++        true
++    }
++
++    /// Returns whether the file must be written again.
++    fn thread_status(&mut self, thread_id: &str, busy: bool, now: u64) -> bool {
++        if busy {
++            self.busy_threads.insert(thread_id.to_string());
++        } else {
++            self.busy_threads.remove(thread_id);
++        }
++        if !self.refresh_status(now) {
++            return false;
++        }
++        self.updated_at = now;
++        true
++    }
++
++    /// Returns whether the file must be written again.
++    fn set_tmux(&mut self, tmux: Option<String>, now: u64) -> bool {
++        if self.tmux == tmux {
++            return false;
++        }
++        self.tmux = tmux;
++        self.updated_at = now;
++        true
++    }
++
++    fn refresh_status(&mut self, now: u64) -> bool {
++        let busy = self
++            .session_id
++            .as_ref()
++            .is_some_and(|session_id| self.busy_threads.contains(session_id));
++        if busy == self.busy {
++            return false;
++        }
++        self.busy = busy;
++        self.status_updated_at = now;
++        true
++    }
++
++    fn to_json(&self) -> Value {
++        let status = if self.busy { "busy" } else { "idle" };
++        json!({
++            "pid": self.pid,
++            "procStart": self.proc_start,
++            "sessionId": self.session_id,
++            "cwd": self.cwd.to_string_lossy(),
++            "tmux": self.tmux,
++            "status": status,
++            "kind": KIND,
++            "version": self.version,
++            "startedAt": self.started_at,
++            "updatedAt": self.updated_at,
++            "statusUpdatedAt": self.status_updated_at,
++        })
++    }
++
++    fn path(&self) -> PathBuf {
++        let pid = self.pid;
++        self.dir.join(format!("{pid}.json"))
++    }
++
++    /// Errors are ignored: the file is a hint for other programs, never a reason to stop Codex.
++    fn write(&self) {
++        let _ = self.try_write();
++    }
++
++    fn try_write(&self) -> io::Result<()> {
++        create_private_dir(&self.dir)?;
++        let mut bytes = serde_json::to_vec(&self.to_json()).map_err(io::Error::other)?;
++        bytes.push(b'\n');
++        let pid = self.pid;
++        let temp = self.dir.join(format!(".{pid}.json.tmp"));
++        let mut file = private_file(&temp)?;
++        file.write_all(&bytes)?;
++        drop(file);
++        fs::rename(temp, self.path())
++    }
++
++    fn remove(&self) {
++        let _ = fs::remove_file(self.path());
++    }
++}
++
++fn create_private_dir(dir: &Path) -> io::Result<()> {
++    let mut builder = fs::DirBuilder::new();
++    builder.recursive(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::DirBuilderExt;
++        builder.mode(0o700);
++    }
++    builder.create(dir)
++}
++
++fn private_file(path: &Path) -> io::Result<fs::File> {
++    let mut options = fs::OpenOptions::new();
++    options.write(true).create(true).truncate(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.mode(0o600);
++    }
++    options.open(path)
++}
++
++/// The start time of a process, in clock ticks after boot: field 22 of `/proc/<pid>/stat`. With
++/// the pid it names one process, even after the pid is reused. `None` where `/proc` is missing.
++fn proc_start_of(pid: u32) -> Option<String> {
++    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
++    parse_proc_start(&stat)
++}
++
++fn parse_proc_start(stat: &str) -> Option<String> {
++    // Field 2, the command name, is in parentheses and may itself contain spaces and `)`.
++    let (_, rest) = stat.rsplit_once(')')?;
++    rest.split_whitespace().nth(19).map(str::to_string)
++}
++
++/// `session:@window.%pane`, as `tmux display-message` prints it for this process's pane; only the
++/// pane id when tmux does not answer; `None` outside tmux.
++fn tmux_location() -> Option<String> {
++    std::env::var_os("TMUX")?;
++    let pane = std::env::var("TMUX_PANE")
++        .ok()
++        .filter(|pane| !pane.is_empty())?;
++    let output = Command::new("tmux")
++        .args([
++            "display-message",
++            "-p",
++            "-t",
++            pane.as_str(),
++            "#{session_name}:#{window_id}.#{pane_id}",
++        ])
++        .stdin(Stdio::null())
++        .stderr(Stdio::null())
++        .output();
++    let location = match output {
++        Ok(output) if output.status.success() => {
++            String::from_utf8_lossy(&output.stdout).trim().to_string()
++        }
++        _ => String::new(),
++    };
++    if location.is_empty() {
++        Some(pane)
++    } else {
++        Some(location)
++    }
++}
++
++/// Removes the files of processes that ended without removing theirs (killed, or closed with
++/// their terminal): their pid no longer runs, or now belongs to a process started later. Does
++/// nothing where the start time of this process cannot be read.
++fn sweep(dir: &Path, own_pid: u32, proc_start: impl Fn(u32) -> Option<String>) {
++    if proc_start(own_pid).is_none() {
++        return;
++    }
++    let Ok(entries) = fs::read_dir(dir) else {
++        return;
++    };
++    for entry in entries.flatten() {
++        let path = entry.path();
++        let Some(pid) = card_pid(&path) else {
++            continue;
++        };
++        if pid == own_pid {
++            continue;
++        }
++        let ended = match proc_start(pid) {
++            None => true,
++            Some(current) => recorded_proc_start(&path).is_some_and(|recorded| recorded != current),
++        };
++        if ended {
++            let _ = fs::remove_file(path);
++        }
++    }
++}
++
++/// The pid in the name of a status file, `<pid>.json`, or of its temporary `.<pid>.json.tmp`.
++fn card_pid(path: &Path) -> Option<u32> {
++    let name = path.file_name()?.to_str()?;
++    let digits = name
++        .strip_suffix(".json")
++        .or_else(|| name.strip_prefix('.')?.strip_suffix(".json.tmp"))?;
++    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
++        return None;
++    }
++    digits.parse().ok()
++}
++
++fn recorded_proc_start(path: &Path) -> Option<String> {
++    let text = fs::read_to_string(path).ok()?;
++    let card: Value = serde_json::from_str(&text).ok()?;
++    card.get("procStart")?.as_str().map(str::to_string)
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/codex-rs/process-status-file/src/tests.rs b/codex-rs/process-status-file/src/tests.rs
+new file mode 100644
+index 0000000..3d24fe4
+--- /dev/null
++++ b/codex-rs/process-status-file/src/tests.rs
+@@ -0,0 +1,312 @@
++use super::*;
++use pretty_assertions::assert_eq;
++use std::cell::RefCell;
++
++fn read(path: &Path) -> Value {
++    let text = fs::read_to_string(path).expect("read the status file");
++    serde_json::from_str(&text).expect("parse the status file")
++}
++
++fn card_in(dir: &Path, pid: u32) -> Card {
++    Card::new(
++        dir.join(DIRECTORY),
++        pid,
++        Some("4242".to_string()),
++        "0.169.1",
++        Path::new("/work/project"),
++        1_000,
++    )
++}
++
++fn file_names(dir: &Path) -> Vec<String> {
++    let mut names: Vec<String> = fs::read_dir(dir)
++        .expect("list the directory")
++        .map(|entry| {
++            entry
++                .expect("directory entry")
++                .file_name()
++                .to_string_lossy()
++                .into_owned()
++        })
++        .collect();
++    names.sort();
++    names
++}
++
++#[test]
++fn a_new_card_has_the_fields_of_the_claude_card() {
++    let home = tempfile::tempdir().expect("tempdir");
++    let card = card_in(home.path(), 31_337);
++
++    card.write();
++
++    assert_eq!(
++        read(&home.path().join(DIRECTORY).join("31337.json")),
++        json!({
++            "pid": 31_337,
++            "procStart": "4242",
++            "sessionId": null,
++            "cwd": "/work/project",
++            "tmux": null,
++            "status": "idle",
++            "kind": "interactive",
++            "version": "0.169.1",
++            "startedAt": 1_000,
++            "updatedAt": 1_000,
++            "statusUpdatedAt": 1_000,
++        })
++    );
++    // The temporary file is renamed, never left behind.
++    assert_eq!(
++        file_names(&home.path().join(DIRECTORY)),
++        vec!["31337.json".to_string()]
++    );
++}
++
++#[cfg(unix)]
++#[test]
++fn the_file_and_its_directory_are_private() {
++    use std::os::unix::fs::PermissionsExt;
++
++    let home = tempfile::tempdir().expect("tempdir");
++    let card = card_in(home.path(), 7);
++    card.write();
++
++    let dir_mode = fs::metadata(home.path().join(DIRECTORY))
++        .expect("directory metadata")
++        .permissions()
++        .mode();
++    let file_mode = fs::metadata(card.path())
++        .expect("file metadata")
++        .permissions()
++        .mode();
++    assert_eq!((dir_mode & 0o777, file_mode & 0o777), (0o700, 0o600));
++}
++
++#[test]
++fn showing_a_conversation_changes_the_file_only_when_it_changes() {
++    let home = tempfile::tempdir().expect("tempdir");
++    let mut card = card_in(home.path(), 8);
++    let cwd = Path::new("/work/project");
++
++    assert!(card.show(Some("thread-a".to_string()), cwd, 2_000));
++    assert!(!card.show(Some("thread-a".to_string()), cwd, 3_000));
++    assert!(card.show(
++        Some("thread-a".to_string()),
++        Path::new("/work/other"),
++        4_000
++    ));
++    assert!(card.show(
++        Some("thread-b".to_string()),
++        Path::new("/work/other"),
++        5_000
++    ));
++    assert!(card.show(None, Path::new("/work/other"), 6_000));
++    card.write();
++
++    let written = read(&card.path());
++    assert_eq!(
++        (
++            written["sessionId"].clone(),
++            written["cwd"].clone(),
++            written["updatedAt"].clone(),
++            written["statusUpdatedAt"].clone(),
++        ),
++        (
++            Value::Null,
++            json!("/work/other"),
++            json!(6_000),
++            json!(1_000)
++        )
++    );
++}
++
++#[test]
++fn the_status_follows_only_the_shown_conversation() {
++    let home = tempfile::tempdir().expect("tempdir");
++    let mut card = card_in(home.path(), 9);
++    let cwd = Path::new("/work/project");
++    card.show(Some("main".to_string()), cwd, 2_000);
++
++    // A turn in another thread (a side chat, a sub-agent, a summary) leaves the status alone.
++    assert!(!card.thread_status("side", /*busy*/ true, 3_000));
++    assert!(card.thread_status("main", /*busy*/ true, 4_000));
++    assert!(!card.thread_status("main", /*busy*/ true, 5_000));
++    card.write();
++    let busy = read(&card.path());
++    assert_eq!(
++        (busy["status"].clone(), busy["statusUpdatedAt"].clone()),
++        (json!("busy"), json!(4_000))
++    );
++
++    // Showing another conversation shows its own status; coming back restores the running one.
++    assert!(card.show(Some("other".to_string()), cwd, 6_000));
++    assert!(!card.busy);
++    assert!(card.show(Some("main".to_string()), cwd, 7_000));
++    assert!(card.busy);
++
++    assert!(card.thread_status("main", /*busy*/ false, 8_000));
++    card.write();
++    let idle = read(&card.path());
++    assert_eq!(
++        (
++            idle["status"].clone(),
++            idle["statusUpdatedAt"].clone(),
++            idle["updatedAt"].clone(),
++        ),
++        (json!("idle"), json!(8_000), json!(8_000))
++    );
++}
++
++#[test]
++fn the_tmux_location_is_written_once_known() {
++    let home = tempfile::tempdir().expect("tempdir");
++    let mut card = card_in(home.path(), 10);
++
++    assert!(card.set_tmux(Some("work:@3.%7".to_string()), 2_000));
++    assert!(!card.set_tmux(Some("work:@3.%7".to_string()), 3_000));
++    card.write();
++
++    assert_eq!(read(&card.path())["tmux"], json!("work:@3.%7"));
++}
++
++#[test]
++fn removing_deletes_the_file_and_tolerates_a_missing_one() {
++    let home = tempfile::tempdir().expect("tempdir");
++    let card = card_in(home.path(), 11);
++    card.write();
++
++    card.remove();
++    card.remove();
++
++    assert!(!card.path().exists());
++}
++
++#[test]
++fn the_start_time_is_field_22_of_proc_stat() {
++    let fields: Vec<String> = (3..=52).map(|field| format!("f{field}")).collect();
++    let stat = format!("1234 (odd ) name (x)) {}\n", fields.join(" "));
++
++    assert_eq!(parse_proc_start(&stat), Some("f22".to_string()));
++    assert_eq!(parse_proc_start("1234 (truncated) S 1 2"), None);
++    assert_eq!(parse_proc_start("no parentheses"), None);
++}
++
++#[cfg(target_os = "linux")]
++#[test]
++fn this_process_has_a_start_time() {
++    let start = proc_start_of(std::process::id()).expect("start time of this process");
++
++    assert!(start.bytes().all(|byte| byte.is_ascii_digit()), "{start}");
++}
++
++#[test]
++fn only_status_file_names_carry_a_pid() {
++    let pid = |name: &str| card_pid(Path::new("/x").join(name).as_path());
++
++    assert_eq!(pid("123.json"), Some(123));
++    assert_eq!(pid(".123.json.tmp"), Some(123));
++    assert_eq!(pid("abc.json"), None);
++    assert_eq!(pid(".json"), None);
++    assert_eq!(pid("+12.json"), None);
++    assert_eq!(pid(".123.json"), None);
++    assert_eq!(pid("123.json.bak"), None);
++    assert_eq!(pid("notes.txt"), None);
++}
++
++#[test]
++fn the_sweep_removes_only_files_of_ended_processes() {
++    let home = tempfile::tempdir().expect("tempdir");
++    let dir = home.path().join(DIRECTORY);
++    let own = card_in(home.path(), 100);
++    own.write();
++    // A live process with the start time it recorded.
++    card_in(home.path(), 200).write();
++    // A pid that is gone.
++    card_in(home.path(), 300).write();
++    // A pid reused by a process started later.
++    card_in(home.path(), 400).write();
++    // The temporary file of a process killed while writing.
++    fs::write(dir.join(".300.json.tmp"), "{").expect("write a temporary file");
++    // Other files are not ours to remove.
++    fs::write(dir.join("README"), "keep").expect("write another file");
++
++    let asked = RefCell::new(Vec::new());
++    sweep(&dir, 100, |pid| {
++        asked.borrow_mut().push(pid);
++        match pid {
++            100 | 200 => Some("4242".to_string()),
++            400 => Some("9999".to_string()),
++            _ => None,
++        }
++    });
++
++    assert_eq!(
++        file_names(&dir),
++        vec![
++            "100.json".to_string(),
++            "200.json".to_string(),
++            "README".to_string(),
++        ]
++    );
++    assert!(!asked.borrow().is_empty());
++}
++
++#[test]
++fn the_sweep_does_nothing_without_start_times() {
++    let home = tempfile::tempdir().expect("tempdir");
++    let dir = home.path().join(DIRECTORY);
++    card_in(home.path(), 100).write();
++    card_in(home.path(), 300).write();
++
++    sweep(&dir, 100, |_| None);
++
++    assert_eq!(
++        file_names(&dir),
++        vec!["100.json".to_string(), "300.json".to_string()]
++    );
++}
++
++#[test]
++fn the_environment_turns_the_file_off() {
++    for value in ["0", "false", "OFF", " no "] {
++        assert!(!enabled(Some(value)), "{value}");
++    }
++    for value in [None, Some(""), Some("1"), Some("true"), Some("on")] {
++        assert!(enabled(value), "{value:?}");
++    }
++}
++
++/// The only test that uses the process-wide card, so tests running in parallel never share it.
++#[test]
++fn the_tui_hooks_write_the_file_and_remove_it_on_exit() {
++    let home = tempfile::tempdir().expect("tempdir");
++    let path = home
++        .path()
++        .join(DIRECTORY)
++        .join(format!("{}.json", std::process::id()));
++    if !enabled(std::env::var(DISABLE_ENV).ok().as_deref()) {
++        return;
++    }
++
++    let guard = start(home.path(), Path::new("/work/project"), "0.169.1");
++    assert_eq!(read(&path)["sessionId"], Value::Null);
++
++    show(Some("main".to_string()), Path::new("/work/project"));
++    thread_status("main", /*busy*/ true);
++    let written = read(&path);
++    assert_eq!(
++        (
++            written["sessionId"].clone(),
++            written["status"].clone(),
++            written["pid"].clone(),
++        ),
++        (json!("main"), json!("busy"), json!(std::process::id()))
++    );
++
++    drop(guard);
++    assert!(!path.exists());
++    // After exit the hooks do nothing, and write no file again.
++    show(Some("other".to_string()), Path::new("/work/project"));
++    assert!(!path.exists());
++}
+-- 
+2.53.0
+
