@@ -4,14 +4,36 @@ Builds of [OpenAI Codex](https://github.com/openai/codex) with optional
 extensions, kept as small patch series on top of the stable upstream releases.
 
 Every extension is opt-in: without the configuration that enables it, Codex
-behaves exactly like the upstream release it is built from. The `codex --version`
-output is the upstream version.
+behaves exactly like the upstream release it is built from. The only addition
+that is on by default is the [process status file](#process-status-file), which
+does not change what Codex does. The `codex --version` output is the upstream
+version.
 
 ## Extensions
 
 The extensions are the series listed in [`patches/series`](patches/series).
 Each release lists the patches it contains and the files they change, in its
 notes and in `MODIFICATIONS.md` inside the archive.
+
+## Process status file
+
+While the interactive Codex (the TUI) runs, it keeps a small JSON file that says
+which conversation it shows, so other programs can find it without reading the
+screen: `$CODEX_HOME/processes/<pid>.json` (`~/.codex/processes/` by default).
+It has the same fields as the file Claude Code writes in `~/.claude/sessions/`:
+`pid`, `procStart`, `sessionId` (the conversation, `null` before the first one),
+`cwd`, `tmux` (`session:@window.%pane` inside tmux), `status` (`busy` or
+`idle`), `kind`, `version`, `startedAt`, `updatedAt` and `statusUpdatedAt`.
+
+The file is written atomically when Codex starts, when the conversation on
+screen changes (`/new`, `/clear`, `/resume`, fork), when the working directory
+changes, and when a turn starts or ends. It is removed when Codex exits. A file
+left by a killed process is removed by the next Codex that starts; readers
+should still check that `pid` and `procStart` match a running process.
+
+To turn it off, set `CODEX_PROCESS_STATUS_FILE=0` (`false`, `off` and `no` also
+work) in the environment Codex starts with. Details:
+[`patches/process-status-file/README.md`](patches/process-status-file/README.md).
 
 ## Install
 
