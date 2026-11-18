@@ -25,8 +25,9 @@ It has the same fields as the file Claude Code writes in `~/.claude/sessions/`:
 `cwd`, `tmux` (`session:@window.%pane` inside tmux), `status` (`busy` or
 `idle`), `kind`, `version`, `startedAt`, `updatedAt` and `statusUpdatedAt`.
 
-The file is written atomically when Codex starts, when the conversation on
-screen changes (`/new`, `/clear`, `/resume`, fork), when the working directory
+The file is written atomically when the TUI's main screen starts (the onboarding
+screens and the startup picker of `codex resume` or `codex fork` have no file
+yet), when the conversation on screen changes (`/new`, `/clear`, `/resume`, fork), when the working directory
 changes, and when a turn starts or ends. It is removed when Codex exits. A file
 left by a killed process is removed by the next Codex that starts; readers
 should still check that `pid` and `procStart` match a running process.

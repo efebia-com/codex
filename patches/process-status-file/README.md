@@ -24,7 +24,7 @@ can handle both.
   as a string. Together with `pid` it names one process even after the pid is reused. `null`
   where `/proc` does not exist.
 - `sessionId`: the id of the conversation shown, the root thread (the same value shell commands
-  get as `CODEX_SESSION_ID`). `null` before a conversation exists (startup screens, pickers).
+  get as `CODEX_SESSION_ID`). `null` until the TUI shows a conversation.
 - `cwd`: the working directory of the conversation shown.
 - `tmux`: `session:@window.%pane` of the process's pane, as `tmux display-message` prints it; only
   `%pane` if tmux does not answer; `null` outside tmux. Looked up once at start.
@@ -36,7 +36,8 @@ can handle both.
 
 ## When it changes
 
-- At start, before any conversation, with `sessionId` null.
+- When the TUI's main screen starts. The onboarding screens and the startup picker of
+  `codex resume` or `codex fork` run before it and have no file yet.
 - When the conversation shown changes: `/new`, `/clear`, `/resume`, `/fork` (the fork is shown),
   and the first conversation once it starts. A `/side` chat, a sub-agent opened from the agents
   view, and helper threads such as summaries do not change it: they are not the conversation of
