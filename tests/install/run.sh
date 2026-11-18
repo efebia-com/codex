@@ -77,6 +77,9 @@ chmod 0755 "${work}/fakebin/uname"
 export PATH="${work}/fakebin:${PATH}"
 
 export HOME="${work}/home"
+# The installer and the fake codex default CODEX_HOME to $HOME/.codex: one inherited
+# from the calling shell (a Codex session sets it) would point them outside the test.
+unset CODEX_HOME
 mkdir -p "$HOME"
 CODEX_EXT_DOWNLOAD_BASE="http://127.0.0.1:$(cat "${work}/port")/releases"
 export CODEX_EXT_DOWNLOAD_BASE
