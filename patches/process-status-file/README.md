@@ -24,8 +24,10 @@ can handle both.
   as a string. Together with `pid` it names one process even after the pid is reused. `null`
   where `/proc` does not exist.
 - `sessionId`: the id of the conversation shown, the root thread (the same value shell commands
-  get as `CODEX_SESSION_ID`). `null` until the TUI shows a conversation.
-- `cwd`: the working directory of the conversation shown.
+  get as `CODEX_SESSION_ID`). `null` until the TUI shows a conversation: on the startup screens
+  (startup composer, onboarding, the pickers of `codex resume` and `codex fork`).
+- `cwd`: the working directory of the conversation shown; before one, the directory Codex was
+  started in (`-C`, or the current one).
 - `tmux`: `session:@window.%pane` of the process's pane, as `tmux display-message` prints it; only
   `%pane` if tmux does not answer; `null` outside tmux. Looked up once at start.
 - `status`: `busy` while a turn runs in the conversation shown, `idle` otherwise.
@@ -36,8 +38,7 @@ can handle both.
 
 ## When it changes
 
-- When the TUI's main screen starts. The onboarding screens and the startup picker of
-  `codex resume` or `codex fork` run before it and have no file yet.
+- When the TUI starts, before its first screen, with `sessionId` null.
 - When the conversation shown changes: `/new`, `/clear`, `/resume`, `/fork` (the fork is shown),
   and the first conversation once it starts. A `/side` chat, a sub-agent opened from the agents
   view, and helper threads such as summaries do not change it: they are not the conversation of
@@ -70,8 +71,9 @@ other one is removed. Any other value, or no variable, leaves it on.
 
 - `0001` adds the `codex-process-status-file` crate: the file, its writes, the sweep of files left
   by killed processes, and its unit tests. It depends only on `serde_json`.
-- `0002` connects it to the TUI in three places: the guard around `App::run` writes the file and
-  removes it at exit; each frame reports the root thread shown and its working directory; thread
-  status notifications report turns starting and ending. The TUI writes nothing more than that.
+- `0002` connects it to the TUI in three places: a guard taken once the terminal is set up, before
+  the startup screens, writes the file and removes it at exit; each frame of the main screen
+  reports the root thread shown and its working directory; thread status notifications report
+  turns starting and ending. The TUI writes nothing more than that.
 
 Tests: `cargo test -p codex-process-status-file`.

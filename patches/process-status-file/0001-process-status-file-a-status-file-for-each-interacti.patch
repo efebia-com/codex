@@ -1,14 +1,16 @@
-From 2c4d245b742231518fc818f63e452d819ce2a5a8 Mon Sep 17 00:00:00 2001
+From 21f7adafb641677ce2e7a96b2937bc992ee3d486 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Wed, 18 Nov 2026 12:18:32 +0100
 Subject: [PATCH 1/2] process-status-file: a status file for each interactive
  process
 
-While the TUI runs, $CODEX_HOME/processes/<pid>.json tells which
-conversation the process shows, its working directory and terminal
-pane, and whether a turn is running in it, with the field names other
-tools already read: pid, procStart, sessionId, cwd, tmux, status,
-kind, version, startedAt, updatedAt and statusUpdatedAt.
+From the TUI's first screen until it exits,
+$CODEX_HOME/processes/<pid>.json tells which conversation the process
+shows, its working directory and terminal pane, and whether a turn is
+running in it, with the field names other tools already read: pid,
+procStart, sessionId, cwd, tmux, status, kind, version, startedAt,
+updatedAt and statusUpdatedAt. sessionId is null on the startup
+screens, which show no conversation yet.
 
 The file is written atomically (a temporary file in the same directory,
 then a rename) with private permissions, only when something changes,
@@ -23,9 +25,9 @@ Codex.
 ---
  codex-rs/Cargo.toml                       |   2 +
  codex-rs/process-status-file/Cargo.toml   |  20 ++
- codex-rs/process-status-file/src/lib.rs   | 362 ++++++++++++++++++++++
- codex-rs/process-status-file/src/tests.rs | 312 +++++++++++++++++++
- 4 files changed, 696 insertions(+)
+ codex-rs/process-status-file/src/lib.rs   | 364 ++++++++++++++++++++++
+ codex-rs/process-status-file/src/tests.rs | 337 ++++++++++++++++++++
+ 4 files changed, 723 insertions(+)
  create mode 100644 codex-rs/process-status-file/Cargo.toml
  create mode 100644 codex-rs/process-status-file/src/lib.rs
  create mode 100644 codex-rs/process-status-file/src/tests.rs
@@ -78,18 +80,19 @@ index 0000000..cee4ab9
 +tempfile = { workspace = true }
 diff --git a/codex-rs/process-status-file/src/lib.rs b/codex-rs/process-status-file/src/lib.rs
 new file mode 100644
-index 0000000..f734e94
+index 0000000..2bce050
 --- /dev/null
 +++ b/codex-rs/process-status-file/src/lib.rs
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,364 @@
 +//! A status file for each running interactive Codex process.
 +//!
-+//! While the TUI runs, `$CODEX_HOME/processes/<pid>.json` tells which conversation the process
-+//! shows, in which directory and terminal pane, and whether a turn is running in it. Other
-+//! programs can map a process or a pane to its conversation without asking Codex. The file is
-+//! replaced atomically on every change and removed when the TUI exits; files left by processes
-+//! that were killed are removed by the next Codex that starts. Setting
-+//! `CODEX_PROCESS_STATUS_FILE=0` turns it off.
++//! From the TUI's first screen until it exits, `$CODEX_HOME/processes/<pid>.json` tells which
++//! conversation the process shows, in which directory and terminal pane, and whether a turn is
++//! running in it. The startup screens, such as onboarding and the session pickers, show no
++//! conversation yet: there the session id is null. Other programs can map a process or a pane to
++//! its conversation without asking Codex. The file is replaced atomically on every change and
++//! removed when the TUI exits; files left by processes that were killed are removed by the next
++//! Codex that starts. Setting `CODEX_PROCESS_STATUS_FILE=0` turns it off.
 +
 +use std::collections::HashSet;
 +use std::fs;
@@ -134,7 +137,8 @@ index 0000000..f734e94
 +    }
 +}
 +
-+/// Writes this process's file, unless [`DISABLE_ENV`] turns it off.
++/// Writes this process's file, unless [`DISABLE_ENV`] turns it off. Call it before the first
++/// screen: the file shows no conversation until [`show`] records one.
 +///
 +/// The terminal pane is looked up, and the files of ended processes are removed, on a background
 +/// thread, so this never waits for other programs.
@@ -446,10 +450,10 @@ index 0000000..f734e94
 +mod tests;
 diff --git a/codex-rs/process-status-file/src/tests.rs b/codex-rs/process-status-file/src/tests.rs
 new file mode 100644
-index 0000000..3d24fe4
+index 0000000..36e385c
 --- /dev/null
 +++ b/codex-rs/process-status-file/src/tests.rs
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,337 @@
 +use super::*;
 +use pretty_assertions::assert_eq;
 +use std::cell::RefCell;
@@ -731,17 +735,42 @@ index 0000000..3d24fe4
 +
 +/// The only test that uses the process-wide card, so tests running in parallel never share it.
 +#[test]
-+fn the_tui_hooks_write_the_file_and_remove_it_on_exit() {
++fn the_tui_hooks_write_the_file_from_start_and_remove_it_on_exit() {
 +    let home = tempfile::tempdir().expect("tempdir");
-+    let path = home
-+        .path()
-+        .join(DIRECTORY)
-+        .join(format!("{}.json", std::process::id()));
++    let pid = std::process::id();
++    let path = home.path().join(DIRECTORY).join(format!("{pid}.json"));
 +    if !enabled(std::env::var(DISABLE_ENV).ok().as_deref()) {
 +        return;
 +    }
 +
 +    let guard = start(home.path(), Path::new("/work/project"), "0.169.1");
++    // The startup screens, such as onboarding and the session pickers, come before any
++    // conversation: the file is already complete there, with a null session id.
++    let written = read(&path);
++    assert_eq!(
++        (
++            written["pid"].clone(),
++            written["procStart"].clone(),
++            written["sessionId"].clone(),
++            written["cwd"].clone(),
++            written["status"].clone(),
++            written["kind"].clone(),
++            written["version"].clone(),
++        ),
++        (
++            json!(pid),
++            json!(proc_start_of(pid)),
++            Value::Null,
++            json!("/work/project"),
++            json!("idle"),
++            json!("interactive"),
++            json!("0.169.1"),
++        )
++    );
++    // No status change yet. `tmux` and `updatedAt` may already carry the background lookup.
++    assert_eq!(written["startedAt"], written["statusUpdatedAt"]);
++    // The main screen's frames before its first conversation starts keep the session id null.
++    show(/*session_id*/ None, Path::new("/work/project"));
 +    assert_eq!(read(&path)["sessionId"], Value::Null);
 +
 +    show(Some("main".to_string()), Path::new("/work/project"));

@@ -1,20 +1,23 @@
-From 0c601f2cf00a9c4d2dbbc3142711d3d0d9c64bdb Mon Sep 17 00:00:00 2001
+From 69802bacc1d9f5f4116e3b7b1e9fcc621f981674 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Wed, 18 Nov 2026 12:18:32 +0100
 Subject: [PATCH 2/2] tui: keep the process status file up to date
 
-Start the process status file before the app runs and remove it when
-the app returns. Each frame reports the conversation shown, the root
-thread that /new, /clear, /resume and /fork replace, which side chats,
-sub-agents and summary threads leave alone, and its working directory;
-thread status notifications report when its turns start and end. The
-file is only written when one of these changes.
+Start the process status file as soon as the terminal is set up, so the
+startup composer, onboarding and the session pickers of codex resume
+and codex fork already have one, with no conversation, and remove it
+when the TUI exits, also on its fatal startup exits. Each frame of the
+main screen reports the conversation shown, the root thread that /new,
+/clear, /resume and /fork replace, which side chats, sub-agents and
+summary threads leave alone, and its working directory; thread status
+notifications report when its turns start and end. The file is only
+written when one of these changes.
 ---
- codex-rs/tui/Cargo.toml                   | 1 +
- codex-rs/tui/src/app.rs                   | 4 ++++
- codex-rs/tui/src/app/app_server_events.rs | 4 ++++
- codex-rs/tui/src/lib.rs                   | 8 ++++++++
- 4 files changed, 17 insertions(+)
+ codex-rs/tui/Cargo.toml                   |  1 +
+ codex-rs/tui/src/app.rs                   |  4 ++++
+ codex-rs/tui/src/app/app_server_events.rs |  4 ++++
+ codex-rs/tui/src/startup_orchestration.rs | 15 +++++++++++++++
+ 4 files changed, 24 insertions(+)
 
 diff --git a/codex-rs/tui/Cargo.toml b/codex-rs/tui/Cargo.toml
 index 6e5c58f..81d485a 100644
@@ -58,32 +61,53 @@ index 8f179f3..f1eb1af 100644
          }
  
          if let ServerNotification::ThreadStarted(started) = &notification
-diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
-index 7a4528a..5a54a82 100644
---- a/codex-rs/tui/src/lib.rs
-+++ b/codex-rs/tui/src/lib.rs
-@@ -2359,6 +2359,13 @@ async fn run_ratatui_app(
-         }
-     }
- 
-+    // Tells other programs which conversation this process shows; removed when the TUI exits.
+diff --git a/codex-rs/tui/src/startup_orchestration.rs b/codex-rs/tui/src/startup_orchestration.rs
+index 46fd03f..5f2964c 100644
+--- a/codex-rs/tui/src/startup_orchestration.rs
++++ b/codex-rs/tui/src/startup_orchestration.rs
+@@ -351,6 +351,18 @@ pub(super) async fn run_main_inner(
+         screen.transcript_mode.is_owned(),
+         screen.use_alt_screen,
+     );
++    // Tells other programs which conversation this process shows, from the first screen on:
++    // the startup composer, onboarding and session pickers show none yet. Removed on exit.
 +    let process_status_file = codex_process_status_file::start(
-+        config.codex_home.as_path(),
-+        config.cwd.as_path(),
++        codex_home.as_path(),
++        config_cwd
++            .as_ref()
++            .map(AbsolutePathBuf::to_path_buf)
++            .or_else(|| std::env::current_dir().ok())
++            .unwrap_or_default()
++            .as_path(),
 +        crate::version::CODEX_CLI_VERSION,
 +    );
-+
-     // Keep the large event-loop future out of the enclosing startup futures so session
-     // transitions have enough stack headroom to rebuild configuration and the chat widget.
-     let app_result = boxed_future!(App::run(
-@@ -2390,6 +2397,7 @@ async fn run_ratatui_app(
-         daemon_cli_executable,
-     ))
-     .await;
+     let mut startup_draft = startup_draft::StartupDraft::new(
+         initialized_terminal,
+         terminal_restore_guard,
+@@ -880,6 +892,7 @@ pub(super) async fn run_main_inner(
+                     .shutdown_with_timeout(INTERACTIVE_OTEL_SHUTDOWN_TIMEOUT)
+                     .await;
+             }
++            drop(process_status_file);
+             std::process::exit(1);
+         }
+     }
+@@ -901,6 +914,7 @@ pub(super) async fn run_main_inner(
+                     .shutdown_with_timeout(INTERACTIVE_OTEL_SHUTDOWN_TIMEOUT)
+                     .await;
+             }
++            drop(process_status_file);
+             std::process::exit(1);
+         }
+     }
+@@ -1030,6 +1044,7 @@ pub(super) async fn run_main_inner(
+         err.downcast::<std::io::Error>()
+             .unwrap_or_else(|err| std::io::Error::other(err.to_string()))
+     });
 +    drop(process_status_file);
  
-     terminal_restore_guard.restore_silently();
-     // Mark the end of the recorded session.
+     if let Some(worktree) = managed_worktree.as_ref() {
+         worktree.report_startup_failure();
 -- 
 2.53.0
 
