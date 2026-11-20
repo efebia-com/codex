@@ -1,4 +1,4 @@
-From 3a925ca8a7235fa1ecdff6783020a267692e39ca Mon Sep 17 00:00:00 2001
+From f07d5f2307ea7e01c7d8375ade82247044448bea Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 15:50:07 +0100
 Subject: [PATCH 2/2] tui: show status line items from an external JSON file
@@ -20,6 +20,7 @@ present in the file, and saving keeps file: items instead of dropping
 them as unknown ids.
 ---
  codex-rs/tui/src/app.rs                       |   5 +
+ .../app/tests/session_lifecycle_requests.rs   |   6 +-
  codex-rs/tui/src/app_event.rs                 |   4 +-
  ...shot_includes_status_line_file_fields.snap |  16 +
  .../tui/src/bottom_pane/status_line_setup.rs  | 122 ++++-
@@ -37,7 +38,7 @@ them as unknown ids.
  codex-rs/tui/src/lib.rs                       |   1 +
  codex-rs/tui/src/status_line_file.rs          | 459 ++++++++++++++++++
  codex-rs/tui/src/status_line_file_tests.rs    | 360 ++++++++++++++
- 18 files changed, 1244 insertions(+), 51 deletions(-)
+ 19 files changed, 1248 insertions(+), 53 deletions(-)
  create mode 100644 codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__status_line_setup__tests__setup_view_snapshot_includes_status_line_file_fields.snap
  create mode 100644 codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_file_fields_footer.snap
  create mode 100644 codex-rs/tui/src/chatwidget/status_line_file.rs
@@ -61,6 +62,23 @@ index a83022f433..4f175ec6d3 100644
                      self.chat_widget.pre_draw_tick();
                      self.refresh_agents_overview_usage(app_server, tui.frame_requester());
                      let rendered_area = self.render_chat_widget_frame(tui, screen_size)?;
+diff --git a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+index cecfe93125..5aac2f2f20 100644
+--- a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
++++ b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+@@ -2076,8 +2076,10 @@ async fn read_only_history_hides_the_statusline_until_interactive_resume() -> Re
+     assert!(app.chat_widget.statusline_state().is_some());
+     let footer = render_bottom_popup(&app.chat_widget, /*width*/ 100);
+     assert!(footer.contains(&thread_id.to_string()), "{footer}");
+-    app.chat_widget
+-        .setup_status_line(Vec::new(), /*use_theme_colors*/ false);
++    app.chat_widget.setup_status_line(
++        Vec::<crate::bottom_pane::StatusLineItem>::new(),
++        /*use_theme_colors*/ false,
++    );
+     app.chat_widget.handle_server_notification(
+         token_usage_notification(thread_id, "turn-2", /*model_context_window*/ None),
+         /*replay_kind*/ None,
 diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
 index 24592bfe7d..f04b1f821a 100644
 --- a/codex-rs/tui/src/app_event.rs
