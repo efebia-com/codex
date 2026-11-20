@@ -34,6 +34,13 @@ EMIT_TOOL = {
     },
     "annotations": {"readOnlyHint": True},
 }
+PID_TOOL = {
+    "name": "pid",
+    "description": "Return the current server process ID.",
+    "inputSchema": {"type": "object", "properties": {}},
+    "annotations": {"readOnlyHint": True},
+}
+ENV_KEYS = ("CODEX_SESSION_ID", "CODEX_THREAD_ID", "SMOKE_RESTART_VALUE")
 
 
 class FakeChannelServer:
@@ -51,7 +58,7 @@ class FakeChannelServer:
             sys.stdout.flush()
 
     def log(self, event: str, **fields: object) -> None:
-        line = json.dumps({"event": event, **fields}) + "\n"
+        line = json.dumps({"event": event, "pid": os.getpid(), **fields}) + "\n"
         with self.lock, self.record.open("a", encoding="utf-8") as record:
             record.write(line)
 
@@ -72,6 +79,8 @@ class FakeChannelServer:
     def call_tool(self, params: dict) -> dict:
         arguments = params.get("arguments") or {}
         self.log("tool_call", name=params.get("name"), arguments=arguments)
+        if params.get("name") == "pid":
+            return {"content": [{"type": "text", "text": json.dumps({"pid": os.getpid()})}]}
         messages = arguments.get("messages", [])
         for message in messages:
             self.notify(message)
@@ -82,7 +91,7 @@ class FakeChannelServer:
             self.log("initialize", params=params)
             return self.initialize_result(params)
         if method == "tools/list":
-            return {"tools": [EMIT_TOOL]}
+            return {"tools": [EMIT_TOOL, PID_TOOL]}
         if method == "tools/call":
             return self.call_tool(params)
         return EMPTY_RESULTS.get(method)
@@ -93,6 +102,7 @@ class FakeChannelServer:
             return
         if "id" not in message:
             if method == "notifications/initialized":
+                self.log("initialized")
                 self.initialized.set()
             return
         result = self.result_for(method, message.get("params") or {})
@@ -110,12 +120,21 @@ class FakeChannelServer:
             end = data.rfind(b"\n", offset) + 1
             for line in data[offset:end].splitlines():
                 if line.strip():
-                    self.notify(json.loads(line))
+                    self.handle_inbox(json.loads(line))
             offset = max(offset, end)
             time.sleep(POLL_SECONDS)
 
+    def handle_inbox(self, params: dict) -> None:
+        if "exit_pid" in params:
+            # A replacement rereads the file; only the addressed process may exit.
+            if params["exit_pid"] == os.getpid():
+                self.log("exit")
+                os._exit(23)
+            return
+        self.notify(params)
+
     def serve(self) -> None:
-        self.log("start", pid=os.getpid())
+        self.log("start", env={key: os.environ.get(key) for key in ENV_KEYS})
         threading.Thread(target=self.watch_inbox, daemon=True).start()
         for line in sys.stdin:
             if line.strip():

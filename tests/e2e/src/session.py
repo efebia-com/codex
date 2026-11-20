@@ -22,6 +22,8 @@ class ServerSpec:
     name: str
     channel: bool | None  # None leaves `channel` out of the config
     capability: bool = True
+    channel_during_turn: bool | None = None
+    restart_on_exit: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,17 @@ class FakeServer:
 
     def sent(self) -> list[dict]:
         return [record["params"] for record in self.records("notification")]
+
+    def wait_for_records(self, event: str, count: int) -> list[dict]:
+        deadline = time.monotonic() + DELIVERY_TIMEOUT
+        while True:
+            records = self.records(event)
+            if len(records) >= count:
+                return records
+            if time.monotonic() >= deadline:
+                msg = f"MCP server {self.name!r}: expected {count} {event!r} records, got {records}"
+                raise AssertionError(msg)
+            time.sleep(POLL_SECONDS)
 
     def client_capabilities(self) -> dict:
         initialize = self.records("initialize")
@@ -66,6 +79,20 @@ def _server_toml(spec: ServerSpec, server: FakeServer) -> str:
     ]
     if spec.channel is not None:
         lines.append(f"channel = {json.dumps(spec.channel)}")
+    if spec.channel_during_turn is not None:
+        lines.append(f"channel_during_turn = {json.dumps(spec.channel_during_turn)}")
+    if spec.restart_on_exit is not None:
+        lines.append(f"restart_on_exit = {json.dumps(spec.restart_on_exit)}")
+    if spec.restart_on_exit:
+        lines.extend(
+            [
+                'env = { SMOKE_RESTART_VALUE = "configured" }',
+                (
+                    'env_vars = [{ name = "CODEX_SESSION_ID", source = "codex" }, '
+                    '{ name = "CODEX_THREAD_ID", source = "codex" }]'
+                ),
+            ]
+        )
     return "\n".join(lines) + "\n"
 
 
