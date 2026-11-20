@@ -204,6 +204,8 @@ jobs:
       - name: Fetch the Codex-built V8 (checksums verified)
         run: scripts/fetch-v8.sh --source "$SOURCE_DIR" --target "$TARGET" --cache "${RUNNER_TEMP}/rusty_v8" >>"$GITHUB_ENV"
       - name: Build
+        env:
+          CODEX_DISPLAY_VERSION: ${{ needs.plan.outputs.version }}
         run: scripts/build.sh --release --target "$TARGET" --source "$SOURCE_DIR" --out "${RUNNER_TEMP}/package"
       - name: Package
         run: |

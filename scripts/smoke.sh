@@ -38,8 +38,12 @@ prefix="${work}/prefix"
 log "Installing ${version} with install.sh into ${prefix}"
 CODEX_EXT_DOWNLOAD_BASE="file://${work}/mirror" sh "${DIST_ROOT}/install.sh" --prefix "$prefix" --version "$version"
 codex="${prefix}/bin/codex"
-"$codex" --version
-grep -q "^version=${version}$" "${prefix}/current/DISTRIBUTION" || die "installed DISTRIBUTION does not report ${version}"
+reported="$("$codex" --version)"
+printf '%s\n' "$reported"
+if [[ "$version" == *-efebia || "$version" == *-efebia.* ]]; then
+  [[ "$reported" == "codex-cli $version" ]] || die "installed binary reports '${reported}', expected 'codex-cli ${version}'"
+fi
+grep -Fqx "version=${version}" "${prefix}/current/DISTRIBUTION" || die "installed DISTRIBUTION does not report ${version}"
 
 if [[ "$(uname -s)" == Darwin ]]; then
   binary="$(cd "${prefix}/current/bin" && pwd)/codex"

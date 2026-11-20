@@ -14,3 +14,4 @@ mcp-restart-tests
 mcp-fence
 channels-fence
 process-status-file
+cli-display-version

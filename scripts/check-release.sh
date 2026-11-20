@@ -39,8 +39,9 @@ emit() {
   printf 'build=%s\nupstream_tag=%s\nversion=%s\nreason=%s\n' "$1" "$tag" "${2:-}" "$3"
 }
 
-published="$(git ls-remote --tags "https://github.com/${repo}.git" "refs/tags/v${upstream}-ext.*" | wc -l)"
-if ((published > 0)) && [[ "$force" == false ]]; then
+published="$(git ls-remote --refs --tags "https://github.com/${repo}.git" \
+  "refs/tags/v${upstream}-efebia" "refs/tags/v${upstream}-efebia.*" "refs/tags/v${upstream}-ext.*")"
+if [[ -n "$published" && "$force" == false ]]; then
   emit false "" "${tag} is already published"
   exit 0
 fi

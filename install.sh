@@ -31,7 +31,7 @@ usage() {
 Usage: install.sh [--prefix DIR] [--version VERSION] [--check]
 
   --prefix DIR       install directory (default: ${PREFIX})
-  --version VERSION  release to install, e.g. 0.169.0-ext.1 (default: latest)
+  --version VERSION  release to install, e.g. 0.171.0-efebia (default: latest)
   --check            only report whether an update is available
   -h, --help         show this help
 

@@ -17,7 +17,7 @@
 #   --built-on <name>   host named in the release notes (default: hostname -s)
 #
 # Steps, as in release.yml:
-#   plan     check-release.sh: the version (v<upstream>-ext.<N>); an upstream version
+#   plan     check-release.sh: the version (v<upstream>-efebia); an upstream version
 #            that is already published is refused unless --force
 #   prepare  prepare-source.sh into <work>/src
 #   test     test-extensions.sh, with the Codex-built V8 for this host
@@ -322,7 +322,8 @@ step_build() (
   v8_env="$("${DIST_ROOT}/scripts/fetch-v8.sh" --source "$src" --target "$target" --cache "${cache}/rusty_v8")"
   export_lines "$v8_env"
   log "Release build with CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}"
-  "${DIST_ROOT}/scripts/build.sh" --release --target "$target" --source "$src" --out "${work}/package"
+  CODEX_DISPLAY_VERSION="$version" \
+    "${DIST_ROOT}/scripts/build.sh" --release --target "$target" --source "$src" --out "${work}/package"
 )
 
 step_package() {

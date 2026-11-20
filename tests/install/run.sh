@@ -36,8 +36,8 @@ sha256() {
 
 # Releases are published for Linux x86_64 only.
 targets=(x86_64-unknown-linux-musl)
-versions=(1.0.0-ext.1 1.0.0-ext.2 1.1.0-ext.1)
-latest=1.1.0-ext.1
+latest=1.1.0-efebia
+versions=(1.0.0-ext.1 1.0.0-ext.2 "$latest")
 for version in "${versions[@]}"; do
   out="${work}/site/releases/download/v${version}"
   mkdir -p "$out"

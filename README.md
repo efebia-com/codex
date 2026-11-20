@@ -122,15 +122,13 @@ To avoid the daemon altogether, start the TUI with `codex --no-daemon`.
 
 ## Versions
 
-Releases are tagged `v<upstream version>-ext.<revision>`, for example
-`v0.169.0-ext.1`:
+The first release for a stable upstream tag uses the upstream version with an
+`-efebia` suffix. For example, `rust-v0.171.0` is published as
+`v0.171.0-efebia`. Forced releases with updated patches append `.2`, `.3` and
+so on. The installer also accepts older `-ext.N` releases.
 
-- `<upstream version>` is the upstream release the build comes from
-  (`rust-v0.169.0`);
-- `<revision>` starts at 1 for each upstream version and grows when the same
-  upstream version is published again with changed patches.
-
-The version is recorded in `DISTRIBUTION` inside each package.
+New releases report the distribution version in `codex --version` and in the
+package's `DISTRIBUTION` file.
 
 ## How releases are made
 
