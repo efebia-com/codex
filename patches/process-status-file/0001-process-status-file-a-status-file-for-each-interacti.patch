@@ -1,4 +1,4 @@
-From 21f7adafb641677ce2e7a96b2937bc992ee3d486 Mon Sep 17 00:00:00 2001
+From 2c32d662ed6e05e569403620ec79bc18b57a6b11 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Wed, 18 Nov 2026 12:18:32 +0100
 Subject: [PATCH 1/2] process-status-file: a status file for each interactive
@@ -33,10 +33,10 @@ Codex.
  create mode 100644 codex-rs/process-status-file/src/tests.rs
 
 diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
-index 71567d4..89d3519 100644
+index aa1d6c19e1..be1fbe261b 100644
 --- a/codex-rs/Cargo.toml
 +++ b/codex-rs/Cargo.toml
-@@ -101,6 +101,7 @@ members = [
+@@ -102,6 +102,7 @@ members = [
      "network-proxy",
      "ollama",
      "process-hardening",
@@ -44,7 +44,7 @@ index 71567d4..89d3519 100644
      "realtime-webrtc",
      "voice-host",
      "protocol",
-@@ -285,6 +286,7 @@ codex-otel-trace-websocket = { path = "otel-trace-websocket" }
+@@ -287,6 +288,7 @@ codex-otel-trace-websocket = { path = "otel-trace-websocket" }
  codex-plugin = { path = "plugin" }
  codex-model-provider = { path = "model-provider" }
  codex-process-hardening = { path = "process-hardening" }
@@ -54,7 +54,7 @@ index 71567d4..89d3519 100644
  codex-prompts = { path = "prompts" }
 diff --git a/codex-rs/process-status-file/Cargo.toml b/codex-rs/process-status-file/Cargo.toml
 new file mode 100644
-index 0000000..cee4ab9
+index 0000000000..cee4ab95f8
 --- /dev/null
 +++ b/codex-rs/process-status-file/Cargo.toml
 @@ -0,0 +1,20 @@
@@ -80,7 +80,7 @@ index 0000000..cee4ab9
 +tempfile = { workspace = true }
 diff --git a/codex-rs/process-status-file/src/lib.rs b/codex-rs/process-status-file/src/lib.rs
 new file mode 100644
-index 0000000..2bce050
+index 0000000000..2bce050c27
 --- /dev/null
 +++ b/codex-rs/process-status-file/src/lib.rs
 @@ -0,0 +1,364 @@
@@ -450,7 +450,7 @@ index 0000000..2bce050
 +mod tests;
 diff --git a/codex-rs/process-status-file/src/tests.rs b/codex-rs/process-status-file/src/tests.rs
 new file mode 100644
-index 0000000..36e385c
+index 0000000000..36e385c12a
 --- /dev/null
 +++ b/codex-rs/process-status-file/src/tests.rs
 @@ -0,0 +1,337 @@

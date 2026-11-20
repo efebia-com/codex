@@ -1,4 +1,4 @@
-From bd61ba1e6be445557be268b3b1b963fc3075c027 Mon Sep 17 00:00:00 2001
+From f05ff4b4946b5a78b94de299cd0c75c444bb2428 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 19:47:40 +0100
 Subject: [PATCH 3/3] mcp: fence the input of channel servers
@@ -22,11 +22,11 @@ notifications carry the generation of the connection that read them.
  codex-rs/codex-mcp/src/channel_tests.rs       |   1 +
  codex-rs/codex-mcp/src/lib.rs                 |   8 +
  codex-rs/codex-mcp/src/resource_client.rs     |   6 +
- codex-rs/codex-mcp/src/rmcp_client.rs         |  15 +-
+ codex-rs/codex-mcp/src/rmcp_client.rs         |   8 +
  codex-rs/codex-mcp/src/runtime.rs             |  12 +
  codex-rs/ext/channels/src/delivery_tests.rs   |   2 +
  codex-rs/ext/channels/src/render_tests.rs     |   2 +
- 10 files changed, 970 insertions(+), 11 deletions(-)
+ 10 files changed, 968 insertions(+), 6 deletions(-)
  create mode 100644 codex-rs/codex-mcp/src/channel_fence.rs
  create mode 100644 codex-rs/codex-mcp/src/channel_fence_tests.rs
 
@@ -1064,7 +1064,7 @@ index 944a64abf8..ce487e0d86 100644
              }
          );
 diff --git a/codex-rs/codex-mcp/src/lib.rs b/codex-rs/codex-mcp/src/lib.rs
-index 7be2afafa2..62cdb8ab44 100644
+index 7d79dc1d72..25ad356936 100644
 --- a/codex-rs/codex-mcp/src/lib.rs
 +++ b/codex-rs/codex-mcp/src/lib.rs
 @@ -12,6 +12,13 @@ pub use channel::ChannelNotification;
@@ -1081,7 +1081,7 @@ index 7be2afafa2..62cdb8ab44 100644
  pub use client_capabilities::client_mcp_extensions;
  pub use client_tool_catalog::CodexAppsToolSnapshot;
  pub use codex_rmcp_client::McpProtocolMode;
-@@ -134,6 +141,7 @@ mod binding;
+@@ -137,6 +144,7 @@ mod binding;
  pub(crate) mod binding_clients;
  mod catalog;
  mod channel;
@@ -1090,7 +1090,7 @@ index 7be2afafa2..62cdb8ab44 100644
  mod client_tool_catalog;
  pub(crate) mod codex_apps;
 diff --git a/codex-rs/codex-mcp/src/resource_client.rs b/codex-rs/codex-mcp/src/resource_client.rs
-index f5b024bb3f..da178090d7 100644
+index a357c9ac21..7a56055a94 100644
 --- a/codex-rs/codex-mcp/src/resource_client.rs
 +++ b/codex-rs/codex-mcp/src/resource_client.rs
 @@ -260,6 +260,12 @@ impl McpResourceClient {
@@ -1107,43 +1107,36 @@ index f5b024bb3f..da178090d7 100644
      pub fn cache_key(&self) -> McpResourceClientCacheKey {
          McpResourceClientCacheKey(Arc::downgrade(&self.runtime.latest_connections()))
 diff --git a/codex-rs/codex-mcp/src/rmcp_client.rs b/codex-rs/codex-mcp/src/rmcp_client.rs
-index 397954c210..b30bdbd6cb 100644
+index 0a3efb769d..a8fe9b9b48 100644
 --- a/codex-rs/codex-mcp/src/rmcp_client.rs
 +++ b/codex-rs/codex-mcp/src/rmcp_client.rs
-@@ -346,6 +346,11 @@ impl ManagedClientStartup {
+@@ -354,6 +354,11 @@ impl ManagedClientStartup {
                  if let Err(error) = validate_mcp_server_name(&server_name) {
                      return Err(error.into());
                  }
 +                // While the thread's channel fence is closed, a channel server that cannot
 +                // fence itself must not get a process that could accept input.
-+                if let Some(hub) = elicitation_requests.channel_hub_for(&server_name) {
++                if let Some(hub) = elicitation_requests.channel_hub_for(&server_key) {
 +                    hub.fence().wait_for_launch(&server_name).await;
 +                }
  
                  let client = match tokio::time::timeout(
                      startup_timeout,
-@@ -1182,11 +1187,11 @@ async fn start_server_task(
+@@ -1205,6 +1210,9 @@ async fn start_server_task(
              );
      }
  
--    let channel = crate::channel::ChannelSubscription::prepare(
--        elicitation_requests.channel_hub_for(&server_name),
--        &client,
--        &mut params,
--    );
-+    let channel_hub = elicitation_requests.channel_hub_for(&server_name);
 +    if let Some(hub) = &channel_hub {
 +        hub.fence().attach(&server_name, &client);
 +    }
-+    let channel = crate::channel::ChannelSubscription::prepare(channel_hub, &client, &mut params);
+     let channel = crate::channel::ChannelSubscription::prepare(channel_hub, &client, &mut params);
  
      let requested_capabilities = params.capabilities.clone();
-     let started_at = Instant::now();
 diff --git a/codex-rs/codex-mcp/src/runtime.rs b/codex-rs/codex-mcp/src/runtime.rs
-index 6ad9416182..1f3d41f65d 100644
+index c22c529993..10457ed6e6 100644
 --- a/codex-rs/codex-mcp/src/runtime.rs
 +++ b/codex-rs/codex-mcp/src/runtime.rs
-@@ -740,6 +740,18 @@ impl McpRuntime {
+@@ -783,6 +783,18 @@ impl McpRuntime {
          self.elicitation_router.channels.take_receiver()
      }
  

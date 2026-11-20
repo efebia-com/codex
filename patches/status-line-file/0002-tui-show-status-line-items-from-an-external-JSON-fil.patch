@@ -1,4 +1,4 @@
-From 32bbac20aaae86e18eeab19c8437c93e02835036 Mon Sep 17 00:00:00 2001
+From 3a925ca8a7235fa1ecdff6783020a267692e39ca Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 15:50:07 +0100
 Subject: [PATCH 2/2] tui: show status line items from an external JSON file
@@ -22,22 +22,22 @@ them as unknown ids.
  codex-rs/tui/src/app.rs                       |   5 +
  codex-rs/tui/src/app_event.rs                 |   4 +-
  ...shot_includes_status_line_file_fields.snap |  16 +
- .../tui/src/bottom_pane/status_line_setup.rs  | 118 ++++-
+ .../tui/src/bottom_pane/status_line_setup.rs  | 122 ++++-
  .../tui/src/bottom_pane/status_line_style.rs  |  27 +-
- .../src/bottom_pane/status_surface_preview.rs |  22 +-
+ .../src/bottom_pane/status_surface_preview.rs |  73 ++-
  codex-rs/tui/src/chatwidget.rs                |   4 +
  codex-rs/tui/src/chatwidget/constructor.rs    |   1 +
  ...tests__status_line_file_fields_footer.snap |  10 +
  .../tui/src/chatwidget/status_controls.rs     |   6 +-
  .../tui/src/chatwidget/status_line_file.rs    |  29 ++
  .../src/chatwidget/status_surface_commands.rs |   7 +-
- .../tui/src/chatwidget/status_surfaces.rs     |  16 +-
+ .../tui/src/chatwidget/status_surfaces.rs     |  21 +-
  codex-rs/tui/src/chatwidget/tests.rs          |   2 +
  .../tests/status_line_file_tests.rs           | 148 ++++++
  codex-rs/tui/src/lib.rs                       |   1 +
  codex-rs/tui/src/status_line_file.rs          | 459 ++++++++++++++++++
  codex-rs/tui/src/status_line_file_tests.rs    | 360 ++++++++++++++
- 18 files changed, 1203 insertions(+), 32 deletions(-)
+ 18 files changed, 1244 insertions(+), 51 deletions(-)
  create mode 100644 codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__status_line_setup__tests__setup_view_snapshot_includes_status_line_file_fields.snap
  create mode 100644 codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_file_fields_footer.snap
  create mode 100644 codex-rs/tui/src/chatwidget/status_line_file.rs
@@ -46,10 +46,10 @@ them as unknown ids.
  create mode 100644 codex-rs/tui/src/status_line_file_tests.rs
 
 diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
-index ddddc61d49..4a11d5b430 100644
+index a83022f433..4f175ec6d3 100644
 --- a/codex-rs/tui/src/app.rs
 +++ b/codex-rs/tui/src/app.rs
-@@ -1312,6 +1312,11 @@ impl App {
+@@ -1421,6 +1421,11 @@ impl App {
                      if let Some(owner) = self.background_voice.as_mut() {
                          owner.refresh_realtime_microphone_level();
                      }
@@ -62,18 +62,18 @@ index ddddc61d49..4a11d5b430 100644
                      self.refresh_agents_overview_usage(app_server, tui.frame_requester());
                      let rendered_area = self.render_chat_widget_frame(tui, screen_size)?;
 diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
-index c858e8196f..9c09abdfbf 100644
+index 24592bfe7d..f04b1f821a 100644
 --- a/codex-rs/tui/src/app_event.rs
 +++ b/codex-rs/tui/src/app_event.rs
-@@ -52,7 +52,6 @@ use uuid::Uuid;
- use crate::app_command::AppCommand;
+@@ -53,7 +53,6 @@ use crate::app_command::AppCommand;
  use crate::app_server_session::AppServerStartedThread;
+ use crate::backend_id::BackendId;
  use crate::bottom_pane::ApprovalRequest;
 -use crate::bottom_pane::StatusLineItem;
  use crate::bottom_pane::TerminalTitleItem;
  use crate::chatwidget::AstraModelPickerAction;
  use crate::chatwidget::ConfiguredPetLoadGeneration;
-@@ -61,6 +60,7 @@ use crate::chatwidget::ThreadUsageOutcome;
+@@ -62,6 +61,7 @@ use crate::chatwidget::ThreadUsageOutcome;
  use crate::chatwidget::UserMessage;
  use crate::experimental_features::FeatureWriteResult;
  use crate::goal_files::GoalDraft;
@@ -81,7 +81,7 @@ index c858e8196f..9c09abdfbf 100644
  use codex_app_server_protocol::AskForApproval;
  use codex_config::types::ApprovalsReviewer;
  use codex_features::Feature;
-@@ -1830,7 +1830,7 @@ pub(crate) enum AppEvent {
+@@ -1914,7 +1914,7 @@ pub(crate) enum AppEvent {
      },
      /// Apply a user-confirmed status-line item ordering/selection.
      StatusLineSetup {
@@ -113,79 +113,87 @@ index 0000000000..504a8f0af7
 +  gpt-5-codex · build ok · gone
 +  space toggle · ←/→ reorder · enter save · esc cancel
 diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
-index 0d7985f6ea..319028703c 100644
+index 7d8894e4f0..62f6ee83b8 100644
 --- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
 +++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
-@@ -20,6 +20,7 @@
+@@ -20,9 +20,13 @@
  //! - Usage limits (primary, secondary)
  //! - Session info (thread title, thread ID, tokens used)
  //! - Application version
 +//! - Fields of the status line file (`file:<key>`), when one is configured
++
++use std::collections::HashSet;
  
  use ratatui::buffer::Buffer;
  use ratatui::layout::Rect;
-@@ -39,6 +40,7 @@ use crate::bottom_pane::status_surface_preview::StatusSurfacePreviewData;
- use crate::bottom_pane::status_surface_preview::StatusSurfacePreviewItem;
++use strum::IntoEnumIterator;
+ use strum_macros::Display;
+ use strum_macros::EnumIter;
+ use strum_macros::EnumString;
+@@ -39,6 +43,7 @@ use crate::bottom_pane::status_surface_preview::StatusSurfacePreviewItem;
+ use crate::key_hint::KeyBinding;
  use crate::keymap::ListKeymap;
  use crate::render::renderable::Renderable;
 +use crate::status_line_file::StatusLineEntry;
  
  const STATUS_LINE_USE_THEME_COLORS_ITEM_ID: &str = "status-line-use-theme-colors";
  
-@@ -317,18 +319,21 @@ impl StatusLineSetupView {
+@@ -361,11 +366,40 @@ impl StatusLineSetupView {
+             on_activate: None,
+         });
  
-         if let Some(selected_items) = status_line_items.as_ref() {
-             for id in *selected_items {
--                let Ok(item) = id.parse::<StatusLineItem>() else {
-+                let Ok(entry) = id.parse::<StatusLineEntry>() else {
-                     continue;
-                 };
--                let item_id = item.to_string();
-+                let item_id = entry.to_string();
-                 if !used_ids.insert(item_id.clone()) {
-                     continue;
-                 }
--                items.push(Self::status_line_select_item(
--                    item,
--                    /*enabled*/ true,
--                    &preview_data,
--                ));
-+                items.push(match entry {
-+                    StatusLineEntry::Builtin(item) => {
-+                        Self::status_line_select_item(item, /*enabled*/ true, &preview_data)
-+                    }
-+                    StatusLineEntry::File(key) => {
-+                        Self::status_line_file_select_item(&key, /*enabled*/ true)
-+                    }
-+                });
-             }
-         }
- 
-@@ -344,6 +349,14 @@ impl StatusLineSetupView {
-             ));
-         }
- 
-+        for key in preview_data.status_line_file.keys() {
-+            if used_ids.insert(StatusLineEntry::File(key.to_string()).to_string()) {
-+                items.push(Self::status_line_file_select_item(
-+                    key, /*enabled*/ false,
-+                ));
+-        items.extend(preview_data.picker_items(
+-            status_line_items,
+-            StatusLineItem::description,
+-            |item| Some(item.preview_item()),
+-        ));
++        let configured_entries = status_line_items
++            .into_iter()
++            .flatten()
++            .filter_map(|id| id.parse::<StatusLineEntry>().ok());
++        let available_entries = StatusLineItem::iter().map(StatusLineEntry::Builtin).chain(
++            preview_data
++                .status_line_file
++                .keys()
++                .map(|key| StatusLineEntry::File(key.to_string())),
++        );
++        let mut used_ids = HashSet::new();
++        for (entry, enabled) in configured_entries
++            .map(|entry| (entry, true))
++            .chain(available_entries.map(|entry| (entry, false)))
++        {
++            let id = entry.to_string();
++            if !used_ids.insert(id.clone()) {
++                continue;
 +            }
++            items.push(match entry {
++                StatusLineEntry::Builtin(item) => preview_data.picker_item(
++                    id,
++                    enabled,
++                    item.description(),
++                    Some(item.preview_item()),
++                ),
++                StatusLineEntry::File(key) => preview_data.picker_item(
++                    id,
++                    enabled,
++                    &format!("Field \"{key}\" of the status line file (omitted when unavailable)"),
++                    None,
++                ),
++            });
 +        }
-+
+ 
          Self {
              picker: MultiSelectPicker::builder(
-                 "Configure Status Line".to_string(),
-@@ -361,7 +374,7 @@ impl StatusLineSetupView {
-                     items
-                         .iter()
-                         .filter(|item| item.enabled)
--                        .filter_map(|item| item.id.parse::<StatusLineItem>().ok()),
-+                        .filter_map(|item| item.id.parse::<StatusLineEntry>().ok()),
-                     use_theme_colors,
-                 )
-             })
-@@ -371,7 +384,7 @@ impl StatusLineSetupView {
+@@ -385,7 +419,7 @@ impl StatusLineSetupView {
+                         items
+                             .iter()
+                             .filter(|item| item.enabled)
+-                            .filter_map(|item| item.id.parse::<StatusLineItem>().ok()),
++                            .filter_map(|item| item.id.parse::<StatusLineEntry>().ok()),
+                         use_theme_colors,
+                     )
+                     .map(Into::into)
+@@ -396,7 +430,7 @@ impl StatusLineSetupView {
                      .any(|id| id == STATUS_LINE_USE_THEME_COLORS_ITEM_ID);
                  let items = ids
                      .iter()
@@ -194,29 +202,7 @@ index 0d7985f6ea..319028703c 100644
                      .collect::<Vec<_>>();
                  app_event.send(AppEvent::StatusLineSetup {
                      items,
-@@ -410,6 +423,21 @@ impl StatusLineSetupView {
-             section_break_after: false,
-         }
-     }
-+
-+    /// Converts a status line file field into a [`MultiSelectItem`] for the picker.
-+    fn status_line_file_select_item(key: &str, enabled: bool) -> MultiSelectItem {
-+        let id = StatusLineEntry::File(key.to_string()).to_string();
-+        MultiSelectItem {
-+            id: id.clone(),
-+            name: id,
-+            description: Some(format!(
-+                "Field \"{key}\" of the status line file (omitted when unavailable)"
-+            )),
-+            enabled,
-+            orderable: true,
-+            section_break_after: false,
-+        }
-+    }
- }
- 
- impl BottomPaneView for StatusLineSetupView {
-@@ -817,6 +845,78 @@ mod tests {
+@@ -858,6 +892,80 @@ mod tests {
          );
      }
  
@@ -245,6 +231,7 @@ index 0d7985f6ea..319028703c 100644
 +                "file:build".to_string(),
 +            ]),
 +            /*use_theme_colors*/ false,
++            StatuslineProviderActions::Hidden,
 +            file_fields_preview(),
 +            AppEventSender::new(tx),
 +            crate::keymap::RuntimeKeymap::defaults().list,
@@ -275,6 +262,7 @@ index 0d7985f6ea..319028703c 100644
 +                "file:gone".to_string(),
 +            ]),
 +            /*use_theme_colors*/ true,
++            StatuslineProviderActions::Hidden,
 +            file_fields_preview(),
 +            AppEventSender::new(tx_raw),
 +            crate::keymap::RuntimeKeymap::defaults().list,
@@ -292,11 +280,11 @@ index 0d7985f6ea..319028703c 100644
 +        );
 +    }
 +
-     fn render_lines(view: &StatusLineSetupView, width: u16) -> String {
-         let height = view.desired_height(width);
-         let area = Rect::new(0, 0, width, height);
+     fn line_text(content: Option<HyperlinkLine>) -> Option<String> {
+         content.map(|line| line.line.to_string())
+     }
 diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
-index 2efa1a07db..a153a9bb35 100644
+index 59426adf57..bfac8f5989 100644
 --- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
 +++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
 @@ -7,6 +7,7 @@ use ratatui::text::Span;
@@ -307,7 +295,7 @@ index 2efa1a07db..a153a9bb35 100644
  use crate::style::readable_color_on;
  use crate::style::secondary_text_style;
  use crate::terminal_hyperlinks::HyperlinkLine;
-@@ -80,6 +81,13 @@ impl StatusLineAccent {
+@@ -85,6 +86,13 @@ impl StatusLineAccent {
          }
      }
  
@@ -321,7 +309,7 @@ index 2efa1a07db..a153a9bb35 100644
      pub(crate) fn scopes(self) -> &'static [&'static str] {
          match self {
              Self::Model => &["entity.name.type", "support.type", "variable"],
-@@ -104,14 +112,15 @@ impl StatusLineAccent {
+@@ -109,14 +117,15 @@ impl StatusLineAccent {
      }
  }
  
@@ -339,7 +327,7 @@ index 2efa1a07db..a153a9bb35 100644
  {
      status_line_from_segments_with_resolver(
          segments,
-@@ -122,7 +131,7 @@ where
+@@ -127,7 +136,7 @@ where
      )
  }
  
@@ -348,7 +336,7 @@ index 2efa1a07db..a153a9bb35 100644
      segments: I,
      use_theme_colors: bool,
      thread_id: Option<ThreadId>,
-@@ -130,11 +139,13 @@ fn status_line_from_segments_with_resolver<I, F>(
+@@ -135,11 +144,13 @@ fn status_line_from_segments_with_resolver<I, F>(
      theme_style_for_accent: F,
  ) -> Option<HyperlinkLine>
  where
@@ -363,7 +351,7 @@ index 2efa1a07db..a153a9bb35 100644
          // Paragraph skips control characters, so they must not enter this single row's link offsets.
          text.retain(|ch| !ch.is_control());
          if !line.line.spans.is_empty() {
-@@ -144,13 +155,13 @@ where
+@@ -149,13 +160,13 @@ where
          let style = if use_theme_colors
              && matches!(
                  item,
@@ -379,7 +367,7 @@ index 2efa1a07db..a153a9bb35 100644
              soften_status_line_style(
                  theme_style_for_accent(accent)
                      .unwrap_or_else(|| Style::default().fg(accent.fallback_color())),
-@@ -163,14 +174,14 @@ where
+@@ -168,14 +179,14 @@ where
              if effective_stdout_color_level() == StdoutColorLevel::Ansi16
                  && matches!(foreground, Color::Rgb(..) | Color::Indexed(16..))
              {
@@ -397,16 +385,20 @@ index 2efa1a07db..a153a9bb35 100644
          } else {
              line.line.push_span(Span::styled(text, style));
 diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
-index 3018d12749..e31e5279a6 100644
+index 414db2ce0a..c88d45d2b0 100644
 --- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
 +++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
-@@ -1,10 +1,12 @@
- use std::collections::BTreeMap;
+@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
+ use std::collections::HashSet;
+ use std::fmt::Display;
+ use std::str::FromStr;
 +use std::sync::Arc;
+ use strum::IntoEnumIterator;
  
- use super::footer_content::FooterContent;
- use codex_protocol::ThreadId;
+ use crate::terminal_hyperlinks::HyperlinkLine;
+@@ -9,7 +10,8 @@ use codex_protocol::ThreadId;
  
+ use super::multi_select_picker::MultiSelectItem;
  use super::status_line_from_segments;
 -use super::status_line_setup::StatusLineItem;
 +use crate::status_line_file::StatusLineEntry;
@@ -414,7 +406,7 @@ index 3018d12749..e31e5279a6 100644
  
  #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
  pub(crate) enum StatusSurfacePreviewItem {
-@@ -138,6 +140,8 @@ struct PreviewValue {
+@@ -143,6 +145,8 @@ struct PreviewValue {
  pub(crate) struct StatusSurfacePreviewData {
      pub(crate) thread_id: Option<ThreadId>,
      pub(crate) pull_request_url: Option<String>,
@@ -423,7 +415,7 @@ index 3018d12749..e31e5279a6 100644
      values: BTreeMap<StatusSurfacePreviewItem, PreviewValue>,
  }
  
-@@ -146,6 +150,7 @@ impl Default for StatusSurfacePreviewData {
+@@ -151,6 +155,7 @@ impl Default for StatusSurfacePreviewData {
          let mut data = Self {
              thread_id: None,
              pull_request_url: None,
@@ -431,9 +423,71 @@ index 3018d12749..e31e5279a6 100644
              values: BTreeMap::new(),
          };
          for item in StatusSurfacePreviewItem::iter() {
-@@ -250,11 +255,20 @@ impl StatusSurfacePreviewData {
+@@ -250,31 +255,40 @@ impl StatusSurfacePreviewData {
+                 if !seen.insert(id.clone()) {
+                     return None;
+                 }
+-                let copy = preview_item(item)
+-                    .filter(|item| {
+-                        matches!(
+-                            item,
+-                            StatusSurfacePreviewItem::FiveHourLimit
+-                                | StatusSurfacePreviewItem::WeeklyLimit
+-                        )
+-                    })
+-                    .and_then(|item| self.live_value_for(item))
+-                    .and_then(rate_limit_preview_copy);
+-                let (name, description) = copy.map_or_else(
+-                    || (id.clone(), description(item).to_string()),
+-                    |copy| (copy.name.to_string(), copy.description.to_string()),
+-                );
+-                Some(MultiSelectItem {
+-                    id,
+-                    name,
+-                    description: Some(description),
+-                    enabled,
+-                    ..Default::default()
+-                })
++                Some(self.picker_item(id, enabled, description(item), preview_item(item)))
+             })
+             .collect()
+     }
+ 
++    pub(super) fn picker_item(
++        &self,
++        id: String,
++        enabled: bool,
++        description: &str,
++        preview_item: Option<StatusSurfacePreviewItem>,
++    ) -> MultiSelectItem {
++        let copy = preview_item
++            .filter(|item| {
++                matches!(
++                    item,
++                    StatusSurfacePreviewItem::FiveHourLimit | StatusSurfacePreviewItem::WeeklyLimit
++                )
++            })
++            .and_then(|item| self.live_value_for(item))
++            .and_then(rate_limit_preview_copy);
++        let (name, description) = copy.map_or_else(
++            || (id.clone(), description.to_string()),
++            |copy| (copy.name.to_string(), copy.description.to_string()),
++        );
++        MultiSelectItem {
++            id,
++            name,
++            description: Some(description),
++            enabled,
++            ..Default::default()
++        }
++    }
++
+     pub(crate) fn value_for(&self, item: StatusSurfacePreviewItem) -> Option<&str> {
+         self.values.get(&item).map(|value| value.text.as_str())
+     }
+@@ -292,11 +306,20 @@ impl StatusSurfacePreviewData {
          use_theme_colors: bool,
-     ) -> Option<FooterContent>
+     ) -> Option<HyperlinkLine>
      where
 -        I: IntoIterator<Item = StatusLineItem>,
 +        I: IntoIterator,
@@ -456,18 +510,18 @@ index 3018d12749..e31e5279a6 100644
          status_line_from_segments(
              segments,
 diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
-index e748352efd..fd0e689350 100644
+index 22205141b8..6dc740f3a0 100644
 --- a/codex-rs/tui/src/chatwidget.rs
 +++ b/codex-rs/tui/src/chatwidget.rs
-@@ -396,6 +396,7 @@ use self::status_state::StatusIndicatorState;
+@@ -399,6 +399,7 @@ use self::status_state::StatusIndicatorState;
  use self::status_state::StatusState;
  use self::status_state::TerminalTitleStatusKind;
  mod status_controls;
 +mod status_line_file;
  mod status_surface_commands;
  mod status_surfaces;
- use self::status_surface_commands::StatusSurfaceOverrides;
-@@ -779,6 +780,8 @@ pub(crate) struct ChatWidget {
+ mod statusline_reader;
+@@ -802,6 +803,8 @@ pub(crate) struct ChatWidget {
      status_line_git_summary_pending: bool,
      // True once we've attempted a Git summary lookup for the current CWD.
      status_line_git_summary_lookup_complete: bool,
@@ -476,7 +530,7 @@ index e748352efd..fd0e689350 100644
      // Cached workspace notification headline for the status line.
      status_line_workspace_headline: Option<String>,
      // Request ID for the async workspace headline fetch currently in flight.
-@@ -1230,6 +1233,7 @@ impl ChatWidget {
+@@ -1242,6 +1245,7 @@ impl ChatWidget {
              self.refresh_terminal_title();
          }
          self.refresh_status_line_if_workspace_headline_due();
@@ -485,17 +539,17 @@ index e748352efd..fd0e689350 100644
          self.refresh_terminal_program_status();
      }
 diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
-index 1ae43235f0..92ea7d73d4 100644
+index f27e7c4801..514570d43a 100644
 --- a/codex-rs/tui/src/chatwidget/constructor.rs
 +++ b/codex-rs/tui/src/chatwidget/constructor.rs
-@@ -291,6 +291,7 @@ impl ChatWidget {
+@@ -304,6 +304,7 @@ impl ChatWidget {
              status_line_git_summary_cwd: None,
              status_line_git_summary_pending: false,
              status_line_git_summary_lookup_complete: false,
 +            status_line_file_fields: crate::status_line_file::current_fields(),
              status_line_workspace_headline: None,
              status_line_workspace_headline_pending_request_id: None,
-             next_status_line_workspace_headline_request_id: 0,
+             status_line_workspace_headline_last_requested_at: None,
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_file_fields_footer.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_file_fields_footer.snap
 new file mode 100644
 index 0000000000..1e9e55749f
@@ -513,10 +567,10 @@ index 0000000000..1e9e55749f
 +"  Ready · build ok · staging deploy waiting for approval from the re…           "
 +"  ? for shortcuts                                                               "
 diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
-index 4d947a952b..e43f0df87f 100644
+index f3f869ee9c..ef34270175 100644
 --- a/codex-rs/tui/src/chatwidget/status_controls.rs
 +++ b/codex-rs/tui/src/chatwidget/status_controls.rs
-@@ -121,7 +121,10 @@ impl ChatWidget {
+@@ -122,7 +122,10 @@ impl ChatWidget {
      /// Applies status-line item selection from the setup view to in-memory config.
      ///
      /// An empty selection persists as an explicit empty list.
@@ -528,7 +582,7 @@ index 4d947a952b..e43f0df87f 100644
          tracing::info!(
              "status line setup confirmed with items: {items:#?}, use_theme_colors: {use_theme_colors}"
          );
-@@ -368,6 +371,7 @@ impl ChatWidget {
+@@ -374,6 +377,7 @@ impl ChatWidget {
              }),
          );
          preview_data.thread_id = self.thread_id;
@@ -605,18 +659,18 @@ index caf0ab1cb2..b493670b1d 100644
          return Err("Cannot combine --clear with status-line items.".into());
      }
 diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-index c7109c6e3d..6bb04b20ea 100644
+index 881cd0eebb..576bb9fb29 100644
 --- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
 +++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-@@ -14,6 +14,7 @@ use crate::status::format_credit_micros;
+@@ -13,6 +13,7 @@ use crate::model_catalog::LUNA_RESERVE_MODEL;
+ use crate::status::format_credit_micros;
  use crate::status::format_estimated_usd_micros;
  use crate::status::format_tokens_compact;
- use crate::status::thread_cost_micros;
 +use crate::status_line_file::StatusLineEntry;
  use crate::terminal_program_status::ProgramStatus;
+ use crate::thread_label::ThreadLabelStyle;
  use codex_app_server_protocol::AskForApproval;
- use codex_config::ConfigLayerSource;
-@@ -53,6 +54,8 @@ const TERMINAL_TITLE_ACTION_REQUIRED_PREFIX_HIDDEN: &str = "[ . ] Action Require
+@@ -51,6 +52,8 @@ const TERMINAL_TITLE_ACTION_REQUIRED_PREFIX_HIDDEN: &str = "[ . ] Action Require
  /// from the same selection set.
  struct StatusSurfaceSelections {
      status_line_items: Vec<StatusLineItem>,
@@ -625,13 +679,13 @@ index c7109c6e3d..6bb04b20ea 100644
      invalid_status_line_items: Vec<String>,
      terminal_title_items: Vec<TerminalTitleItem>,
      invalid_terminal_title_items: Vec<String>,
-@@ -107,11 +110,14 @@ pub(super) struct CachedProjectRootName {
+@@ -86,11 +89,14 @@ pub(super) struct CachedProjectRootName {
  
  impl ChatWidget {
      fn status_surface_selections(&self) -> StatusSurfaceSelections {
 -        let (status_line_items, invalid_status_line_items) = self.status_line_items_with_invalids();
 +        let (status_line_entries, invalid_status_line_items) =
-+            parse_items_with_invalids::<StatusLineEntry>(self.configured_status_line_items());
++            self.status_line_entries_with_invalids();
 +        let status_line_items = StatusLineEntry::builtin_items(&status_line_entries);
          let (terminal_title_items, invalid_terminal_title_items) =
              self.terminal_title_items_with_invalids();
@@ -641,16 +695,16 @@ index c7109c6e3d..6bb04b20ea 100644
              invalid_status_line_items,
              terminal_title_items,
              invalid_terminal_title_items,
-@@ -202,7 +208,7 @@ impl ChatWidget {
-     }
- 
-     fn refresh_status_line_from_selections(&mut self, selections: &StatusSurfaceSelections) {
+@@ -184,7 +190,7 @@ impl ChatWidget {
+         if self.refresh_provider_footer() {
+             return;
+         }
 -        let enabled = !selections.status_line_items.is_empty();
 +        let enabled = !selections.status_line_entries.is_empty();
          self.bottom_pane.set_status_line_enabled(enabled);
          if !enabled {
              self.set_status_line(/*status_line*/ None);
-@@ -210,9 +216,9 @@ impl ChatWidget {
+@@ -192,9 +198,9 @@ impl ChatWidget {
          }
  
          let mut segments = Vec::new();
@@ -663,8 +717,20 @@ index c7109c6e3d..6bb04b20ea 100644
              }
          }
  
+@@ -447,6 +453,11 @@ impl ChatWidget {
+     ///
+     /// Unknown ids are deduplicated in insertion order for warning messages.
+     pub(super) fn status_line_items_with_invalids(&self) -> (Vec<StatusLineItem>, Vec<String>) {
++        let (entries, invalids) = self.status_line_entries_with_invalids();
++        (StatusLineEntry::builtin_items(&entries), invalids)
++    }
++
++    fn status_line_entries_with_invalids(&self) -> (Vec<StatusLineEntry>, Vec<String>) {
+         if self.read_only_history {
+             return Default::default();
+         }
 diff --git a/codex-rs/tui/src/chatwidget/tests.rs b/codex-rs/tui/src/chatwidget/tests.rs
-index 42f292b52b..c7542d42f6 100644
+index be73d9a712..fcd8ac242e 100644
 --- a/codex-rs/tui/src/chatwidget/tests.rs
 +++ b/codex-rs/tui/src/chatwidget/tests.rs
 @@ -298,6 +298,8 @@ mod sparkle_submission_tests;
@@ -831,17 +897,17 @@ index 0000000000..605be1d3ed
 +    );
 +}
 diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
-index 8b3608cf9c..7a4528a4f8 100644
+index 48edcda99d..8cb69a24a2 100644
 --- a/codex-rs/tui/src/lib.rs
 +++ b/codex-rs/tui/src/lib.rs
-@@ -228,6 +228,7 @@ mod startup_presentation;
+@@ -232,6 +232,7 @@ mod startup_presentation;
  mod startup_recovery;
  mod status;
  mod status_indicator_widget;
 +mod status_line_file;
+ mod statusline_metrics;
+ mod statusline_provider;
  mod streaming;
- mod style;
- mod subscription;
 diff --git a/codex-rs/tui/src/status_line_file.rs b/codex-rs/tui/src/status_line_file.rs
 new file mode 100644
 index 0000000000..280851ab75

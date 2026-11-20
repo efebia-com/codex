@@ -1,4 +1,4 @@
-From c75246515879391d9b06ad9418d33c3f4f78012d Mon Sep 17 00:00:00 2001
+From 1dcd0e8ce63c4ab0d83eeb1bcf18e68cfee1d768 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 13:52:12 +0100
 Subject: [PATCH] Add app-server tests for MCP channel notifications
@@ -1164,7 +1164,7 @@ index 0000000000..01148c73e4
 +if __name__ == "__main__":
 +    main()
 diff --git a/codex-rs/app-server/tests/suite/v2/mod.rs b/codex-rs/app-server/tests/suite/v2/mod.rs
-index d8ba076fc5..b25cdae263 100644
+index 1a650e6b4d..eb324eab00 100644
 --- a/codex-rs/app-server/tests/suite/v2/mod.rs
 +++ b/codex-rs/app-server/tests/suite/v2/mod.rs
 @@ -90,6 +90,7 @@ mod luna_reserve;

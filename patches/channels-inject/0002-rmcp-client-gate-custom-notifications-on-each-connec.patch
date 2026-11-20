@@ -1,7 +1,7 @@
-From 2295ef53ac48a27a6eb7a8dd0d2acfa80c36ed95 Mon Sep 17 00:00:00 2001
+From a0f18b6bcc4a0057ea1d1c5ae8cc89d057609b42 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 11:43:23 +0100
-Subject: [PATCH 2/4] rmcp-client: gate custom notifications on each connection
+Subject: [PATCH 2/7] rmcp-client: gate custom notifications on each connection
  capability
 
 ---
@@ -352,10 +352,10 @@ index d84e1a132e..e0ea03696f 100644
          .initialize(
              InitializeRequestParams::new(
 diff --git a/codex-rs/rmcp-client/src/rmcp_client.rs b/codex-rs/rmcp-client/src/rmcp_client.rs
-index b88c7e1ebe..1f4a273673 100644
+index c9e8cca797..b1e73e834b 100644
 --- a/codex-rs/rmcp-client/src/rmcp_client.rs
 +++ b/codex-rs/rmcp-client/src/rmcp_client.rs
-@@ -468,13 +468,16 @@ impl RmcpClient {
+@@ -469,13 +469,16 @@ impl RmcpClient {
      /// Delivers server notifications with `method`, which this client otherwise ignores, to the
      /// returned receiver in the order the server sent them. Subscribe before `initialize` to
      /// receive notifications sent right after it. When the receiver falls `capacity` behind, new

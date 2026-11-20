@@ -1,4 +1,4 @@
-From c3f1a835fb095210839e0594d9055eac68494224 Mon Sep 17 00:00:00 2001
+From 1f56e04aaffae8d3d83db9cac6272dc0ce09383d Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 14:38:12 +0100
 Subject: [PATCH 4/4] ext/channels: deliver MCP channel notifications to the
@@ -29,10 +29,10 @@ for sub-agents and other non-root threads.
  create mode 100644 codex-rs/ext/channels/tests/lifecycle.rs
 
 diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
-index 9d5e0bf0fd..9583fffcd9 100644
+index 01d075adec..aa1d6c19e1 100644
 --- a/codex-rs/Cargo.toml
 +++ b/codex-rs/Cargo.toml
-@@ -69,6 +69,7 @@ members = [
+@@ -70,6 +70,7 @@ members = [
      "ext/extension-api",
      "ext/multi-env-copy-file",
      "ext/goal",
@@ -40,7 +40,7 @@ index 9d5e0bf0fd..9583fffcd9 100644
      "ext/git-attribution",
      "ext/guardian-reviewer",
      "ext/guardian-v2",
-@@ -273,6 +274,7 @@ codex-memories-read = { path = "memories/read" }
+@@ -275,6 +276,7 @@ codex-memories-read = { path = "memories/read" }
  codex-memories-write = { path = "memories/write" }
  codex-mcp = { path = "codex-mcp" }
  codex-mcp-extension = { path = "ext/mcp" }
@@ -49,7 +49,7 @@ index 9d5e0bf0fd..9583fffcd9 100644
  codex-models-manager = { path = "models-manager" }
  codex-mxc-sandbox = { path = "mxc-sandbox" }
 diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
-index 959373d773..7c19fe0936 100644
+index 5e6ecb808a..0ac7335b51 100644
 --- a/codex-rs/app-server/Cargo.toml
 +++ b/codex-rs/app-server/Cargo.toml
 @@ -82,6 +82,7 @@ codex-websocket-auth = { workspace = true }
@@ -61,7 +61,7 @@ index 959373d773..7c19fe0936 100644
  codex-model-provider-info = { workspace = true }
  codex-models-manager = { workspace = true }
 diff --git a/codex-rs/app-server/src/extensions.rs b/codex-rs/app-server/src/extensions.rs
-index ff31e9e395..138e6d931b 100644
+index caa9b4da77..39b37a8415 100644
 --- a/codex-rs/app-server/src/extensions.rs
 +++ b/codex-rs/app-server/src/extensions.rs
 @@ -84,6 +84,7 @@ pub(crate) fn thread_extensions(

@@ -1,4 +1,4 @@
-From 65b9f7f85062840a8f756f345c6959850b60442b Mon Sep 17 00:00:00 2001
+From 560a10a86a0a76763412715292cd9de162d916f1 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 11:52:56 +0100
 Subject: [PATCH] app-server: test opted-in MCP process restarts
@@ -818,7 +818,7 @@ index 0000000000..4d63740e89
 +if __name__ == "__main__":
 +    main()
 diff --git a/codex-rs/app-server/tests/suite/v2/mod.rs b/codex-rs/app-server/tests/suite/v2/mod.rs
-index b25cdae263..a298e59914 100644
+index eb324eab00..905d1a694f 100644
 --- a/codex-rs/app-server/tests/suite/v2/mod.rs
 +++ b/codex-rs/app-server/tests/suite/v2/mod.rs
 @@ -96,6 +96,7 @@ mod mcp_event_stream;

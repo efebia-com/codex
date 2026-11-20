@@ -1,4 +1,4 @@
-From 69802bacc1d9f5f4116e3b7b1e9fcc621f981674 Mon Sep 17 00:00:00 2001
+From be1f2b9fcff16d020b07d30c379974471f5bc2d6 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Wed, 18 Nov 2026 12:18:32 +0100
 Subject: [PATCH 2/2] tui: keep the process status file up to date
@@ -20,10 +20,10 @@ written when one of these changes.
  4 files changed, 24 insertions(+)
 
 diff --git a/codex-rs/tui/Cargo.toml b/codex-rs/tui/Cargo.toml
-index 6e5c58f..81d485a 100644
+index 79ae4afa11..06a166112d 100644
 --- a/codex-rs/tui/Cargo.toml
 +++ b/codex-rs/tui/Cargo.toml
-@@ -55,6 +55,7 @@ codex-model-provider-info = { workspace = true }
+@@ -57,6 +57,7 @@ codex-model-provider-info = { workspace = true }
  codex-models-manager = { workspace = true }
  codex-otel = { workspace = true }
  codex-plugin = { workspace = true }
@@ -32,10 +32,10 @@ index 6e5c58f..81d485a 100644
  codex-realtime-webrtc = { workspace = true }
  futures = { workspace = true }
 diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
-index 4a11d5b..ac27116 100644
+index 4f175ec6d3..b153ff70d3 100644
 --- a/codex-rs/tui/src/app.rs
 +++ b/codex-rs/tui/src/app.rs
-@@ -1319,6 +1319,10 @@ impl App {
+@@ -1428,6 +1428,10 @@ impl App {
                      );
                      self.chat_widget.pre_draw_tick();
                      self.refresh_agents_overview_usage(app_server, tui.frame_requester());
@@ -47,11 +47,11 @@ index 4a11d5b..ac27116 100644
                      if tui.is_owned_screen()
                          && self.transcript_view.history
 diff --git a/codex-rs/tui/src/app/app_server_events.rs b/codex-rs/tui/src/app/app_server_events.rs
-index 8f179f3..f1eb1af 100644
+index a23c09a1c0..b84bf5a10b 100644
 --- a/codex-rs/tui/src/app/app_server_events.rs
 +++ b/codex-rs/tui/src/app/app_server_events.rs
-@@ -214,6 +214,10 @@ impl App {
- 
+@@ -265,6 +265,10 @@ impl App {
+         self.observe_sidebar_agent_event(&notification);
          if let ServerNotification::ThreadStatusChanged(status) = &notification {
              let _ = self.dynamic_tool_status_updates.send(status.clone());
 +            codex_process_status_file::thread_status(
@@ -62,10 +62,10 @@ index 8f179f3..f1eb1af 100644
  
          if let ServerNotification::ThreadStarted(started) = &notification
 diff --git a/codex-rs/tui/src/startup_orchestration.rs b/codex-rs/tui/src/startup_orchestration.rs
-index 46fd03f..5f2964c 100644
+index ce51253098..ecdd3acd4d 100644
 --- a/codex-rs/tui/src/startup_orchestration.rs
 +++ b/codex-rs/tui/src/startup_orchestration.rs
-@@ -351,6 +351,18 @@ pub(super) async fn run_main_inner(
+@@ -352,6 +352,18 @@ pub(super) async fn run_main_inner(
          screen.transcript_mode.is_owned(),
          screen.use_alt_screen,
      );
@@ -84,7 +84,7 @@ index 46fd03f..5f2964c 100644
      let mut startup_draft = startup_draft::StartupDraft::new(
          initialized_terminal,
          terminal_restore_guard,
-@@ -880,6 +892,7 @@ pub(super) async fn run_main_inner(
+@@ -886,6 +898,7 @@ pub(super) async fn run_main_inner(
                      .shutdown_with_timeout(INTERACTIVE_OTEL_SHUTDOWN_TIMEOUT)
                      .await;
              }
@@ -92,7 +92,7 @@ index 46fd03f..5f2964c 100644
              std::process::exit(1);
          }
      }
-@@ -901,6 +914,7 @@ pub(super) async fn run_main_inner(
+@@ -907,6 +920,7 @@ pub(super) async fn run_main_inner(
                      .shutdown_with_timeout(INTERACTIVE_OTEL_SHUTDOWN_TIMEOUT)
                      .await;
              }
@@ -100,7 +100,7 @@ index 46fd03f..5f2964c 100644
              std::process::exit(1);
          }
      }
-@@ -1030,6 +1044,7 @@ pub(super) async fn run_main_inner(
+@@ -1037,6 +1051,7 @@ pub(super) async fn run_main_inner(
          err.downcast::<std::io::Error>()
              .unwrap_or_else(|err| std::io::Error::other(err.to_string()))
      });

@@ -1,4 +1,4 @@
-From e10aa5801c1b5209a5ca2f56dd998602fb60d385 Mon Sep 17 00:00:00 2001
+From 8f16f1e839757eba0592933f7a3c580cb53cdec3 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 14:38:11 +0100
 Subject: [PATCH 2/4] config: accept mcp_servers.<name>.channel
@@ -11,7 +11,7 @@ carried in McpServerConfig.
  2 files changed, 12 insertions(+)
 
 diff --git a/codex-rs/config/src/mcp_types.rs b/codex-rs/config/src/mcp_types.rs
-index 4a81cabe37..174b90d68d 100644
+index f228d7bc28..92b1743038 100644
 --- a/codex-rs/config/src/mcp_types.rs
 +++ b/codex-rs/config/src/mcp_types.rs
 @@ -432,6 +432,12 @@ pub struct RawMcpServerConfig {
@@ -36,10 +36,10 @@ index 4a81cabe37..174b90d68d 100644
              supports_parallel_tool_calls,
              tool_input_schema_max_bytes,
 diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
-index 5f72e108ec..0a75b6053e 100644
+index b99d4360b0..2fd8614e20 100644
 --- a/codex-rs/core/config.schema.json
 +++ b/codex-rs/core/config.schema.json
-@@ -4339,6 +4339,11 @@
+@@ -4429,6 +4429,11 @@
          "bearer_token_env_var": {
            "type": "string"
          },

@@ -1,4 +1,4 @@
-From 1a5419ffff16e7b009ce9e7bd195b61d993f6701 Mon Sep 17 00:00:00 2001
+From 605c079ce74adb0b4c294b6be5076c3cfa5f6103 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 14:15:35 +0100
 Subject: [PATCH 3/3] core: raise the recursion limit for MCP recovery futures
@@ -10,7 +10,7 @@ Builds exceed rustc's default query depth when laying out async MCP tool refresh
  2 files changed, 6 insertions(+)
 
 diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
-index d684b39426..6c170ff260 100644
+index 1e9090ab19..bb143bb44f 100644
 --- a/codex-rs/core/src/lib.rs
 +++ b/codex-rs/core/src/lib.rs
 @@ -4,6 +4,9 @@

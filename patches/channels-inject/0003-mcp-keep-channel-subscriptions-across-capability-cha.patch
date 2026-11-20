@@ -1,7 +1,7 @@
-From 0278e1c50d66a37e78b7644ee9480b15ac377c7c Mon Sep 17 00:00:00 2001
+From e1882258232e2b59009e592da7ad49c1e6390c2e Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 11:43:23 +0100
-Subject: [PATCH 3/4] mcp: keep channel subscriptions across capability changes
+Subject: [PATCH 3/7] mcp: keep channel subscriptions across capability changes
 
 ---
  codex-rs/codex-mcp/src/channel.rs       | 25 ++++++++++++++++------
@@ -114,7 +114,7 @@ index 4bb85a0709..944a64abf8 100644
      Ok(())
  }
 diff --git a/codex-rs/codex-mcp/src/lib.rs b/codex-rs/codex-mcp/src/lib.rs
-index 84d9fc0722..50c3456430 100644
+index 3db845a5a1..042bab52f8 100644
 --- a/codex-rs/codex-mcp/src/lib.rs
 +++ b/codex-rs/codex-mcp/src/lib.rs
 @@ -9,6 +9,7 @@ pub use channel::CHANNEL_CAPABILITY;

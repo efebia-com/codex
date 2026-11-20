@@ -1,4 +1,4 @@
-From 5306d14ceaa98ae8729ba61d2d0fe87fe34d487b Mon Sep 17 00:00:00 2001
+From 4250ac4603b50a5eee76588f12734fd1ca4d6346 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 15:54:13 +0100
 Subject: [PATCH 2/2] core: test MCP session ids across resume and sub-agents
@@ -350,10 +350,10 @@ index 0000000000..1ebfed8dc2
 +    Ok(())
 +}
 diff --git a/codex-rs/core/tests/suite/mod.rs b/codex-rs/core/tests/suite/mod.rs
-index b1f7a42313..bc317c38e1 100644
+index 756524d6c5..8fe9ed37bb 100644
 --- a/codex-rs/core/tests/suite/mod.rs
 +++ b/codex-rs/core/tests/suite/mod.rs
-@@ -148,6 +148,7 @@ mod mcp_executor_context;
+@@ -149,6 +149,7 @@ mod mcp_executor_context;
  mod mcp_extension_protocol;
  mod mcp_optional_startup_grace;
  mod mcp_refresh_cleanup;

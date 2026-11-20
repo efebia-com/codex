@@ -1,4 +1,4 @@
-From b79cc1cffb65f67e32570d35854ab1eff90cc578 Mon Sep 17 00:00:00 2001
+From 9c7082d2d1c3aabd0c5301fe020ccb0890faea3e Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 15:54:13 +0100
 Subject: [PATCH 1/2] mcp: pass session and thread ids to stdio servers that
@@ -38,7 +38,7 @@ between threads that requested different ids.
  create mode 100644 codex-rs/config/src/mcp_codex_env_tests.rs
 
 diff --git a/codex-rs/cli/src/doctor.rs b/codex-rs/cli/src/doctor.rs
-index ab43884ac8..5e597c9dfe 100644
+index 619326595a..66d1ba8b7b 100644
 --- a/codex-rs/cli/src/doctor.rs
 +++ b/codex-rs/cli/src/doctor.rs
 @@ -1610,7 +1610,7 @@ async fn mcp_check_from_servers(servers: &HashMap<String, McpServerConfig>) -> D
@@ -51,30 +51,30 @@ index ab43884ac8..5e597c9dfe 100644
                      }
                  }
 diff --git a/codex-rs/codex-mcp/src/lib.rs b/codex-rs/codex-mcp/src/lib.rs
-index e9bf3852dd..df39f7450f 100644
+index f508a95eea..3db845a5a1 100644
 --- a/codex-rs/codex-mcp/src/lib.rs
 +++ b/codex-rs/codex-mcp/src/lib.rs
-@@ -42,6 +42,7 @@ pub use sandbox_metadata::MCP_SANDBOX_LAUNCHER_META_KEY;
- pub use sandbox_metadata::MCP_SANDBOX_STATE_CAPABILITY;
+@@ -50,6 +50,7 @@ pub use sandbox_metadata::MCP_SANDBOX_STATE_CAPABILITY;
  pub use sandbox_metadata::MCP_SANDBOX_STATE_META_CAPABILITY;
  pub use sandbox_metadata::SandboxState;
+ pub use server_key::McpServerKey;
 +pub use session_env::McpSessionEnv;
  pub use tool_catalog_cache::McpToolCatalogCache;
  pub use tool_request_meta::McpToolRequestMetaHook;
  pub use tool_request_meta::McpToolRequestMetaProvider;
-@@ -148,6 +149,7 @@ pub(crate) mod runtime;
- mod sandbox_executable;
+@@ -159,6 +160,7 @@ mod sandbox_executable;
  mod sandbox_metadata;
  pub(crate) mod server;
+ mod server_key;
 +mod session_env;
  mod tool_catalog_cache;
  mod tool_request_meta;
  pub(crate) mod tools;
 diff --git a/codex-rs/codex-mcp/src/rmcp_client.rs b/codex-rs/codex-mcp/src/rmcp_client.rs
-index a287528289..3894d006e6 100644
+index 523f779028..1504e8f344 100644
 --- a/codex-rs/codex-mcp/src/rmcp_client.rs
 +++ b/codex-rs/codex-mcp/src/rmcp_client.rs
-@@ -1497,6 +1497,8 @@ pub(crate) async fn make_rmcp_client(
+@@ -1519,6 +1519,8 @@ pub(crate) async fn make_rmcp_client(
          } => {
              let command_os: OsString = command.into();
              let args_os: Vec<OsString> = args.into_iter().map(Into::into).collect();
@@ -84,10 +84,10 @@ index a287528289..3894d006e6 100644
                  env.into_iter()
                      .map(|(key, value)| (key.into(), value.into()))
 diff --git a/codex-rs/codex-mcp/src/runtime.rs b/codex-rs/codex-mcp/src/runtime.rs
-index 35ac0f980c..58fb661527 100644
+index f0a957ff62..c22c529993 100644
 --- a/codex-rs/codex-mcp/src/runtime.rs
 +++ b/codex-rs/codex-mcp/src/runtime.rs
-@@ -71,6 +71,7 @@ use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
+@@ -74,6 +74,7 @@ use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
  use crate::resource_client::McpResourceServerCacheKey;
  use crate::resource_origin::ResourceOrigins;
  use crate::server::EffectiveMcpServer;
@@ -95,7 +95,7 @@ index 35ac0f980c..58fb661527 100644
  use crate::tool_catalog_cache::McpToolCatalogCache;
  use crate::tools::ToolInfo;
  
-@@ -1066,6 +1067,7 @@ pub struct McpRuntimeContext {
+@@ -1202,6 +1203,7 @@ pub struct McpRuntimeContext {
      ready_environments: HashMap<String, Arc<Environment>>,
      local_process_cwd: PathBuf,
      local_http_client: Arc<dyn HttpClient>,
@@ -103,7 +103,7 @@ index 35ac0f980c..58fb661527 100644
  }
  
  /// Applies the local HTTP headers helper configured for an MCP server.
-@@ -1115,9 +1117,20 @@ impl McpRuntimeContext {
+@@ -1251,9 +1253,20 @@ impl McpRuntimeContext {
              ready_environments: HashMap::new(),
              local_process_cwd,
              local_http_client,
@@ -125,10 +125,10 @@ index 35ac0f980c..58fb661527 100644
      pub fn with_connection_pool(mut self, pool: McpConnectionPool) -> Self {
          self.connection_pool = Some(pool);
 diff --git a/codex-rs/codex-mcp/src/server.rs b/codex-rs/codex-mcp/src/server.rs
-index dffab26c55..a3d825250b 100644
+index 0933b4279c..6ce552fd21 100644
 --- a/codex-rs/codex-mcp/src/server.rs
 +++ b/codex-rs/codex-mcp/src/server.rs
-@@ -7,6 +7,7 @@ use std::sync::Arc;
+@@ -8,6 +8,7 @@ use crate::McpServerKey;
  use crate::auth::McpAuthProvider;
  use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
  use crate::runtime::McpRuntimeContext;
@@ -136,7 +136,7 @@ index dffab26c55..a3d825250b 100644
  use codex_config::AppToolApproval;
  use codex_config::McpServerAuth;
  use codex_config::McpServerConfig;
-@@ -176,6 +177,7 @@ pub(crate) struct McpServerConnectionIdentity {
+@@ -177,6 +178,7 @@ pub(crate) struct McpServerConnectionIdentity {
      resolved_environment: Result<Option<Arc<Environment>>, String>,
      local_stdio_fallback_cwd: Option<PathBuf>,
      referenced_environment_variables: Vec<(String, Option<OsString>)>,
@@ -144,7 +144,7 @@ index dffab26c55..a3d825250b 100644
      runtime_auth: Option<CodexAuth>,
      runtime_auth_token: Option<String>,
      runtime_auth_mode: Option<codex_features::RuntimeAuthMode>,
-@@ -282,6 +284,13 @@ impl McpServerConnectionIdentity {
+@@ -283,6 +285,13 @@ impl McpServerConnectionIdentity {
              McpCredentialPolicy::HostFallbackAllowed => referenced_environment_variables(config),
              McpCredentialPolicy::ExecutorOnly => Vec::new(),
          };
@@ -158,7 +158,7 @@ index dffab26c55..a3d825250b 100644
          let runtime_auth = runtime_auth_provider.and(auth).cloned();
          let runtime_auth_token = runtime_auth.as_ref().and_then(|auth| auth.get_token().ok());
          let oauth_store_was_contended = oauth_credentials
-@@ -306,6 +315,7 @@ impl McpServerConnectionIdentity {
+@@ -307,6 +316,7 @@ impl McpServerConnectionIdentity {
              resolved_environment: resolved_environment.clone(),
              local_stdio_fallback_cwd,
              referenced_environment_variables,
@@ -166,7 +166,7 @@ index dffab26c55..a3d825250b 100644
              runtime_auth,
              runtime_auth_token,
              runtime_auth_mode,
-@@ -346,6 +356,7 @@ impl McpServerConnectionIdentity {
+@@ -347,6 +357,7 @@ impl McpServerConnectionIdentity {
              && same_resolved_environment(&self.resolved_environment, &other.resolved_environment)
              && self.local_stdio_fallback_cwd == other.local_stdio_fallback_cwd
              && self.referenced_environment_variables == other.referenced_environment_variables
@@ -397,7 +397,7 @@ index 0000000000..26a07f539c
 +    assert!(fixture::key(&thread_a, &plain) == fixture::key(&thread_b, &plain));
 +}
 diff --git a/codex-rs/config/src/lib.rs b/codex-rs/config/src/lib.rs
-index 4a10ce6872..2e1af72a3b 100644
+index 05ed1eb435..92603b0441 100644
 --- a/codex-rs/config/src/lib.rs
 +++ b/codex-rs/config/src/lib.rs
 @@ -23,6 +23,7 @@ mod in_app_browser_requirements;
@@ -408,7 +408,7 @@ index 4a10ce6872..2e1af72a3b 100644
  mod mcp_edit;
  mod mcp_ema;
  mod mcp_ema_cancellation;
-@@ -184,6 +185,8 @@ pub use marketplace_edit::RemoveMarketplaceConfigOutcome;
+@@ -185,6 +186,8 @@ pub use marketplace_edit::RemoveMarketplaceConfigOutcome;
  pub use marketplace_edit::record_user_marketplace;
  pub use marketplace_edit::remove_user_marketplace;
  pub use marketplace_edit::remove_user_marketplace_config;
@@ -528,7 +528,7 @@ index 0000000000..986403d1fb
 +    assert_eq!(deserialized.validate_source(), Ok(()));
 +}
 diff --git a/codex-rs/config/src/mcp_types.rs b/codex-rs/config/src/mcp_types.rs
-index 4a81cabe37..fc9e3d0c76 100644
+index 92b1743038..208e4c3f2c 100644
 --- a/codex-rs/config/src/mcp_types.rs
 +++ b/codex-rs/config/src/mcp_types.rs
 @@ -17,9 +17,11 @@ use serde::Deserializer;
@@ -573,10 +573,10 @@ index 4a81cabe37..fc9e3d0c76 100644
          }
      }
 diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
-index 5f72e108ec..57592e39c8 100644
+index 2fd8614e20..c2b2e85671 100644
 --- a/codex-rs/core/config.schema.json
 +++ b/codex-rs/core/config.schema.json
-@@ -2855,6 +2855,7 @@
+@@ -2923,6 +2923,7 @@
                "type": "string"
              },
              "source": {
@@ -585,10 +585,10 @@ index 5f72e108ec..57592e39c8 100644
              }
            },
 diff --git a/codex-rs/core/src/session/mcp.rs b/codex-rs/core/src/session/mcp.rs
-index b2ec905920..cb82178849 100644
+index bc3e2ac358..c012738a38 100644
 --- a/codex-rs/core/src/session/mcp.rs
 +++ b/codex-rs/core/src/session/mcp.rs
-@@ -176,6 +176,10 @@ impl Session {
+@@ -209,6 +209,10 @@ impl Session {
              local_process_cwd,
          )
          .with_connection_pool(self.services.mcp_manager.connection_pool())

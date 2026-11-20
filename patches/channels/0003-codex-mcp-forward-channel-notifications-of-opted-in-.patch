@@ -1,4 +1,4 @@
-From d74556ef5c2730cc513db3d5999ae58c9df79487 Mon Sep 17 00:00:00 2001
+From 754922bd52f132ee4e39caeb1cb9823f09f8bd88 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Mon, 16 Nov 2026 14:38:11 +0100
 Subject: [PATCH 3/4] codex-mcp: forward channel notifications of opted-in
@@ -9,14 +9,15 @@ capability in initialize and, when the server declares it too over a
 session with an initialize handshake, forward its notifications/claude/channel
 notifications to a bounded per-thread queue that a host can take.
 ---
- codex-rs/codex-mcp/src/channel.rs         | 174 ++++++++++++++++++
- codex-rs/codex-mcp/src/channel_tests.rs   | 212 ++++++++++++++++++++++
- codex-rs/codex-mcp/src/elicitation.rs     |  15 ++
- codex-rs/codex-mcp/src/lib.rs             |   7 +
- codex-rs/codex-mcp/src/resource_client.rs |   8 +
- codex-rs/codex-mcp/src/rmcp_client.rs     |   9 +
- codex-rs/codex-mcp/src/runtime.rs         |   8 +
- 7 files changed, 433 insertions(+)
+ codex-rs/codex-mcp/src/channel.rs           | 174 ++++++++++++++++
+ codex-rs/codex-mcp/src/channel_tests.rs     | 212 ++++++++++++++++++++
+ codex-rs/codex-mcp/src/elicitation.rs       |  22 ++
+ codex-rs/codex-mcp/src/elicitation_tests.rs |  32 +++
+ codex-rs/codex-mcp/src/lib.rs               |   7 +
+ codex-rs/codex-mcp/src/resource_client.rs   |   8 +
+ codex-rs/codex-mcp/src/rmcp_client.rs       |   6 +
+ codex-rs/codex-mcp/src/runtime.rs           |   8 +
+ 8 files changed, 469 insertions(+)
  create mode 100644 codex-rs/codex-mcp/src/channel.rs
  create mode 100644 codex-rs/codex-mcp/src/channel_tests.rs
 
@@ -419,10 +420,10 @@ index 0000000000..4bb85a0709
 +    assert!(first.take_receiver().is_none());
 +}
 diff --git a/codex-rs/codex-mcp/src/elicitation.rs b/codex-rs/codex-mcp/src/elicitation.rs
-index 46d1ad84fd..858cd7e12b 100644
+index 5dbe5cd775..23ed549288 100644
 --- a/codex-rs/codex-mcp/src/elicitation.rs
 +++ b/codex-rs/codex-mcp/src/elicitation.rs
-@@ -103,6 +103,8 @@ pub(crate) struct ElicitationRequestRouter {
+@@ -107,6 +107,8 @@ pub(crate) struct ElicitationRequestRouter {
      requests: Arc<StdMutex<PendingResponders>>,
      terminal_actions_finished: Arc<tokio::sync::Notify>,
      full_access_form_input_enabled: Arc<AtomicBool>,
@@ -431,28 +432,85 @@ index 46d1ad84fd..858cd7e12b 100644
  }
  
  // Removes and abandons a published request when its native waiter is dropped.
-@@ -416,6 +418,19 @@ impl ElicitationRequestManager {
+@@ -422,6 +424,26 @@ impl ElicitationRequestManager {
          true
      }
  
 +    /// The thread's channel hub when the current config enables channels for `server`.
-+    pub(crate) fn channel_hub_for(&self, server: &str) -> Option<crate::channel::ChannelHub> {
-+        let enabled = self
-+            .authority
-+            .lock()
-+            .unwrap_or_else(std::sync::PoisonError::into_inner)
-+            .as_ref()
-+            .is_some_and(|authority| {
-+                crate::channel::channel_enabled(&authority.config.config_layer_stack, server)
-+            });
++    pub(crate) fn channel_hub_for(
++        &self,
++        server: &McpServerKey,
++    ) -> Option<crate::channel::ChannelHub> {
++        let enabled = server.scoped_environment_id().is_none()
++            && self
++                .authority
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .as_ref()
++                .is_some_and(|authority| {
++                    crate::channel::channel_enabled(
++                        &authority.config.config_layer_stack,
++                        server.name(),
++                    )
++                });
 +        enabled.then(|| self.router.channels.clone())
 +    }
 +
      pub(crate) fn make_sender(
          &self,
-         server_name: String,
+         server_key: McpServerKey,
+diff --git a/codex-rs/codex-mcp/src/elicitation_tests.rs b/codex-rs/codex-mcp/src/elicitation_tests.rs
+index b32953a412..b0d4fe21ad 100644
+--- a/codex-rs/codex-mcp/src/elicitation_tests.rs
++++ b/codex-rs/codex-mcp/src/elicitation_tests.rs
+@@ -3,6 +3,9 @@ use crate::McpServerKey;
+ use crate::McpServerPermissions;
+ use crate::mcp::tests::test_elicitation_config;
+ use async_channel::Receiver;
++use codex_config::ConfigLayerEntry;
++use codex_config::ConfigLayerSource;
++use codex_config::ConfigLayerStack;
+ use codex_protocol::models::PermissionProfile;
+ use codex_protocol::protocol::GranularApprovalConfig;
+ use pretty_assertions::assert_eq;
+@@ -16,6 +19,35 @@ use std::sync::atomic::Ordering::Relaxed;
+ 
+ type ReviewerResponse = std::result::Result<Option<ElicitationResponse>, &'static str>;
+ 
++#[test]
++fn channel_opt_in_applies_only_to_the_unscoped_registration() {
++    let mut config =
++        test_elicitation_config("server", AskForApproval::Never, PermissionProfile::Disabled);
++    let layer = ConfigLayerEntry::new(
++        ConfigLayerSource::SessionFlags,
++        serde_json::from_value(json!({"mcp_servers": {"server": {"channel": true}}})).unwrap(),
++    );
++    Arc::make_mut(&mut config).config_layer_stack =
++        ConfigLayerStack::new(vec![layer], Default::default(), Default::default()).unwrap();
++    let manager = ElicitationRequestManager::new(
++        config,
++        /*reviewer*/ None,
++        /*lifecycle*/ None,
++        ElicitationRequestRouter::default(),
++    );
++
++    assert!(
++        manager
++            .channel_hub_for(&McpServerKey::unscoped("server"))
++            .is_some()
++    );
++    assert!(
++        manager
++            .channel_hub_for(&McpServerKey::in_environment("executor", "server"))
++            .is_none()
++    );
++}
++
+ #[tokio::test]
+ async fn abandonment_is_ordered_and_exactly_once_when_the_native_waiter_is_dropped() {
+     let (manager, _, _) = verification_fixture(AskForApproval::OnRequest, /*reviewer*/ None);
 diff --git a/codex-rs/codex-mcp/src/lib.rs b/codex-rs/codex-mcp/src/lib.rs
-index e9bf3852dd..6d34134abc 100644
+index ea9cb05291..f508a95eea 100644
 --- a/codex-rs/codex-mcp/src/lib.rs
 +++ b/codex-rs/codex-mcp/src/lib.rs
 @@ -5,6 +5,12 @@ pub use binding::SEARCH_CONNECTOR;
@@ -468,7 +526,7 @@ index e9bf3852dd..6d34134abc 100644
  pub use client_capabilities::client_mcp_extensions;
  pub use client_tool_catalog::CodexAppsToolSnapshot;
  pub use codex_rmcp_client::McpProtocolMode;
-@@ -125,6 +131,7 @@ pub(crate) mod auth_elicitation;
+@@ -128,6 +134,7 @@ pub(crate) mod auth_elicitation;
  mod binding;
  pub(crate) mod binding_clients;
  mod catalog;
@@ -477,7 +535,7 @@ index e9bf3852dd..6d34134abc 100644
  mod client_tool_catalog;
  pub(crate) mod codex_apps;
 diff --git a/codex-rs/codex-mcp/src/resource_client.rs b/codex-rs/codex-mcp/src/resource_client.rs
-index 612f080979..f5b024bb3f 100644
+index 9ce31c3d22..a357c9ac21 100644
 --- a/codex-rs/codex-mcp/src/resource_client.rs
 +++ b/codex-rs/codex-mcp/src/resource_client.rs
 @@ -252,6 +252,14 @@ impl McpResourceClient {
@@ -496,23 +554,27 @@ index 612f080979..f5b024bb3f 100644
      pub fn cache_key(&self) -> McpResourceClientCacheKey {
          McpResourceClientCacheKey(Arc::downgrade(&self.runtime.latest_connections()))
 diff --git a/codex-rs/codex-mcp/src/rmcp_client.rs b/codex-rs/codex-mcp/src/rmcp_client.rs
-index a287528289..5fb97f9b77 100644
+index 9e471d15de..523f779028 100644
 --- a/codex-rs/codex-mcp/src/rmcp_client.rs
 +++ b/codex-rs/codex-mcp/src/rmcp_client.rs
-@@ -1171,6 +1171,12 @@ async fn start_server_task(
+@@ -1159,6 +1159,7 @@ async fn start_server_task(
+         catalog_item_limit,
+         server_capabilities,
+     } = params;
++    let channel_hub = elicitation_requests.channel_hub_for(&server_key);
+     let send_elicitation = elicitation_requests.make_sender(
+         server_key,
+         server_name.clone(),
+@@ -1193,6 +1194,8 @@ async fn start_server_task(
              );
      }
  
-+    let channel = crate::channel::ChannelSubscription::prepare(
-+        elicitation_requests.channel_hub_for(&server_name),
-+        &client,
-+        &mut params,
-+    );
++    let channel = crate::channel::ChannelSubscription::prepare(channel_hub, &client, &mut params);
 +
      let requested_capabilities = params.capabilities.clone();
      let started_at = Instant::now();
      let initialize_result = client
-@@ -1183,6 +1189,9 @@ async fn start_server_task(
+@@ -1205,6 +1208,9 @@ async fn start_server_task(
          &initialize_result,
      );
      let initialize_result = initialize_result.map_err(StartupOutcomeError::from)?;
@@ -523,11 +585,11 @@ index a287528289..5fb97f9b77 100644
          && !initialize_result.protocol_version.has_initialize()
          && let Some(context) = tool_catalog_cache_context.take()
 diff --git a/codex-rs/codex-mcp/src/runtime.rs b/codex-rs/codex-mcp/src/runtime.rs
-index 35ac0f980c..30174d00b9 100644
+index 75def52531..f0a957ff62 100644
 --- a/codex-rs/codex-mcp/src/runtime.rs
 +++ b/codex-rs/codex-mcp/src/runtime.rs
-@@ -731,6 +731,14 @@ impl McpRuntime {
-             })
+@@ -774,6 +774,14 @@ impl McpRuntime {
+             .environments_match(selections, ready_environments)
      }
  
 +    /// The thread's channel notifications (see [`crate::ChannelNotification`]), to the first
