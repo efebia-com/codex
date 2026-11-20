@@ -1,4 +1,4 @@
-From 07f971eb9d2454f278fb73d28f92e2e19ff1f0d9 Mon Sep 17 00:00:00 2001
+From a2f94a62c47f1bb65e0bf34860eaf0edd95008e2 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Tue, 17 Nov 2026 11:55:16 +0100
 Subject: [PATCH 1/3] mcp: opt in to bounded stdio server recovery
@@ -11,6 +11,7 @@ Subject: [PATCH 1/3] mcp: opt in to bounded stdio server recovery
  codex-rs/codex-mcp/src/lib.rs                 |   1 +
  codex-rs/codex-mcp/src/restart.rs             |  77 +++
  codex-rs/codex-mcp/src/rmcp_client.rs         |  22 +-
+ .../src/rmcp_client/apps_startup_tests.rs     |   1 +
  .../src/rmcp_client/managed_client.rs         |   1 +
  codex-rs/codex-mcp/src/server.rs              |   8 +
  codex-rs/codex-mcp/src/server_tests.rs        |  10 +
@@ -21,7 +22,7 @@ Subject: [PATCH 1/3] mcp: opt in to bounded stdio server recovery
  codex-rs/rmcp-client/src/rmcp_client.rs       |  81 ++-
  codex-rs/rmcp-client/src/stdio_restart.rs     | 479 ++++++++++++++++++
  .../rmcp-client/src/stdio_server_launcher.rs  | 160 +++++-
- 17 files changed, 848 insertions(+), 38 deletions(-)
+ 18 files changed, 849 insertions(+), 38 deletions(-)
  create mode 100644 codex-rs/codex-mcp/src/restart.rs
  create mode 100644 codex-rs/rmcp-client/src/stdio_restart.rs
 
@@ -290,6 +291,18 @@ index 1504e8f344..0a3efb769d 100644
      publish_apps: Option<watch::Sender<Option<std::sync::Weak<RmcpClient>>>>,
      sharing_declined: Option<CancellationToken>,
      server_capabilities: Arc<StdMutex<Option<serde_json::Value>>>,
+diff --git a/codex-rs/codex-mcp/src/rmcp_client/apps_startup_tests.rs b/codex-rs/codex-mcp/src/rmcp_client/apps_startup_tests.rs
+index 6a0268d6f1..4c06bf8081 100644
+--- a/codex-rs/codex-mcp/src/rmcp_client/apps_startup_tests.rs
++++ b/codex-rs/codex-mcp/src/rmcp_client/apps_startup_tests.rs
+@@ -46,6 +46,7 @@ async fn start_overlapping_apps_clients(
+         let (publish, mut initialized) = watch::channel(None);
+         let params = StartServerTaskParams {
+             server_key: McpServerKey::unscoped(CODEX_APPS_MCP_SERVER_NAME),
++            restart_cancellation: CancellationToken::new(),
+             publish_apps: Some(publish),
+             sharing_declined: None,
+             server_capabilities: Arc::default(),
 diff --git a/codex-rs/codex-mcp/src/rmcp_client/managed_client.rs b/codex-rs/codex-mcp/src/rmcp_client/managed_client.rs
 index 7c3d830dc2..7f95714fc3 100644
 --- a/codex-rs/codex-mcp/src/rmcp_client/managed_client.rs
