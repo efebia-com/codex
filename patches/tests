@@ -57,3 +57,5 @@ channels-fence: -p codex-app-server --test all mcp_channels::fence
 channels-fence: -p codex-app-server-protocol --lib schema_fixtures
 
 process-status-file: -p codex-process-status-file
+
+channels-ui: -p codex-tui --lib channel_messages

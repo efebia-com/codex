@@ -1,0 +1,739 @@
+From 62255bec8372572ded39c1cdbeabf4fab5c49e99 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Thu, 19 Nov 2026 15:28:32 +0100
+Subject: [PATCH] Render MCP channel messages in the TUI
+
+---
+ codex-rs/tui/Cargo.toml                       |   3 +-
+ codex-rs/tui/src/chatwidget.rs                |   6 +-
+ codex-rs/tui/src/chatwidget/tool_lifecycle.rs |   9 +-
+ codex-rs/tui/src/chatwidget/user_messages.rs  |   4 +
+ codex-rs/tui/src/history_cell/channel.rs      | 147 ++++++++++++++++++
+ .../tui/src/history_cell/channel_tests.rs     |  82 ++++++++++
+ codex-rs/tui/src/history_cell/mcp.rs          |  61 +++++++-
+ codex-rs/tui/src/history_cell/mcp_tests.rs    |  65 ++++++++
+ codex-rs/tui/src/history_cell/messages.rs     |  18 +++
+ codex-rs/tui/src/history_cell/mod.rs          |   2 +
+ codex-rs/tui/src/history_cell/tests.rs        |   2 +-
+ codex-rs/tui/src/thread_transcript.rs         |   9 +-
+ codex-rs/tui/src/transcript_view/copy_mode.rs |   1 +
+ codex-rs/tui/src/transcript_view/layout.rs    |   6 +-
+ .../tui/src/transcript_view/prompt_header.rs  |   9 ++
+ 15 files changed, 412 insertions(+), 12 deletions(-)
+ create mode 100644 codex-rs/tui/src/history_cell/channel.rs
+ create mode 100644 codex-rs/tui/src/history_cell/channel_tests.rs
+
+diff --git a/codex-rs/tui/Cargo.toml b/codex-rs/tui/Cargo.toml
+index 06a16611..f61340bd 100644
+--- a/codex-rs/tui/Cargo.toml
++++ b/codex-rs/tui/Cargo.toml
+@@ -50,6 +50,7 @@ codex-file-search = { workspace = true }
+ codex-git-utils = { workspace = true }
+ codex-http-client = { workspace = true }
+ codex-login = { workspace = true }
++codex-mcp = { workspace = true }
+ codex-mermaid = { workspace = true }
+ codex-message-history = { workspace = true }
+ codex-model-provider = { workspace = true }
+@@ -94,6 +95,7 @@ itertools = { workspace = true }
+ lazy_static = { workspace = true }
+ pathdiff = { workspace = true }
+ pulldown-cmark = { workspace = true, features = ["html"] }
++quick-xml = { workspace = true }
+ rand = { workspace = true }
+ ratatui = { workspace = true, features = [
+     "scrolling-regions",
+@@ -184,7 +186,6 @@ arboard = { workspace = true }
+ 
+ [dev-dependencies]
+ app_test_support = { workspace = true }
+-codex-mcp = { workspace = true }
+ codex-protocol-test-support = { workspace = true }
+ codex-skills = { workspace = true }
+ core_test_support = { workspace = true }
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index f62e5794..57141ba3 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -1383,7 +1383,8 @@ impl ChatWidget {
+             self.on_committed_user_message(&projected, client_id, from_replay, turn_id);
+             return;
+         }
+-        let display = Self::user_message_display_from_inputs(items);
++        let mut display = Self::user_message_display_from_inputs(items);
++        display.channel_messages = history_cell::ChannelMessages::from_inputs(items, client_id);
+         if from_replay {
+             if self.review.is_review_mode {
+                 return;
+@@ -1464,7 +1465,8 @@ impl ChatWidget {
+                     display.local_images,
+                     display.remote_image_urls,
+                 )
+-                .with_async_replies(display.replies, self.config.cwd.as_path()),
++                .with_async_replies(display.replies, self.config.cwd.as_path())
++                .with_channel_messages(display.channel_messages),
+             );
+         }
+     }
+diff --git a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+index 443b3a50..b78749aa 100644
+--- a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+@@ -223,11 +223,13 @@ impl ChatWidget {
+             return;
+         }
+         self.flush_active_cell();
+-        self.transcript.active_cell = Some(Box::new(history_cell::new_active_mcp_tool_call(
++        let cell = history_cell::new_active_mcp_tool_call(
+             id,
+             invocation,
+             self.local_settings.tui.animations && self.local_settings.tui.effects.progress,
+-        )));
++        )
++        .with_channel_presentation(Some(&self.config));
++        self.transcript.active_cell = Some(Box::new(cell));
+         self.bump_active_cell_revision();
+         self.request_redraw();
+     }
+@@ -270,7 +272,8 @@ impl ChatWidget {
+                     id,
+                     invocation,
+                     self.local_settings.tui.animations && self.local_settings.tui.effects.progress,
+-                );
++                )
++                .with_channel_presentation(Some(&self.config));
+                 cell.complete(duration, result);
+                 self.transcript.active_cell = Some(Box::new(cell));
+             }
+diff --git a/codex-rs/tui/src/chatwidget/user_messages.rs b/codex-rs/tui/src/chatwidget/user_messages.rs
+index 9963b63b..4f0b1ad1 100644
+--- a/codex-rs/tui/src/chatwidget/user_messages.rs
++++ b/codex-rs/tui/src/chatwidget/user_messages.rs
+@@ -14,6 +14,7 @@ use std::path::PathBuf;
+ use crate::bottom_pane::LocalImageAttachment;
+ use crate::bottom_pane::MentionBinding;
+ use crate::bottom_pane::QueuedInputAction;
++use crate::history_cell::ChannelMessages;
+ use codex_app_server_protocol::ImageReference;
+ use codex_app_server_protocol::TextElement as AppServerTextElement;
+ use codex_app_server_protocol::UserInput;
+@@ -593,6 +594,7 @@ pub(super) fn merge_user_messages_with_history_record(
+ #[derive(Clone, Debug, PartialEq)]
+ pub(crate) struct UserMessageDisplay {
+     pub(crate) message: String,
++    pub(super) channel_messages: Option<ChannelMessages>,
+     // Keep distinct replies distinct when their visible question and answer text match.
+     pub(super) replies: Vec<crate::async_question_reply::AsyncQuestionReply>,
+     pub(crate) remote_image_urls: Vec<String>,
+@@ -731,6 +733,7 @@ impl ChatWidget {
+         if let Some(replies) = replies.or_else(|| crate::async_question_reply::parse(message)) {
+             return UserMessageDisplay {
+                 message: crate::async_question_reply::display_replies(&replies),
++                channel_messages: None,
+                 replies,
+                 text_elements: Vec::new(),
+                 local_images,
+@@ -759,6 +762,7 @@ impl ChatWidget {
+ 
+         UserMessageDisplay {
+             message: message.to_string(),
++            channel_messages: None,
+             replies: Vec::new(),
+             remote_image_urls,
+             local_images,
+diff --git a/codex-rs/tui/src/history_cell/channel.rs b/codex-rs/tui/src/history_cell/channel.rs
+new file mode 100644
+index 00000000..7f078181
+--- /dev/null
++++ b/codex-rs/tui/src/history_cell/channel.rs
+@@ -0,0 +1,147 @@
++//! Presentation of MCP channel messages in the transcript.
++
++use codex_app_server_protocol::UserInput;
++use quick_xml::Reader;
++use quick_xml::XmlVersion;
++use quick_xml::escape::unescape;
++use quick_xml::events::Event;
++use ratatui::style::Stylize;
++use ratatui::text::Line;
++
++use super::messages::sanitize_user_text;
++use crate::style::accent_color;
++use crate::terminal_hyperlinks::HyperlinkLine;
++use crate::terminal_hyperlinks::adaptive_wrap_hyperlink_lines;
++use crate::terminal_hyperlinks::annotate_web_urls;
++use crate::wrapping::RtOptions;
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct ChannelMessages(Vec<ChannelMessage>);
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++struct ChannelMessage {
++    label: String,
++    text: String,
++}
++
++impl ChannelMessages {
++    pub(crate) fn from_inputs(items: &[UserInput], client_id: Option<&str>) -> Option<Self> {
++        // The extension has no client submission ID. Match its complete envelope so XML
++        // pasted into a local prompt, partial envelopes and mixed input keep their normal rendering.
++        if client_id.is_some() || items.is_empty() {
++            return None;
++        }
++        let mut messages = Vec::new();
++        for item in items {
++            let UserInput::Text {
++                text,
++                text_elements,
++            } = item
++            else {
++                return None;
++            };
++            if !text_elements.is_empty() {
++                return None;
++            }
++            // Older history concatenates a batch's text inputs into a single string.
++            let mut remaining = text.as_str();
++            loop {
++                let (message, rest) = ChannelMessage::parse(remaining)?;
++                messages.push(message);
++                if rest.is_empty() {
++                    break;
++                }
++                remaining = rest;
++            }
++        }
++        Some(Self(messages))
++    }
++
++    pub(crate) fn first_line(&self) -> Line<'static> {
++        self.0.first().map_or_else(Line::default, |message| {
++            let first = message.text.lines().next().unwrap_or_default();
++            message_header("←", &message.label, first)
++        })
++    }
++
++    pub(super) fn render(&self, width: u16) -> Vec<HyperlinkLine> {
++        self.0
++            .iter()
++            .flat_map(|message| channel_lines("←", &message.label, &message.text, width))
++            .collect()
++    }
++}
++
++impl ChannelMessage {
++    fn parse(text: &str) -> Option<(Self, &str)> {
++        if !text.starts_with("<channel source=\"") {
++            return None;
++        }
++        let mut reader = Reader::from_str(text);
++        let Event::Start(tag) = reader.read_event().ok()? else {
++            return None;
++        };
++        let body = text
++            .get(usize::try_from(reader.buffer_position()).ok()?..)?
++            .strip_prefix('\n')?;
++        let (body, rest) = body.split_once("\n</channel>")?;
++        if body.contains(['<', '>']) {
++            return None;
++        }
++        let mut source = None;
++        let mut sender = None;
++        for attribute in tag.attributes() {
++            let attribute = attribute.ok()?;
++            let target = match attribute.key.as_ref() {
++                b"source" => &mut source,
++                b"from_name" => &mut sender,
++                _ => continue,
++            };
++            let value = attribute
++                .decoded_and_normalized_value(XmlVersion::Implicit1_0, reader.decoder())
++                .ok()?;
++            *target = Some(sanitize_user_text(value).into_owned());
++        }
++        let mut label = source.filter(|source| !source.trim().is_empty())?;
++        if let Some(sender) = sender.filter(|sender| !sender.trim().is_empty()) {
++            label.push_str(" · ");
++            label.push_str(sender.trim());
++        }
++        let text = sanitize_user_text(unescape(body).ok()?).into_owned();
++        Some((Self { label, text }, rest))
++    }
++}
++
++fn message_header(arrow: &'static str, label: &str, text: &str) -> Line<'static> {
++    let mut spans = vec![arrow.fg(accent_color()), " ".into(), label.to_owned().dim()];
++    if !text.is_empty() {
++        spans.extend(["  ".into(), text.to_owned().into()]);
++    }
++    Line::from(spans)
++}
++
++pub(super) fn channel_lines(
++    arrow: &'static str,
++    label: &str,
++    text: &str,
++    width: u16,
++) -> Vec<HyperlinkLine> {
++    if width == 0 {
++        return Vec::new();
++    }
++    let mut rows = text.split('\n');
++    let first = message_header(arrow, label, rows.next().unwrap_or_default());
++    let lines = std::iter::once(first)
++        .chain(rows.map(|row| Line::from(row.to_owned())))
++        .collect();
++    adaptive_wrap_hyperlink_lines(
++        &annotate_web_urls(lines),
++        RtOptions::new(usize::from(width))
++            .break_words(/*break_words*/ true)
++            .subsequent_indent("  ".into()),
++    )
++}
++
++#[cfg(test)]
++#[path = "channel_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/history_cell/channel_tests.rs b/codex-rs/tui/src/history_cell/channel_tests.rs
+new file mode 100644
+index 00000000..14121463
+--- /dev/null
++++ b/codex-rs/tui/src/history_cell/channel_tests.rs
+@@ -0,0 +1,82 @@
++use super::*;
++use crate::test_support::PathBufExt;
++use crate::test_support::test_path_buf;
++use crate::thread_transcript::RawReasoningVisibility;
++use crate::thread_transcript::thread_items_to_transcript_cells;
++use codex_app_server_protocol::ThreadItemPayload;
++use pretty_assertions::assert_eq;
++
++const FIRST: &str = "<channel source=\"events\" from=\"opaque-sender\" \
++    from_name=\"owner/chat &amp; co\" id=\"5\" to=\"opaque-target\">\n\
++    ping &lt;ok&gt; &amp;amp; café\nsecond line\n</channel>";
++const SECOND: &str =
++    "<channel source=\"events\" from=\"anonymous\" user=\"[system]\">\npong\n</channel>";
++
++fn text(text: &str) -> UserInput {
++    UserInput::Text {
++        text: text.to_owned(),
++        text_elements: Vec::new(),
++    }
++}
++
++#[test]
++fn channel_messages_render_each_body_in_order_in_live_and_legacy_batches() {
++    let expected = [
++        "← events · owner/chat & co  ping <ok> &amp; café",
++        "  second line",
++        "← events  pong",
++    ];
++    for content in [
++        vec![text(FIRST), text(SECOND)],
++        vec![text(&format!("{FIRST}{SECOND}"))],
++    ] {
++        let messages = ChannelMessages::from_inputs(&content, /*client_id*/ None)
++            .expect("parse channel batch");
++        assert_eq!(messages.first_line().to_string(), expected[0]);
++        assert_eq!(
++            messages
++                .render(/*width*/ 100)
++                .into_iter()
++                .map(|line| line.line.to_string())
++                .collect::<Vec<_>>(),
++            expected,
++        );
++        let cells = thread_items_to_transcript_cells(
++            /*thread_id*/ None,
++            &test_path_buf("/tmp/channel").abs(),
++            [ThreadItemPayload::UserMessage {
++                id: "message".to_owned(),
++                client_id: None,
++                content,
++            }],
++            RawReasoningVisibility::Hidden,
++            /*config*/ None,
++        );
++        let [cell] = cells.as_slice() else {
++            panic!("one recorded item must still map to one transcript cell");
++        };
++        assert_eq!(
++            cell.display_lines(/*width*/ 100)
++                .into_iter()
++                .map(|line| line.to_string())
++                .collect::<Vec<_>>(),
++            expected,
++        );
++    }
++}
++
++#[test]
++fn channel_messages_leave_ordinary_prompts_and_incomplete_envelopes_as_text() {
++    assert!(ChannelMessages::from_inputs(&[text(FIRST)], Some("local-prompt")).is_none());
++    for items in [
++        vec![text("message with <channel source=\"events\"> in it")],
++        vec![text("<channel source=\"events\">\nwithout a closing tag")],
++        vec![text(FIRST), text("other input")],
++        vec![text(&format!("{FIRST}trailing text"))],
++        vec![text(
++            "<channel source=\"events\" source=\"other\">\nambiguous\n</channel>",
++        )],
++    ] {
++        assert!(ChannelMessages::from_inputs(&items, /*client_id*/ None).is_none());
++    }
++}
+diff --git a/codex-rs/tui/src/history_cell/mcp.rs b/codex-rs/tui/src/history_cell/mcp.rs
+index 4939d18a..5221c98b 100644
+--- a/codex-rs/tui/src/history_cell/mcp.rs
++++ b/codex-rs/tui/src/history_cell/mcp.rs
+@@ -4,6 +4,7 @@
+ //! Invocation and result rows retain exact logical source ranges through wrapping and gutters.
+ //! Environment ownership is rendered separately from raw server names used by special handlers.
+ 
++use super::channel::channel_lines;
+ use super::*;
+ use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
+ 
+@@ -56,6 +57,7 @@ pub(crate) struct McpToolCallCell {
+     duration: Option<Duration>,
+     result: Option<Result<McpToolResult, String>>,
+     animations_enabled: bool,
++    channel_send: bool,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -99,9 +101,38 @@ impl McpToolCallCell {
+             duration: None,
+             result: None,
+             animations_enabled,
++            channel_send: false,
+         }
+     }
+ 
++    pub(crate) fn with_channel_presentation(mut self, config: Option<&Config>) -> Self {
++        // Only the simple message-sending signature has a compact conversation row.
++        self.channel_send = self.invocation.tool == "send"
++            && self
++                .invocation
++                .arguments
++                .as_ref()
++                .and_then(serde_json::Value::as_object)
++                .is_some_and(|arguments| {
++                    arguments
++                        .get("to")
++                        .is_some_and(serde_json::Value::is_string)
++                        && arguments
++                            .get("text")
++                            .is_some_and(serde_json::Value::is_string)
++                        && arguments
++                            .get("from")
++                            .is_none_or(serde_json::Value::is_string)
++                        && arguments
++                            .keys()
++                            .all(|key| matches!(key.as_str(), "to" | "text" | "from"))
++                })
++            && config.is_some_and(|config| {
++                codex_mcp::channel_enabled(&config.config_layer_stack, &self.invocation.server)
++            });
++        self
++    }
++
+     pub(crate) fn call_id(&self) -> &str {
+         &self.call_id
+     }
+@@ -144,6 +175,27 @@ impl McpToolCallCell {
+         }
+     }
+ 
++    fn channel_send_lines(&self, width: u16) -> Option<Vec<HyperlinkLine>> {
++        if !self.channel_send {
++            return None;
++        }
++        let text = self.invocation.arguments.as_ref()?.get("text")?.as_str()?;
++        let text = sanitize_user_text(Cow::Borrowed(text));
++        let server = sanitize_user_text(Cow::Borrowed(&self.invocation.server));
++        let label = if self.result.is_none() {
++            Cow::Owned(format!("{server} · sending"))
++        } else {
++            server
++        };
++        let mut lines = channel_lines("→", &label, &text, width);
++        lines.extend(prefix_hyperlink_lines(
++            self.render_detail_lines(width, McpToolCallRenderMode::Display),
++            "  └ ".dim(),
++            "    ".into(),
++        ));
++        Some(lines)
++    }
++
+     fn render_hyperlink_lines(
+         &self,
+         width: u16,
+@@ -352,6 +404,9 @@ impl McpToolCallCell {
+ 
+ impl HistoryCell for McpToolCallCell {
+     fn tool_call_labels(&self) -> Vec<String> {
++        if self.channel_send {
++            return Vec::new();
++        }
+         let verb = match self.success() {
+             Some(true) => "Called",
+             Some(false) => "Failed",
+@@ -365,7 +420,8 @@ impl HistoryCell for McpToolCallCell {
+     }
+ 
+     fn compact_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+-        self.compact_mcp_lines(width)
++        self.channel_send_lines(width)
++            .unwrap_or_else(|| self.compact_mcp_lines(width))
+     }
+ 
+     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+@@ -377,7 +433,8 @@ impl HistoryCell for McpToolCallCell {
+     }
+ 
+     fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+-        self.render_hyperlink_lines(width, McpToolCallRenderMode::Display)
++        self.channel_send_lines(width)
++            .unwrap_or_else(|| self.render_hyperlink_lines(width, McpToolCallRenderMode::Display))
+     }
+ 
+     fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+diff --git a/codex-rs/tui/src/history_cell/mcp_tests.rs b/codex-rs/tui/src/history_cell/mcp_tests.rs
+index fb3f3d79..7f34cae7 100644
+--- a/codex-rs/tui/src/history_cell/mcp_tests.rs
++++ b/codex-rs/tui/src/history_cell/mcp_tests.rs
+@@ -8,6 +8,71 @@ use std::sync::Arc;
+ 
+ const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+ 
++#[tokio::test]
++async fn channel_messages_show_outgoing_text_and_delivery_result_with_expandable_details() {
++    let mut config = super::super::tests::test_config().await;
++    config.config_layer_stack = config
++        .config_layer_stack
++        .with_user_config(
++            &config.codex_home.join("config.toml"),
++            toml::from_str("[mcp_servers.events]\ncommand = \"events\"\nchannel = true")
++                .expect("parse channel config"),
++        )
++        .expect("set channel config");
++    let invocation = McpInvocation {
++        environment_id: None,
++        server: "events".to_owned(),
++        tool: "send".to_owned(),
++        arguments: Some(json!({"to": "opaque-target", "from": "opaque-sender", "text": "pong"})),
++    };
++    let ordinary = new_active_mcp_tool_call(
++        "id".to_owned(),
++        invocation.clone(),
++        /*animations_enabled*/ false,
++    );
++    assert!(
++        ordinary
++            .display_lines(/*width*/ 120)
++            .iter()
++            .any(|line| line.to_string().contains("opaque-target"))
++    );
++    let mut cell = new_active_mcp_tool_call(
++        "id".to_owned(),
++        invocation,
++        /*animations_enabled*/ false,
++    )
++    .with_channel_presentation(Some(&config));
++    assert_eq!(
++        cell.display_lines(/*width*/ 120)[0].to_string(),
++        "→ events · sending  pong",
++    );
++    cell.complete(
++        Duration::ZERO,
++        Ok(CallToolResult {
++            content: vec![json!({"type": "text", "text": "rejected"})],
++            structured_content: None,
++            is_error: None,
++            meta: None,
++        }),
++    );
++    let text = |lines: Vec<Line<'static>>| {
++        lines
++            .into_iter()
++            .map(|line| line.to_string())
++            .collect::<Vec<_>>()
++    };
++    let expected = ["→ events  pong", "  └ rejected"];
++    assert_eq!(text(cell.display_lines(/*width*/ 120)), expected);
++    assert_eq!(
++        text(visible_lines(cell.compact_hyperlink_lines(/*width*/ 120))),
++        expected,
++    );
++    assert!(cell.tool_call_labels().is_empty());
++    let details = text(cell.transcript_lines(/*width*/ 120)).join("\n");
++    assert!(details.contains("opaque-target"));
++    assert!(details.contains("opaque-sender"));
++}
++
+ #[test]
+ fn mcp_inventory_connection_states() {
+     use McpServerConnectionStatus as Status;
+diff --git a/codex-rs/tui/src/history_cell/messages.rs b/codex-rs/tui/src/history_cell/messages.rs
+index 84f5a863..c5ef448d 100644
+--- a/codex-rs/tui/src/history_cell/messages.rs
++++ b/codex-rs/tui/src/history_cell/messages.rs
+@@ -27,6 +27,7 @@ pub(crate) enum UserMessagePresentation {
+     #[default]
+     Typed,
+     Spoken,
++    Channel(ChannelMessages),
+     /// Render each submitted answer as Markdown beneath its question caption.
+     AsyncReplies {
+         /// Keep the decoded pairs so the two-row limit applies only to question captions.
+@@ -181,6 +182,20 @@ fn user_message_element_style(style: Style, accent: Color) -> Style {
+ }
+ 
+ impl UserHistoryCell {
++    pub(crate) fn with_channel_messages(mut self, messages: Option<ChannelMessages>) -> Self {
++        if let Some(messages) = messages {
++            self.presentation = UserMessagePresentation::Channel(messages);
++        }
++        self
++    }
++
++    pub(crate) fn channel_messages(&self) -> Option<&ChannelMessages> {
++        match &self.presentation {
++            UserMessagePresentation::Channel(messages) => Some(messages),
++            _ => None,
++        }
++    }
++
+     pub(crate) fn with_async_replies(
+         mut self,
+         replies: Vec<AsyncQuestionReply>,
+@@ -247,6 +262,9 @@ impl HistoryCell for UserHistoryCell {
+     }
+ 
+     fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
++        if let Some(messages) = self.channel_messages() {
++            return messages.render(width);
++        }
+         let sanitized_message = sanitize_user_text((&self.message).into());
+         // Speech transcripts can begin with whitespace; the marker already supplies its separator.
+         let message = if self.is_spoken() {
+diff --git a/codex-rs/tui/src/history_cell/mod.rs b/codex-rs/tui/src/history_cell/mod.rs
+index 4940b27e..8054d958 100644
+--- a/codex-rs/tui/src/history_cell/mod.rs
++++ b/codex-rs/tui/src/history_cell/mod.rs
+@@ -107,6 +107,7 @@ mod approvals;
+ mod async_questions;
+ mod async_replies;
+ mod base;
++mod channel;
+ mod delegated_message;
+ mod dynamic;
+ mod exec;
+@@ -129,6 +130,7 @@ pub(crate) use activity_details::ActivityDetails;
+ pub(crate) use activity_preview::ActivityDisclosure;
+ pub(crate) use approvals::*;
+ pub(crate) use base::*;
++pub(crate) use channel::ChannelMessages;
+ pub(crate) use delegated_message::DelegatedMessageCell;
+ pub(crate) use dynamic::DynamicToolCallCell;
+ pub(crate) use exec::*;
+diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
+index 6822d4f5..0d54e235 100644
+--- a/codex-rs/tui/src/history_cell/tests.rs
++++ b/codex-rs/tui/src/history_cell/tests.rs
+@@ -100,7 +100,7 @@ fn local_daemon_version_notice_snapshot() {
+     }
+ }
+ 
+-async fn test_config() -> Config {
++pub(super) async fn test_config() -> Config {
+     let codex_home = std::env::temp_dir();
+     ConfigBuilder::default()
+         .codex_home(codex_home.clone())
+diff --git a/codex-rs/tui/src/thread_transcript.rs b/codex-rs/tui/src/thread_transcript.rs
+index 060d4a9c..28852815 100644
+--- a/codex-rs/tui/src/thread_transcript.rs
++++ b/codex-rs/tui/src/thread_transcript.rs
+@@ -180,7 +180,7 @@ pub(crate) fn thread_items_to_transcript_cells(
+                     }
+                 } else {
+                     PendingActivity::flush(&mut pending, &mut cells);
+-                    let cell = call.into_cell();
++                    let cell = call.into_cell().with_channel_presentation(config);
+                     cells.push(Arc::new(cell));
+                 }
+             }
+@@ -237,6 +237,8 @@ fn item_to_cells(
+             client_id,
+             content,
+         } => {
++            let channels =
++                crate::history_cell::ChannelMessages::from_inputs(&content, client_id.as_deref());
+             if content.iter().any(|input| {
+                 matches!(
+                     input,
+@@ -272,7 +274,10 @@ fn item_to_cells(
+                 item.local_image_paths(),
+                 item.image_urls(),
+             );
+-            cells.push(Arc::new(cell.with_async_replies(replies, cwd.as_path())));
++            cells.push(Arc::new(
++                cell.with_async_replies(replies, cwd.as_path())
++                    .with_channel_messages(channels),
++            ));
+         }
+         ThreadItemPayload::AgentMessage {
+             text,
+diff --git a/codex-rs/tui/src/transcript_view/copy_mode.rs b/codex-rs/tui/src/transcript_view/copy_mode.rs
+index 0dc5c4d7..ca7247d7 100644
+--- a/codex-rs/tui/src/transcript_view/copy_mode.rs
++++ b/codex-rs/tui/src/transcript_view/copy_mode.rs
+@@ -129,6 +129,7 @@ impl TranscriptView {
+                 layout.copy_block_ranges()
+             };
+             let user_source = user
++                .filter(|user| user.channel_messages().is_none())
+                 .map(|user| user.message.as_str())
+                 .filter(|source| !source.is_empty())
+                 .map(|source| crate::history_cell::sanitize_user_text(source.into()));
+diff --git a/codex-rs/tui/src/transcript_view/layout.rs b/codex-rs/tui/src/transcript_view/layout.rs
+index 4966c4cd..225e80fd 100644
+--- a/codex-rs/tui/src/transcript_view/layout.rs
++++ b/codex-rs/tui/src/transcript_view/layout.rs
+@@ -107,7 +107,11 @@ fn cell_content_layout(
+ }
+ 
+ fn is_rich_user_prompt(cell: &dyn HistoryCell, mode: HistoryRenderMode) -> bool {
+-    mode == HistoryRenderMode::Rich && cell.as_any().is::<crate::history_cell::UserHistoryCell>()
++    mode == HistoryRenderMode::Rich
++        && cell
++            .as_any()
++            .downcast_ref::<crate::history_cell::UserHistoryCell>()
++            .is_some_and(|prompt| prompt.channel_messages().is_none())
+ }
+ 
+ #[derive(Default)]
+diff --git a/codex-rs/tui/src/transcript_view/prompt_header.rs b/codex-rs/tui/src/transcript_view/prompt_header.rs
+index 628d3577..b4c70e1b 100644
+--- a/codex-rs/tui/src/transcript_view/prompt_header.rs
++++ b/codex-rs/tui/src/transcript_view/prompt_header.rs
+@@ -43,6 +43,15 @@ pub(super) fn line(
+                 .filter(|prompt| prompt.has_visible_content())
+                 .map(|prompt| (index, prompt))
+         })?;
++    if let Some(messages) = prompt.channel_messages() {
++        return Some((
++            truncate_line_with_ellipsis_if_overflow(
++                messages.first_line(),
++                usize::from(width.saturating_sub(1)),
++            ),
++            EntryKey::cell(&cells[index]),
++        ));
++    }
+     // Bound work even for pasted multi-megabyte prompts; sanitize before painting controls.
+     let prefix: String = prompt.message.chars().take(/*n*/ 512).collect();
+     let message = sanitize_user_text(prefix.into())
+-- 
+2.53.0
+
