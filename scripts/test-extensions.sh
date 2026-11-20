@@ -18,6 +18,9 @@ codex_rs="${source_dir}/codex-rs"
 [[ -f "${codex_rs}/Cargo.toml" ]] || die "not a Codex source tree: $2"
 ensure_v8 "$source_dir" "$(cd "$codex_rs" && host_target)"
 
+# Use the upstream Rust CI stack size for debug test threads.
+export RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}"
+
 mapfile -t extensions < <(series_extensions)
 in_series() {
   local extension
