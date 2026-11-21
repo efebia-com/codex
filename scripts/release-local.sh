@@ -20,7 +20,8 @@
 #   plan     check-release.sh: the version (v<upstream>-efebia); an upstream version
 #            that is already published is refused unless --force
 #   prepare  prepare-source.sh into <work>/src
-#   test     test-extensions.sh, with the Codex-built V8 for this host; when the tests
+#   test     test-extensions.sh (one build of every test binary, then each line of
+#            patches/tests), with the Codex-built V8 for this host; when the tests
 #            pass, their target directory is removed to make room for the build
 #   build    upstream's .github/scripts/install-musl-build-tools.sh, fetch-v8.sh and
 #            build.sh --release --target x86_64-unknown-linux-musl
