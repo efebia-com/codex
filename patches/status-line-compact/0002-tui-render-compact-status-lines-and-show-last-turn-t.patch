@@ -1,12 +1,12 @@
-From 1337c672bf8bbc40a7ec7f58fb9f32bc1d174a9d Mon Sep 17 00:00:00 2001
+From 5d9c8d7d25ec88bf6f8a77c2ecafb32aab293b99 Mon Sep 17 00:00:00 2001
 From: Calogero Mandracchia <calogero@efebia.com>
 Date: Sat, 21 Nov 2026 21:10:14 +0100
 Subject: [PATCH 2/2] tui: render compact status lines and show last turn time
 
 ---
- codex-rs/tui/src/app/session_lifecycle.rs     |   3 +
+ codex-rs/tui/src/app/session_lifecycle.rs     |   8 +
  codex-rs/tui/src/app/startup.rs               |   3 +
- .../src/app/tests/history_hydration_tests.rs  |  55 ++++-
+ .../src/app/tests/history_hydration_tests.rs  |  62 ++++-
  .../tui/src/app_server_session/history.rs     |  43 ++++
  codex-rs/tui/src/bottom_pane/mod.rs           |   3 +
  .../src/bottom_pane/status_line_compact.rs    | 220 ++++++++++++++++++
@@ -23,14 +23,26 @@ Subject: [PATCH 2/2] tui: render compact status lines and show last turn time
  .../tui/src/chatwidget/status_surfaces.rs     |  94 +++++++-
  .../src/chatwidget/tests/status_and_layout.rs |  78 +++++++
  codex-rs/tui/src/token_usage.rs               |  11 +-
- 19 files changed, 593 insertions(+), 31 deletions(-)
+ 19 files changed, 605 insertions(+), 31 deletions(-)
  create mode 100644 codex-rs/tui/src/bottom_pane/status_line_compact.rs
 
 diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
-index 03adb8aa61..e02ecc7745 100644
+index 03adb8aa61..e9e4dd48ee 100644
 --- a/codex-rs/tui/src/app/session_lifecycle.rs
 +++ b/codex-rs/tui/src/app/session_lifecycle.rs
-@@ -2082,6 +2082,9 @@ impl App {
+@@ -1017,6 +1017,11 @@ impl App {
+             AppEvent::ResetTranscriptForThreadSwitch
+         });
+         self.replay_thread_snapshot(snapshot, resume_restored_queue);
++        if self.chat_widget.thread_id() == Some(thread_id) {
++            self.chat_widget.restore_older_status_line_completion(
++                app_server.older_status_line_completion(thread_id),
++            );
++        }
+         self.app_event_tx
+             .send(AppEvent::RestoreBackgroundTerminals(thread_id));
+         if let Some(thread_id) = self.chat_widget.thread_id()
+@@ -2082,6 +2087,9 @@ impl App {
              Ok(()) => {
                  self.ensure_thread_channel(resumed_thread_id)
                      .history_may_be_incomplete = false;
@@ -55,7 +67,7 @@ index a5664d2c22..09bbdd061d 100644
              if let Some(error) = provider_error {
                  app.chat_widget
 diff --git a/codex-rs/tui/src/app/tests/history_hydration_tests.rs b/codex-rs/tui/src/app/tests/history_hydration_tests.rs
-index 11a6dd305f..e79e10ce15 100644
+index 11a6dd305f..bad9cc89a8 100644
 --- a/codex-rs/tui/src/app/tests/history_hydration_tests.rs
 +++ b/codex-rs/tui/src/app/tests/history_hydration_tests.rs
 @@ -29,6 +29,13 @@ use pretty_assertions::assert_ne;
@@ -81,12 +93,13 @@ index 11a6dd305f..e79e10ce15 100644
              duration_ms: None,
              time_to_first_token_ms: None,
          }));
-@@ -113,6 +120,52 @@ async fn history_fixture(
+@@ -113,6 +120,59 @@ async fn history_fixture(
      Ok((app, codex_home, target))
  }
  
 +#[tokio::test]
-+async fn status_line_resume_reads_timestamp_beyond_the_visible_history() -> Result<()> {
++async fn status_line_resume_and_thread_switch_restore_timestamp_beyond_visible_history()
++-> Result<()> {
 +    let completed_at = 1_700_000_000;
 +    let (mut app, _codex_home, target) =
 +        history_fixture_with_completion(&[0, 0, 0, 0, 0, 0, 0, 1], Some(completed_at)).await?;
@@ -97,35 +110,41 @@ index 11a6dd305f..e79e10ce15 100644
 +        /*failed_thread_name*/ None,
 +    )
 +    .await?;
-+    let _: ThreadResumeResponse = server
-+        .request_handle()
-+        .request_typed(ClientRequest::ThreadResume {
-+            request_id: server.next_request_id(),
-+            params: ThreadResumeParams {
-+                thread_id: target.thread_id.to_string(),
-+                exclude_turns: true,
-+                ..ThreadResumeParams::default()
-+            },
-+        })
-+        .await?;
-+    let mut thread = server
-+        .thread_read(target.thread_id, /*include_turns*/ false)
-+        .await?;
-+    server
-+        .hydrate_initial_thread_history(
-+            &mut thread,
-+            /*turn_cursor*/ None,
-+            /*item_cursor*/ None,
-+            Some(&app.config),
-+            Some(&app.local_settings),
-+            HistoryHydrationScope::Initial,
-+        )
-+        .await?;
-+    assert!(thread.turns.iter().all(|turn| turn.completed_at.is_none()));
++    let started = Box::pin(server.resume_thread(
++        &app.local_settings,
++        app.config.clone(),
++        target.thread_id,
++        crate::app_server_session::ResumeModelSettings::RestoreFromThread,
++    ))
++    .await?;
++    assert!(started.turns.iter().all(|turn| turn.completed_at.is_none()));
 +    assert_eq!(
 +        server.older_status_line_completion(target.thread_id),
 +        Some(completed_at)
 +    );
++
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    app.render_thread_snapshot(
++        &mut tui,
++        &mut server,
++        target.thread_id,
++        ThreadEventSnapshot {
++            session: Some(started.session),
++            turns: started.turns,
++            delegated_turns: Vec::new(),
++            events: Vec::new(),
++            active_reasoning_item: None,
++            input_state: None,
++        },
++        /*resume_restored_queue*/ false,
++    )
++    .await?;
++    let expected = chrono::DateTime::from_timestamp(completed_at, 0)
++        .unwrap()
++        .with_timezone(&chrono::Local)
++        .format("%H:%M:%a")
++        .to_string();
++    assert_eq!(app.chat_widget.status_line_text(), Some(expected));
 +    server.shutdown().await?;
 +    proxy.await??;
 +    Ok(())
