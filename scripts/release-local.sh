@@ -20,7 +20,8 @@
 #   plan     check-release.sh: the version (v<upstream>-efebia); an upstream version
 #            that is already published is refused unless --force
 #   prepare  prepare-source.sh into <work>/src
-#   test     test-extensions.sh, with the Codex-built V8 for this host
+#   test     test-extensions.sh, with the Codex-built V8 for this host; when the tests
+#            pass, their target directory is removed to make room for the build
 #   build    upstream's .github/scripts/install-musl-build-tools.sh, fetch-v8.sh and
 #            build.sh --release --target x86_64-unknown-linux-musl
 #   package  package.sh into <work>/dist
@@ -219,6 +220,8 @@ step_test() (
   v8_env="$("${DIST_ROOT}/scripts/fetch-v8.sh" --source "$src" --target "$host" --cache "${cache}/rusty_v8")"
   export_lines "$v8_env"
   "${DIST_ROOT}/scripts/test-extensions.sh" --source "$src"
+  # Tens of GB that the release build may need; after a failure they stay, to look into.
+  rm -rf "$CARGO_TARGET_DIR"
 )
 
 # Make the packages that install-musl-build-tools.sh installs with apt-get
