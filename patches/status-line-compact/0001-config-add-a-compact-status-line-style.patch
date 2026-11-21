@@ -1,0 +1,185 @@
+From 50159a8a4a14d7f375111aa187f46fc2578697f4 Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Sat, 21 Nov 2026 21:03:49 +0100
+Subject: [PATCH 1/2] config: add a compact status line style
+
+---
+ codex-rs/config/src/types.rs               | 13 ++++++++++++
+ codex-rs/core/config.schema.json           | 17 ++++++++++++++++
+ codex-rs/core/src/config/config_tests.rs   | 23 ++++++++++++++++++++++
+ codex-rs/core/src/config/mod.rs            |  8 ++++++++
+ codex-rs/thread-manager-sample/src/main.rs |  1 +
+ codex-rs/tui/src/local_settings.rs         |  1 +
+ 6 files changed, 63 insertions(+)
+
+diff --git a/codex-rs/config/src/types.rs b/codex-rs/config/src/types.rs
+index 8137adc021..7f6d30ba28 100644
+--- a/codex-rs/config/src/types.rs
++++ b/codex-rs/config/src/types.rs
+@@ -902,6 +902,15 @@ pub enum BuiltinStatusLine {
+     Default,
+ }
+ 
++/// Presentation of the built-in status line.
++#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
++#[serde(rename_all = "kebab-case")]
++pub enum StatusLineStyle {
++    #[default]
++    Default,
++    Compact,
++}
++
+ /// Collection of settings that are specific to the TUI.
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
+ #[schemars(deny_unknown_fields)]
+@@ -1022,6 +1031,10 @@ pub struct Tui {
+     /// Local status line selection. Set to "default" for built-in items or specify an MCP server and tool.
+     pub status_line_provider: Option<Box<StatusLineSelection>>,
+ 
++    /// Presentation of the built-in status line. Set to "compact" for a compact layout.
++    #[serde(default)]
++    pub status_line_style: StatusLineStyle,
++
+     /// Color status line items with colors derived from the active syntax theme.
+     /// Defaults to `true`.
+     #[serde(default = "default_true")]
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index 6d3b7edf9b..38f772c4c7 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -5181,6 +5181,14 @@
+       ],
+       "description": "An explicit default overrides an MCP provider from a lower configuration layer."
+     },
++    "StatusLineStyle": {
++      "description": "Presentation of the built-in status line.",
++      "enum": [
++        "default",
++        "compact"
++      ],
++      "type": "string"
++    },
+     "ThreadStoreToml": {
+       "oneOf": [
+         {
+@@ -5875,6 +5883,15 @@
+           ],
+           "description": "Local status line selection. Set to \"default\" for built-in items or specify an MCP server and tool."
+         },
++        "status_line_style": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/StatusLineStyle"
++            }
++          ],
++          "default": "default",
++          "description": "Presentation of the built-in status line. Set to \"compact\" for a compact layout."
++        },
+         "status_line_use_colors": {
+           "default": true,
+           "description": "Color status line items with colors derived from the active syntax theme. Defaults to `true`.",
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index a6755099e2..f0c84a095f 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -1483,6 +1483,7 @@ fn config_toml_deserializes_model_availability_nux() {
+             status_line: None,
+             status_line_provider: None,
+             status_line_use_colors: true,
++            status_line_style: codex_config::types::StatusLineStyle::Default,
+             status_line_file: None,
+             terminal_title: None,
+             theme: None,
+@@ -1520,6 +1521,27 @@ status_line_use_colors = false
+     );
+ }
+ 
++#[test]
++fn config_toml_deserializes_status_line_style() {
++    use codex_config::types::StatusLineStyle;
++
++    for (source, expected) in [
++        ("[tui]", StatusLineStyle::Default),
++        (
++            "[tui]\nstatus_line_style = \"default\"",
++            StatusLineStyle::Default,
++        ),
++        (
++            "[tui]\nstatus_line_style = \"compact\"",
++            StatusLineStyle::Compact,
++        ),
++    ] {
++        let cfg: ConfigToml = toml::from_str(source).unwrap();
++        assert_eq!(cfg.tui.unwrap().status_line_style, expected);
++    }
++    assert!(toml::from_str::<ConfigToml>("[tui]\nstatus_line_style = \"unknown\"").is_err());
++}
++
+ #[test]
+ fn config_toml_deserializes_terminal_resize_reflow_config() {
+     let toml = r#"
+@@ -4811,6 +4833,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
+             status_line: None,
+             status_line_provider: None,
+             status_line_use_colors: true,
++            status_line_style: codex_config::types::StatusLineStyle::Default,
+             status_line_file: None,
+             terminal_title: None,
+             theme: None,
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index de9e513387..a30e9dd37d 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -57,6 +57,7 @@ use codex_config::types::QuickDial;
+ use codex_config::types::ResumeCwdMode;
+ use codex_config::types::SessionPickerViewMode;
+ use codex_config::types::StatusLineSelection;
++use codex_config::types::StatusLineStyle;
+ use codex_config::types::ToolSuggestConfig;
+ use codex_config::types::ToolSuggestDisabledTool;
+ use codex_config::types::ToolSuggestDiscoverable;
+@@ -893,6 +894,8 @@ pub struct Config {
+     /// Whether to color status line items with colors from the active syntax theme.
+     pub tui_status_line_use_colors: bool,
+ 
++    pub tui_status_line_style: StatusLineStyle,
++
+     /// JSON file providing externally written `file:<key>` status line items.
+     pub tui_status_line_file: Option<AbsolutePathBuf>,
+ 
+@@ -4961,6 +4964,11 @@ impl Config {
+                 .as_ref()
+                 .map(|t| t.status_line_use_colors)
+                 .unwrap_or(true),
++            tui_status_line_style: cfg
++                .tui
++                .as_ref()
++                .map(|t| t.status_line_style)
++                .unwrap_or_default(),
+             tui_status_line_file: cfg.tui.as_ref().and_then(|t| t.status_line_file.clone()),
+             tui_terminal_title: cfg.tui.as_ref().and_then(|t| t.terminal_title.clone()),
+             tui_theme: cfg.tui.as_ref().and_then(|t| t.theme.clone()),
+diff --git a/codex-rs/thread-manager-sample/src/main.rs b/codex-rs/thread-manager-sample/src/main.rs
+index a403b312c4..11866ed530 100644
+--- a/codex-rs/thread-manager-sample/src/main.rs
++++ b/codex-rs/thread-manager-sample/src/main.rs
+@@ -313,6 +313,7 @@ async fn new_config(
+         tui_status_line: None,
+         tui_status_line_provider: None,
+         tui_status_line_use_colors: true,
++        tui_status_line_style: Default::default(),
+         tui_status_line_file: None,
+         tui_terminal_title: None,
+         tui_theme: None,
+diff --git a/codex-rs/tui/src/local_settings.rs b/codex-rs/tui/src/local_settings.rs
+index f28aa51da6..0c4e3686d0 100644
+--- a/codex-rs/tui/src/local_settings.rs
++++ b/codex-rs/tui/src/local_settings.rs
+@@ -87,6 +87,7 @@ impl LocalSettings {
+                 status_line: config.tui_status_line.clone(),
+                 status_line_provider: config.tui_status_line_provider.clone(),
+                 status_line_use_colors: config.tui_status_line_use_colors,
++                status_line_style: config.tui_status_line_style,
+                 status_line_file: config.tui_status_line_file.clone(),
+                 terminal_title: config.tui_terminal_title.clone(),
+                 theme: config.tui_theme.clone(),

@@ -1,0 +1,1055 @@
+From 1337c672bf8bbc40a7ec7f58fb9f32bc1d174a9d Mon Sep 17 00:00:00 2001
+From: Calogero Mandracchia <calogero@efebia.com>
+Date: Sat, 21 Nov 2026 21:10:14 +0100
+Subject: [PATCH 2/2] tui: render compact status lines and show last turn time
+
+---
+ codex-rs/tui/src/app/session_lifecycle.rs     |   3 +
+ codex-rs/tui/src/app/startup.rs               |   3 +
+ .../src/app/tests/history_hydration_tests.rs  |  55 ++++-
+ .../tui/src/app_server_session/history.rs     |  43 ++++
+ codex-rs/tui/src/bottom_pane/mod.rs           |   3 +
+ .../src/bottom_pane/status_line_compact.rs    | 220 ++++++++++++++++++
+ .../tui/src/bottom_pane/status_line_setup.rs  |  16 +-
+ .../tui/src/bottom_pane/status_line_style.rs  |   3 +-
+ .../src/bottom_pane/status_surface_preview.rs |  21 +-
+ codex-rs/tui/src/chatwidget.rs                |   1 +
+ codex-rs/tui/src/chatwidget/constructor.rs    |   1 +
+ codex-rs/tui/src/chatwidget/protocol.rs       |   9 +
+ codex-rs/tui/src/chatwidget/replay.rs         |  15 ++
+ codex-rs/tui/src/chatwidget/session_flow.rs   |   3 +
+ .../tui/src/chatwidget/status_controls.rs     |  43 +++-
+ .../src/chatwidget/status_surface_commands.rs |   2 +-
+ .../tui/src/chatwidget/status_surfaces.rs     |  94 +++++++-
+ .../src/chatwidget/tests/status_and_layout.rs |  78 +++++++
+ codex-rs/tui/src/token_usage.rs               |  11 +-
+ 19 files changed, 593 insertions(+), 31 deletions(-)
+ create mode 100644 codex-rs/tui/src/bottom_pane/status_line_compact.rs
+
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index 03adb8aa61..e02ecc7745 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -2082,6 +2082,9 @@ impl App {
+             Ok(()) => {
+                 self.ensure_thread_channel(resumed_thread_id)
+                     .history_may_be_incomplete = false;
++                self.chat_widget.restore_older_status_line_completion(
++                    app_server.older_status_line_completion(resumed_thread_id),
++                );
+                 self.remember_attached_host_project(app_server);
+                 let resumed_turn_running = !read_only
+                     && self
+diff --git a/codex-rs/tui/src/app/startup.rs b/codex-rs/tui/src/app/startup.rs
+index a5664d2c22..09bbdd061d 100644
+--- a/codex-rs/tui/src/app/startup.rs
++++ b/codex-rs/tui/src/app/startup.rs
+@@ -1228,6 +1228,9 @@ See the Codex keymap documentation for supported actions and examples."
+                     return shutdown_on_startup_error(app_server, &mut other_backends, err).await;
+                 }
+             }
++            app.chat_widget.restore_older_status_line_completion(
++                app_server.older_status_line_completion(thread_id),
++            );
+             app.remember_attached_host_project(&app_server);
+             if let Some(error) = provider_error {
+                 app.chat_widget
+diff --git a/codex-rs/tui/src/app/tests/history_hydration_tests.rs b/codex-rs/tui/src/app/tests/history_hydration_tests.rs
+index 11a6dd305f..e79e10ce15 100644
+--- a/codex-rs/tui/src/app/tests/history_hydration_tests.rs
++++ b/codex-rs/tui/src/app/tests/history_hydration_tests.rs
+@@ -29,6 +29,13 @@ use pretty_assertions::assert_ne;
+ 
+ async fn history_fixture(
+     item_counts: &[usize],
++) -> Result<(Box<App>, tempfile::TempDir, SessionTarget)> {
++    history_fixture_with_completion(item_counts, /*first_completion*/ None).await
++}
++
++async fn history_fixture_with_completion(
++    item_counts: &[usize],
++    first_completion: Option<i64>,
+ ) -> Result<(Box<App>, tempfile::TempDir, SessionTarget)> {
+     let mut app = make_test_app().await;
+     let codex_home = tempdir()?;
+@@ -86,7 +93,7 @@ async fn history_fixture(
+             last_agent_message: None,
+             error: None,
+             started_at: None,
+-            completed_at: None,
++            completed_at: if index == 0 { first_completion } else { None },
+             duration_ms: None,
+             time_to_first_token_ms: None,
+         }));
+@@ -113,6 +120,52 @@ async fn history_fixture(
+     Ok((app, codex_home, target))
+ }
+ 
++#[tokio::test]
++async fn status_line_resume_reads_timestamp_beyond_the_visible_history() -> Result<()> {
++    let completed_at = 1_700_000_000;
++    let (mut app, _codex_home, target) =
++        history_fixture_with_completion(&[0, 0, 0, 0, 0, 0, 0, 1], Some(completed_at)).await?;
++    app.local_settings.tui.status_line = Some(vec!["last-response-time".to_string()]);
++    let (mut server, _requests, proxy) = start_recording_app_server(
++        &app.config,
++        /*blocked_thread_list*/ None,
++        /*failed_thread_name*/ None,
++    )
++    .await?;
++    let _: ThreadResumeResponse = server
++        .request_handle()
++        .request_typed(ClientRequest::ThreadResume {
++            request_id: server.next_request_id(),
++            params: ThreadResumeParams {
++                thread_id: target.thread_id.to_string(),
++                exclude_turns: true,
++                ..ThreadResumeParams::default()
++            },
++        })
++        .await?;
++    let mut thread = server
++        .thread_read(target.thread_id, /*include_turns*/ false)
++        .await?;
++    server
++        .hydrate_initial_thread_history(
++            &mut thread,
++            /*turn_cursor*/ None,
++            /*item_cursor*/ None,
++            Some(&app.config),
++            Some(&app.local_settings),
++            HistoryHydrationScope::Initial,
++        )
++        .await?;
++    assert!(thread.turns.iter().all(|turn| turn.completed_at.is_none()));
++    assert_eq!(
++        server.older_status_line_completion(target.thread_id),
++        Some(completed_at)
++    );
++    server.shutdown().await?;
++    proxy.await??;
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn history_hydration_metadata_tracks_missing_turns_and_stale_completions_keep_new_request()
+ -> Result<()> {
+diff --git a/codex-rs/tui/src/app_server_session/history.rs b/codex-rs/tui/src/app_server_session/history.rs
+index 3c8419619f..0d2c583508 100644
+--- a/codex-rs/tui/src/app_server_session/history.rs
++++ b/codex-rs/tui/src/app_server_session/history.rs
+@@ -163,9 +163,16 @@ pub(crate) struct ThreadHistoryPagination {
+     seen_turn_cursors: HashSet<String>,
+     seen_item_cursors: HashSet<String>,
+     loading_older: bool,
++    older_status_line_completion: Option<i64>,
+ }
+ 
+ impl AppServerSession {
++    pub(crate) fn older_status_line_completion(&self, thread_id: ThreadId) -> Option<i64> {
++        self.history_pagination
++            .get(&thread_id)?
++            .older_status_line_completion
++    }
++
+     pub(crate) async fn revert_thread(
+         &mut self,
+         thread_id: ThreadId,
+@@ -484,6 +491,37 @@ impl AppServerSession {
+                 prepend_older_turns(&mut thread.turns, page.data);
+             }
+         }
++        if config.is_some()
++            && local_settings
++                .and_then(|settings| settings.tui.status_line.as_ref())
++                .is_some_and(|items| items.iter().any(|item| item == "last-response-time"))
++            && !thread
++                .turns
++                .iter()
++                .any(|turn| saved_completion(turn).is_some())
++        {
++            // The latest timestamp can predate the visible transcript in imported history.
++            // Follow a separate turn cursor so the metadata search leaves scrolling intact.
++            let mut cursor = state.next_turn_cursor.clone();
++            let mut seen = HashSet::new();
++            while let Some(current) = cursor {
++                let page = match self
++                    .thread_turns_page(thread_id, Some(current.clone()), HISTORY_TURN_PAGE_LIMIT)
++                    .await
++                {
++                    Ok(page) => page,
++                    Err(error) => {
++                        tracing::debug!(%thread_id, %error, "failed to load saved turn completion time");
++                        break;
++                    }
++                };
++                if let Some(completed_at) = page.data.iter().find_map(saved_completion) {
++                    state.older_status_line_completion = Some(completed_at);
++                    break;
++                }
++                cursor = advancing_cursor(Some(&current), page.next_cursor, &mut seen);
++            }
++        }
+         mark_loaded_interruptions(&mut thread.turns, state.next_item_cursor.as_deref());
+         if config.is_some() {
+             self.history_pagination.insert(thread_id, state);
+@@ -492,6 +530,11 @@ impl AppServerSession {
+     }
+ }
+ 
++fn saved_completion(turn: &Turn) -> Option<i64> {
++    turn.completed_at
++        .filter(|_| turn.status != TurnStatus::InProgress)
++}
++
+ fn rendered_history_rows(
+     thread_id: ThreadId,
+     thread: &Thread,
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index 71807ca4fb..73fe090a29 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -97,6 +97,7 @@ mod question_tests;
+ mod questions;
+ mod request_user_input;
+ mod status_line;
++mod status_line_compact;
+ mod status_line_setup;
+ mod status_line_style;
+ mod status_surface_preview;
+@@ -126,6 +127,8 @@ pub(crate) use async_questions::QuestionSubmission;
+ pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
+ pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
+ pub(crate) use request_user_input::RequestUserInputOverlay;
++pub(crate) use status_line_compact::compact_limit_value;
++pub(crate) use status_line_compact::compact_status_line_from_segments;
+ pub(crate) use status_line_style::StatusLineAccent;
+ pub(crate) use status_line_style::status_line_from_segments;
+ pub(crate) use voice_strip::VoiceStripPhase;
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_compact.rs b/codex-rs/tui/src/bottom_pane/status_line_compact.rs
+new file mode 100644
+index 0000000000..b1f0541961
+--- /dev/null
++++ b/codex-rs/tui/src/bottom_pane/status_line_compact.rs
+@@ -0,0 +1,220 @@
++//! Compact rendering for the configurable built-in status line.
++
++use chrono::DateTime;
++use chrono::TimeZone;
++use chrono::Utc;
++use ratatui::style::Color;
++use ratatui::style::Style;
++use ratatui::text::Span;
++
++use super::StatusLineItem;
++use crate::status::RateLimitWindowDisplay;
++use crate::status_line_file::StatusLineEntry;
++use crate::style::secondary_text_style;
++use crate::terminal_hyperlinks::HyperlinkLine;
++
++const GRAY: u8 = 246;
++const RED: u8 = 196;
++const ORANGE: u8 = 208;
++const YELLOW: u8 = 220;
++const GREEN: u8 = 71;
++const BLUE: u8 = 33;
++const VIOLET: u8 = 140;
++
++// This opt-in style uses a fixed 256-color terminal palette.
++#[allow(clippy::disallowed_methods)]
++pub(crate) fn compact_status_line_from_segments(
++    segments: impl IntoIterator<Item = (StatusLineEntry, String)>,
++    use_colors: bool,
++    pull_request_url: Option<&str>,
++) -> Option<HyperlinkLine> {
++    let style = |color| {
++        if use_colors {
++            Style::default().fg(Color::Indexed(color))
++        } else {
++            secondary_text_style()
++        }
++    };
++    let mut line = HyperlinkLine::default();
++    for (entry, mut text) in segments {
++        text.retain(|ch| !ch.is_control());
++        if !line.line.spans.is_empty() {
++            line.line.push_span(Span::styled(" │ ", style(GRAY)));
++        }
++        let color = match entry {
++            StatusLineEntry::File(_) => VIOLET,
++            StatusLineEntry::Builtin(item) => match item {
++                StatusLineItem::ModelWithReasoning => {
++                    if let Some((model, effort)) = text.rsplit_once('/') {
++                        line.line
++                            .push_span(Span::styled(model.to_owned(), style(RED)));
++                        line.line.push_span(Span::styled("/", style(GRAY)));
++                        line.line
++                            .push_span(Span::styled(effort.to_owned(), style(ORANGE)));
++                        continue;
++                    }
++                    RED
++                }
++                StatusLineItem::ModelName => RED,
++                StatusLineItem::Reasoning => ORANGE,
++                StatusLineItem::ContextRemaining | StatusLineItem::ContextUsed => YELLOW,
++                StatusLineItem::CurrentDir | StatusLineItem::ProjectRoot => GREEN,
++                StatusLineItem::SessionId => VIOLET,
++                StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => {
++                    let label = if item == StatusLineItem::FiveHourLimit {
++                        "5h:"
++                    } else {
++                        "7d:"
++                    };
++                    line.line.push_span(Span::styled(label, style(GRAY)));
++                    BLUE
++                }
++                StatusLineItem::PullRequestNumber => {
++                    line.push_span(
++                        Span::styled(text, style(GRAY).underlined()),
++                        pull_request_url,
++                    );
++                    continue;
++                }
++                _ => GRAY,
++            },
++        };
++        line.line.push_span(Span::styled(text, style(color)));
++    }
++    (!line.line.spans.is_empty()).then_some(line)
++}
++
++pub(crate) fn compact_limit_value<Tz: TimeZone>(
++    window: Option<&RateLimitWindowDisplay>,
++    weekly: bool,
++    now: DateTime<Tz>,
++) -> String
++where
++    Tz::Offset: std::fmt::Display,
++{
++    let Some(window) = window.filter(|window| (0.0..=100.0).contains(&window.used_percent)) else {
++        return "?".to_string();
++    };
++    let remaining = 100.0 - window.used_percent;
++    let reset = window
++        .resets_at_unix
++        .and_then(|at| DateTime::<Utc>::from_timestamp(at, 0));
++    if weekly {
++        let duration = reset
++            .map(|at| compact_reset_duration(at.timestamp().saturating_sub(now.timestamp())))
++            .unwrap_or_else(|| "?".to_string());
++        format!("{remaining:.0}% ({duration})")
++    } else if remaining <= 30.0
++        && let Some(reset) = reset
++    {
++        format!(
++            "{remaining:.0}% (reset at {})",
++            reset.with_timezone(&now.timezone()).format("%H:%M")
++        )
++    } else {
++        format!("{remaining:.0}%")
++    }
++}
++
++fn compact_reset_duration(seconds: i64) -> String {
++    let days = seconds / 86_400;
++    let hours = seconds % 86_400 / 3_600;
++    let minutes = seconds % 3_600 / 60;
++    if days > 0 {
++        format!("{days}d{hours}h")
++    } else if hours > 0 {
++        format!("{hours}h{minutes}m")
++    } else if minutes > 0 {
++        format!("{minutes}m")
++    } else if seconds > 0 {
++        "<1m".to_string()
++    } else {
++        "now".to_string()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use chrono::FixedOffset;
++    use insta::assert_snapshot;
++    use pretty_assertions::assert_eq;
++
++    #[test]
++    #[allow(clippy::disallowed_methods)]
++    fn status_line_compact_palette_and_layout() {
++        let segments = [
++            (StatusLineItem::LastResponseTime.into(), "20:44:Sat"),
++            (
++                StatusLineItem::ModelWithReasoning.into(),
++                "Example Model/max",
++            ),
++            (StatusLineItem::ContextRemaining.into(), "86.0%"),
++            (StatusLineItem::CurrentDir.into(), "~/projects"),
++            (StatusLineItem::FiveHourLimit.into(), "30% (reset at 22:15)"),
++            (StatusLineItem::WeeklyLimit.into(), "63% (4d13h)"),
++            (StatusLineEntry::File("label".to_string()), "example"),
++            (
++                StatusLineEntry::File("aliases".to_string()),
++                "⚓ example-fixed",
++            ),
++            (
++                StatusLineItem::SessionId.into(),
++                "2f025ba0-1234-4321-8765-001122334455",
++            ),
++        ];
++        let line = compact_status_line_from_segments(
++            segments.map(|(item, text)| (item, text.to_string())),
++            /*use_colors*/ true,
++            /*pull_request_url*/ None,
++        )
++        .expect("a rendered line");
++        assert_snapshot!(line.line.to_string(), @"20:44:Sat │ Example Model/max │ 86.0% │ ~/projects │ 5h:30% (reset at 22:15) │ 7d:63% (4d13h) │ example │ ⚓ example-fixed │ 2f025ba0-1234-4321-8765-001122334455");
++        let colors: Vec<_> = line.line.spans.iter().map(|span| span.style.fg).collect();
++        assert_eq!(
++            colors,
++            [
++                246, 246, 196, 246, 208, 246, 220, 246, 71, 246, 246, 33, 246, 246, 33, 246, 140,
++                246, 140, 246, 140
++            ]
++            .map(|color| Some(Color::Indexed(color)))
++        );
++    }
++
++    #[test]
++    fn status_line_compact_limits_use_unrounded_threshold_and_local_clock() {
++        let timezone = FixedOffset::east_opt(3_600).expect("valid offset");
++        let now = timezone.with_ymd_and_hms(2026, 11, 21, 20, 44, 0).unwrap();
++        let mut window = RateLimitWindowDisplay {
++            used_percent: 69.9,
++            resets_at_unix: Some(now.timestamp() + 91 * 60),
++            resets_at: None,
++            window_minutes: Some(300),
++        };
++        assert_eq!(
++            compact_limit_value(Some(&window), /*weekly*/ false, now),
++            "30%"
++        );
++        window.used_percent = 70.0;
++        assert_eq!(
++            compact_limit_value(Some(&window), /*weekly*/ false, now),
++            "30% (reset at 22:15)"
++        );
++        window.used_percent = 37.0;
++        window.resets_at_unix = Some(now.timestamp() + (4 * 24 + 13) * 3_600);
++        assert_eq!(
++            compact_limit_value(Some(&window), /*weekly*/ true, now),
++            "63% (4d13h)"
++        );
++        window.resets_at_unix = None;
++        assert_eq!(
++            compact_limit_value(Some(&window), /*weekly*/ true, now),
++            "63% (?)"
++        );
++        window.used_percent = f64::NAN;
++        assert_eq!(
++            compact_limit_value(Some(&window), /*weekly*/ true, now),
++            "?"
++        );
++    }
++}
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+index 62f6ee83b8..6cd0cd31f6 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -55,7 +55,7 @@ const STATUS_LINE_USE_THEME_COLORS_ITEM_ID: &str = "status-line-use-theme-colors
+ ///
+ /// Some items are conditionally displayed based on availability:
+ /// - Git-related items only show when in a git repository
+-/// - Context/limit items only show when data is available from the API
++/// - Context and limit items depend on API data. Compact limits display `?` when unknown.
+ /// - Thread ID only shows after a session has started
+ #[derive(EnumIter, EnumString, Display, Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+ #[strum(serialize_all = "kebab_case")]
+@@ -171,6 +171,9 @@ pub(crate) enum StatusLineItem {
+     /// Model provider ID for the active thread.
+     #[strum(to_string = "provider", serialize = "model-provider")]
+     Provider,
++
++    /// Local time when the latest turn ended.
++    LastResponseTime,
+ }
+ 
+ impl serde::Serialize for StatusLineItem {
+@@ -184,6 +187,7 @@ impl StatusLineItem {
+     /// User-visible description shown in the popup.
+     pub(crate) fn description(self) -> &'static str {
+         match self {
++            StatusLineItem::LastResponseTime => "Local time of the latest turn completion",
+             StatusLineItem::ModelName => "Current model name",
+             StatusLineItem::ModelWithReasoning => "Current model name with reasoning level",
+             StatusLineItem::Reasoning => "Current reasoning level",
+@@ -248,6 +252,7 @@ impl StatusLineItem {
+ 
+     pub(crate) fn preview_item(self) -> StatusSurfacePreviewItem {
+         match self {
++            StatusLineItem::LastResponseTime => StatusSurfacePreviewItem::LastResponseTime,
+             StatusLineItem::ModelName => StatusSurfacePreviewItem::Model,
+             StatusLineItem::ModelWithReasoning => StatusSurfacePreviewItem::ModelWithReasoning,
+             StatusLineItem::Reasoning => StatusSurfacePreviewItem::Reasoning,
+@@ -356,10 +361,15 @@ impl StatusLineSetupView {
+                 ..Default::default()
+             });
+         }
++        let (color_name, color_description) = if preview_data.compact_status_line {
++            ("Use colors", "Apply the compact status line palette")
++        } else {
++            ("Use theme colors", "Apply colors from the active /theme")
++        };
+         items.push(MultiSelectItem {
+             id: STATUS_LINE_USE_THEME_COLORS_ITEM_ID.to_string(),
+-            name: "Use theme colors".to_string(),
+-            description: Some("Apply colors from the active /theme".to_string()),
++            name: color_name.to_string(),
++            description: Some(color_description.to_string()),
+             enabled: use_theme_colors,
+             orderable: false,
+             section_break_after: true,
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index bfac8f5989..86c3c07365 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -70,7 +70,8 @@ impl StatusLineAccent {
+             | StatusLineItem::ThreadCredits
+             | StatusLineItem::EstimatedThreadCost => Self::Usage,
+             StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => Self::Limit,
+-            StatusLineItem::CodexVersion
++            StatusLineItem::LastResponseTime
++            | StatusLineItem::CodexVersion
+             | StatusLineItem::Hostname
+             | StatusLineItem::SessionId
+             | StatusLineItem::Profile => Self::Metadata,
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+index c88d45d2b0..a6d096a833 100644
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -8,6 +8,7 @@ use strum::IntoEnumIterator;
+ use crate::terminal_hyperlinks::HyperlinkLine;
+ use codex_protocol::ThreadId;
+ 
++use super::compact_status_line_from_segments;
+ use super::multi_select_picker::MultiSelectItem;
+ use super::status_line_from_segments;
+ use crate::status_line_file::StatusLineEntry;
+@@ -15,6 +16,7 @@ use crate::status_line_file::StatusLineFileFields;
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+ pub(crate) enum StatusSurfacePreviewItem {
++    LastResponseTime,
+     AppName,
+     ProjectName,
+     ProjectRoot,
+@@ -55,6 +57,7 @@ pub(crate) enum StatusSurfacePreviewItem {
+ impl StatusSurfacePreviewItem {
+     fn placeholder(self) -> &'static str {
+         match self {
++            StatusSurfacePreviewItem::LastResponseTime => "20:44:Sat",
+             StatusSurfacePreviewItem::AppName => "codex",
+             StatusSurfacePreviewItem::ProjectName => "my-project",
+             StatusSurfacePreviewItem::ProjectRoot => "my-project",
+@@ -95,6 +98,7 @@ impl StatusSurfacePreviewItem {
+ 
+     pub(crate) fn iter() -> impl Iterator<Item = Self> {
+         [
++            Self::LastResponseTime,
+             Self::AppName,
+             Self::ProjectName,
+             Self::ProjectRoot,
+@@ -143,6 +147,7 @@ struct PreviewValue {
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub(crate) struct StatusSurfacePreviewData {
++    pub(crate) compact_status_line: bool,
+     pub(crate) thread_id: Option<ThreadId>,
+     pub(crate) pull_request_url: Option<String>,
+     /// Current values of `file:<key>` items.
+@@ -153,6 +158,7 @@ pub(crate) struct StatusSurfacePreviewData {
+ impl Default for StatusSurfacePreviewData {
+     fn default() -> Self {
+         let mut data = Self {
++            compact_status_line: false,
+             thread_id: None,
+             pull_request_url: None,
+             status_line_file: crate::status_line_file::empty_fields(),
+@@ -321,13 +327,14 @@ impl StatusSurfacePreviewData {
+             .map(str::to_string);
+             value.map(|value| (item, value))
+         });
+-        status_line_from_segments(
+-            segments,
+-            use_theme_colors,
+-            self.thread_id,
+-            self.live_value_for(StatusSurfacePreviewItem::PullRequestNumber)
+-                .and(self.pull_request_url.as_deref()),
+-        )
++        let pull_request_url = self
++            .live_value_for(StatusSurfacePreviewItem::PullRequestNumber)
++            .and(self.pull_request_url.as_deref());
++        if self.compact_status_line {
++            compact_status_line_from_segments(segments, use_theme_colors, pull_request_url)
++        } else {
++            status_line_from_segments(segments, use_theme_colors, self.thread_id, pull_request_url)
++        }
+     }
+ }
+ 
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 57141ba3de..8ee5a500fc 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -804,6 +804,7 @@ pub(crate) struct ChatWidget {
+     // True once we've attempted a Git summary lookup for the current CWD.
+     status_line_git_summary_lookup_complete: bool,
+     // Last fields read from the status line file, for `file:<key>` items.
++    status_line_last_response_at: Option<i64>,
+     status_line_file_fields: Arc<crate::status_line_file::StatusLineFileFields>,
+     // Cached workspace notification headline for the status line.
+     status_line_workspace_headline: Option<String>,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 514570d43a..d48ab2b697 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -304,6 +304,7 @@ impl ChatWidget {
+             status_line_git_summary_cwd: None,
+             status_line_git_summary_pending: false,
+             status_line_git_summary_lookup_complete: false,
++            status_line_last_response_at: None,
+             status_line_file_fields: crate::status_line_file::current_fields(),
+             status_line_workspace_headline: None,
+             status_line_workspace_headline_pending_request_id: None,
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index 074bdfec3a..15c7e44425 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -123,6 +123,15 @@ impl ChatWidget {
+                 }
+             }
+             ServerNotification::TurnCompleted(notification) => {
++                if notification.turn.status != TurnStatus::InProgress
++                    && let Some(completed_at) = notification.turn.completed_at.or_else(|| {
++                        replay_kind
++                            .is_none()
++                            .then(|| chrono::Utc::now().timestamp())
++                    })
++                {
++                    self.status_line_last_response_at = Some(completed_at);
++                }
+                 self.restore_realtime_transcripts_before_turn(&notification.turn.id);
+                 self.handle_turn_completed_notification(notification, replay_kind);
+             }
+diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
+index d575997242..09dc8aa89f 100644
+--- a/codex-rs/tui/src/chatwidget/replay.rs
++++ b/codex-rs/tui/src/chatwidget/replay.rs
+@@ -116,6 +116,13 @@ impl ChatWidget {
+         if matches!(replay_kind, ReplayKind::ThreadSnapshot) && !turns.is_empty() {
+             self.warning_display_state.startup_complete = true;
+         }
++        let previous_completion = self.status_line_last_response_at;
++        // Completion metadata is available even when the turn's items are paginated.
++        self.status_line_last_response_at = turns
++            .iter()
++            .rev()
++            .filter(|turn| turn.status != TurnStatus::InProgress)
++            .find_map(|turn| turn.completed_at);
+         let latest_turn_id = turns.last().map(|turn| turn.id.clone());
+         let hidden_nested_review_turns = std::iter::once(/*value*/ false)
+             .chain(turns.windows(/*size*/ 2).map(|turns| {
+@@ -253,6 +260,14 @@ impl ChatWidget {
+                 );
+             }
+         }
++        if previous_completion != self.status_line_last_response_at
++            && self
++                .configured_status_line_items()
++                .iter()
++                .any(|item| item == "last-response-time")
++        {
++            self.refresh_status_line();
++        }
+     }
+ 
+     pub(crate) fn replay_thread_item(
+diff --git a/codex-rs/tui/src/chatwidget/session_flow.rs b/codex-rs/tui/src/chatwidget/session_flow.rs
+index 1162509a59..45683a8a26 100644
+--- a/codex-rs/tui/src/chatwidget/session_flow.rs
++++ b/codex-rs/tui/src/chatwidget/session_flow.rs
+@@ -99,6 +99,9 @@ impl ChatWidget {
+         }
+         let connector_scope_changed = previous_thread_id != Some(session.thread_id)
+             || self.config.cwd.as_path() != session.cwd.as_path();
++        if previous_thread_id != Some(session.thread_id) {
++            self.status_line_last_response_at = None;
++        }
+         self.thread_id = Some(session.thread_id);
+         self.read_only_history = session.read_only_history;
+         self.thread_settings_confirmed = session.thread_settings_confirmed;
+diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
+index ef34270175..8310ec349b 100644
+--- a/codex-rs/tui/src/chatwidget/status_controls.rs
++++ b/codex-rs/tui/src/chatwidget/status_controls.rs
+@@ -349,7 +349,7 @@ impl ChatWidget {
+             Some(configured_status_line_items.as_slice()),
+             self.local_settings.tui.status_line_use_colors,
+             providers,
+-            self.status_surface_preview_data(),
++            self.status_line_preview_data(),
+             self.app_event_tx.clone(),
+             self.bottom_pane.list_keymap(),
+         );
+@@ -369,6 +369,34 @@ impl ChatWidget {
+         self.bottom_pane.show_view(Box::new(view));
+     }
+ 
++    pub(super) fn status_line_preview_data(&mut self) -> StatusSurfacePreviewData {
++        let mut data = self.status_surface_preview_data();
++        if self.local_settings.tui.status_line_style
++            == codex_config::types::StatusLineStyle::Compact
++        {
++            data.compact_status_line = true;
++            for item in [
++                StatusLineItem::ModelWithReasoning,
++                StatusLineItem::ContextRemaining,
++                StatusLineItem::ContextUsed,
++                StatusLineItem::FiveHourLimit,
++                StatusLineItem::WeeklyLimit,
++            ] {
++                if let Some(value) = self.compact_status_line_value_for_item(item) {
++                    data.set_live(item.preview_item(), value);
++                } else {
++                    let placeholder = if item == StatusLineItem::ContextUsed {
++                        "0.0% used"
++                    } else {
++                        "0.0%"
++                    };
++                    data.set_placeholder(item.preview_item(), placeholder);
++                }
++            }
++        }
++        data
++    }
++
+     pub(super) fn status_surface_preview_data(&mut self) -> StatusSurfacePreviewData {
+         let mut preview_data = StatusSurfacePreviewData::from_iter(
+             StatusSurfacePreviewItem::iter().filter_map(|item| {
+@@ -424,11 +452,16 @@ impl ChatWidget {
+     }
+ 
+     pub(super) fn status_line_context_remaining_percent(&self) -> Option<i64> {
++        self.status_line_context_remaining_percentage()
++            .map(|percentage| percentage.round() as i64)
++    }
++
++    pub(super) fn status_line_context_remaining_percentage(&self) -> Option<f64> {
+         if self.token_usage_pending {
+             return None;
+         }
+         let Some(context_window) = self.status_line_context_window_size() else {
+-            return Some(100);
++            return Some(100.0);
+         };
+         let default_usage = TokenUsage::default();
+         let usage = self
+@@ -436,11 +469,7 @@ impl ChatWidget {
+             .as_ref()
+             .map(|info| &info.last_token_usage)
+             .unwrap_or(&default_usage);
+-        Some(
+-            usage
+-                .percent_of_context_window_remaining(context_window)
+-                .clamp(0, 100),
+-        )
++        Some(usage.context_window_remaining_percentage(context_window))
+     }
+ 
+     pub(super) fn status_line_context_used_percent(&self) -> Option<i64> {
+diff --git a/codex-rs/tui/src/chatwidget/status_surface_commands.rs b/codex-rs/tui/src/chatwidget/status_surface_commands.rs
+index b493670b1d..a1f38a134e 100644
+--- a/codex-rs/tui/src/chatwidget/status_surface_commands.rs
++++ b/codex-rs/tui/src/chatwidget/status_surface_commands.rs
+@@ -37,7 +37,7 @@ impl ChatWidget {
+     }
+ 
+     pub(super) fn handle_status_line_command_args(&mut self, args: &str) {
+-        let preview_data = self.status_surface_preview_data();
++        let preview_data = self.status_line_preview_data();
+         match parse_status_line_command(args, &preview_data) {
+             Ok(command) => {
+                 if let Some(items) = command.items {
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 3777e68428..b9067d0a26 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -4,6 +4,8 @@
+ //! behavior easier to review without paging through the rest of `chatwidget.rs`.
+ 
+ use super::*;
++use crate::bottom_pane::compact_limit_value;
++use crate::bottom_pane::compact_status_line_from_segments;
+ use crate::bottom_pane::status_line_from_segments;
+ use crate::branch_summary;
+ use crate::chatwidget::limit_label_for_window;
+@@ -16,9 +18,11 @@ use crate::status::format_tokens_compact;
+ use crate::status_line_file::StatusLineEntry;
+ use crate::terminal_program_status::ProgramStatus;
+ use crate::thread_label::ThreadLabelStyle;
++use chrono::TimeZone;
+ use codex_app_server_protocol::AskForApproval;
+ use codex_config::ConfigLayerSource;
+ use codex_config::os_host_name;
++use codex_config::types::StatusLineStyle;
+ use codex_protocol::config_types::ApprovalsReviewer;
+ use codex_protocol::config_types::ServiceTier;
+ use codex_protocol::models::PermissionProfile;
+@@ -197,19 +201,27 @@ impl ChatWidget {
+             return;
+         }
+ 
++        let compact = self.local_settings.tui.status_line_style == StatusLineStyle::Compact;
+         let mut segments = Vec::new();
+         for entry in &selections.status_line_entries {
+-            if let Some(value) = self.status_line_entry_value(entry) {
++            let value = match entry {
++                StatusLineEntry::Builtin(item) if compact => {
++                    self.compact_status_line_value_for_item(*item)
++                }
++                _ => self.status_line_entry_value(entry),
++            };
++            if let Some(value) = value {
+                 segments.push((entry.clone(), value));
+             }
+         }
+ 
+-        let line = status_line_from_segments(
+-            segments,
+-            self.local_settings.tui.status_line_use_colors,
+-            self.thread_id,
+-            self.status_line_pull_request_url(),
+-        );
++        let use_colors = self.local_settings.tui.status_line_use_colors;
++        let pull_request_url = self.status_line_pull_request_url();
++        let line = if compact {
++            compact_status_line_from_segments(segments, use_colors, pull_request_url)
++        } else {
++            status_line_from_segments(segments, use_colors, self.thread_id, pull_request_url)
++        };
+         self.set_status_line(line.map(Into::into));
+     }
+ 
+@@ -736,6 +748,45 @@ impl ChatWidget {
+         true
+     }
+ 
++    pub(crate) fn restore_older_status_line_completion(&mut self, completed_at: Option<i64>) {
++        if self.status_line_last_response_at.is_none()
++            && let Some(completed_at) = completed_at
++        {
++            self.status_line_last_response_at = Some(completed_at);
++            self.refresh_status_line();
++        }
++    }
++
++    pub(super) fn compact_status_line_value_for_item(
++        &mut self,
++        item: StatusLineItem,
++    ) -> Option<String> {
++        match item {
++            StatusLineItem::ModelWithReasoning => Some(format!(
++                "{}/{}",
++                self.status_model_display_name(),
++                self.reasoning_display_name(),
++            )),
++            StatusLineItem::ContextRemaining => self
++                .status_line_context_remaining_percentage()
++                .map(|remaining| format!("{remaining:.1}%")),
++            StatusLineItem::ContextUsed => self
++                .status_line_context_remaining_percentage()
++                .map(|remaining| format!("{:.1}% used", 100.0 - remaining)),
++            StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => {
++                let weekly = item == StatusLineItem::WeeklyLimit;
++                let label = if weekly { "weekly" } else { "5h" };
++                let window = self
++                    .rate_limit_snapshots_by_limit_id
++                    .get("codex")
++                    .and_then(|snapshot| find_codex_window(snapshot, label))
++                    .map(|(window, _)| window);
++                Some(compact_limit_value(window, weekly, chrono::Local::now()))
++            }
++            _ => self.status_line_value_for_item(item),
++        }
++    }
++
+     /// Resolves a display string for one configured status-line item.
+     ///
+     /// Returning `None` means "omit this item for now", not "configuration error". Callers rely on
+@@ -743,6 +794,12 @@ impl ChatWidget {
+     /// git metadata.
+     pub(super) fn status_line_value_for_item(&mut self, item: StatusLineItem) -> Option<String> {
+         match item {
++            StatusLineItem::LastResponseTime => self.status_line_last_response_at.and_then(|at| {
++                chrono::Local
++                    .timestamp_opt(at, 0)
++                    .single()
++                    .map(format_response_time)
++            }),
+             StatusLineItem::ModelName => Some(self.status_model_display_name().to_string()),
+             StatusLineItem::ModelWithReasoning => {
+                 let service_tier = self.processing_tier_display_name().map(str::to_lowercase);
+@@ -868,6 +925,7 @@ impl ChatWidget {
+         item: StatusSurfacePreviewItem,
+     ) -> Option<String> {
+         let status_line_item = match item {
++            StatusSurfacePreviewItem::LastResponseTime => StatusLineItem::LastResponseTime,
+             StatusSurfacePreviewItem::AppName => return Some("codex".to_string()),
+             StatusSurfacePreviewItem::ProjectName => return self.terminal_title_project_name(),
+             StatusSurfacePreviewItem::ProjectRoot => StatusLineItem::ProjectRoot,
+@@ -1160,6 +1218,13 @@ impl ChatWidget {
+     }
+ }
+ 
++fn format_response_time<Tz: chrono::TimeZone>(at: chrono::DateTime<Tz>) -> String
++where
++    Tz::Offset: std::fmt::Display,
++{
++    at.format("%H:%M:%a").to_string()
++}
++
+ fn five_hour_status_window(
+     snapshot: &RateLimitSnapshotDisplay,
+ ) -> Option<(&RateLimitWindowDisplay, bool)> {
+@@ -1318,3 +1383,18 @@ where
+     }
+     (items, invalid)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::format_response_time;
++    use chrono::FixedOffset;
++    use chrono::TimeZone;
++    use pretty_assertions::assert_eq;
++
++    #[test]
++    fn status_line_last_response_time_formats_local_weekday() {
++        let offset = FixedOffset::east_opt(3_600).unwrap();
++        let time = offset.with_ymd_and_hms(2026, 11, 21, 20, 44, 0).unwrap();
++        assert_eq!(format_response_time(time), "20:44:Sat");
++    }
++}
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index 917f1ad904..8c9f045ebc 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -6298,3 +6298,81 @@ async fn chatwidget_tall() {
+         normalize_snapshot_paths(term.backend().vt100().screen().contents())
+     );
+ }
++
++#[tokio::test]
++async fn status_line_compact_omits_time_before_first_turn() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.local_settings.tui.status_line_style = codex_config::types::StatusLineStyle::Compact;
++    chat.local_settings.tui.status_line = Some(
++        ["last-response-time", "context-remaining"]
++            .map(str::to_string)
++            .to_vec(),
++    );
++    chat.refresh_status_line();
++    insta::assert_snapshot!(status_line_text(&chat).unwrap(), @"100.0%");
++}
++
++#[tokio::test]
++async fn status_line_compact_shows_unknown_limits() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.local_settings.tui.status_line_style = codex_config::types::StatusLineStyle::Compact;
++    chat.local_settings.tui.status_line = Some(
++        ["five-hour-limit", "weekly-limit"]
++            .map(str::to_string)
++            .to_vec(),
++    );
++    chat.refresh_status_line();
++    insta::assert_snapshot!(status_line_text(&chat).unwrap(), @"5h:? │ 7d:?");
++}
++
++#[tokio::test]
++async fn status_line_last_response_time_uses_live_and_saved_completions() {
++    use super::helpers::app_server_turn;
++
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    let thread_id = ThreadId::new();
++    chat.thread_id = Some(thread_id);
++    chat.local_settings.tui.status_line = Some(vec!["last-response-time".to_string()]);
++    for (status, completed_at) in [
++        (TurnStatus::Completed, 1_700_000_000),
++        (TurnStatus::Interrupted, 1_700_000_001),
++        (TurnStatus::Failed, 1_700_000_002),
++    ] {
++        let mut turn = app_server_turn(
++            "live", status, /*duration_ms*/ None, /*error*/ None,
++        );
++        turn.completed_at = Some(completed_at);
++        chat.handle_server_notification(
++            ServerNotification::TurnCompleted(TurnCompletedNotification {
++                thread_id: thread_id.to_string(),
++                turn,
++            }),
++            /*replay_kind*/ None,
++        );
++        assert_eq!(chat.status_line_last_response_at, Some(completed_at));
++    }
++
++    let before = chrono::Utc::now().timestamp();
++    super::helpers::handle_turn_completed(&mut chat, "missing-time", /*duration_ms*/ None);
++    let after = chrono::Utc::now().timestamp();
++    assert!((before..=after).contains(&chat.status_line_last_response_at.unwrap()));
++
++    let mut saved = app_server_turn(
++        "saved",
++        TurnStatus::Interrupted,
++        /*duration_ms*/ None,
++        /*error*/ None,
++    );
++    saved.items_view = codex_app_server_protocol::TurnItemsView::NotLoaded;
++    saved.completed_at = Some(1_700_000_003);
++    let mut legacy = app_server_turn(
++        "legacy",
++        TurnStatus::Completed,
++        /*duration_ms*/ None,
++        /*error*/ None,
++    );
++    legacy.items_view = codex_app_server_protocol::TurnItemsView::NotLoaded;
++    chat.replay_thread_turns(vec![saved, legacy], ReplayKind::ResumeInitialMessages);
++    assert_eq!(chat.status_line_last_response_at, Some(1_700_000_003));
++    assert!(status_line_text(&chat).is_some());
++}
+diff --git a/codex-rs/tui/src/token_usage.rs b/codex-rs/tui/src/token_usage.rs
+index 07ae276bf1..2f8349b521 100644
+--- a/codex-rs/tui/src/token_usage.rs
++++ b/codex-rs/tui/src/token_usage.rs
+@@ -56,15 +56,18 @@ impl TokenUsage {
+     }
+ 
+     pub(crate) fn percent_of_context_window_remaining(&self, context_window: i64) -> i64 {
++        self.context_window_remaining_percentage(context_window)
++            .round() as i64
++    }
++
++    pub(crate) fn context_window_remaining_percentage(&self, context_window: i64) -> f64 {
+         if context_window <= BASELINE_TOKENS {
+-            return 0;
++            return 0.0;
+         }
+         let effective_window = context_window - BASELINE_TOKENS;
+         let used = (self.tokens_in_context_window() - BASELINE_TOKENS).max(0);
+         let remaining = (effective_window - used).max(0);
+-        ((remaining as f64 / effective_window as f64) * 100.0)
+-            .clamp(0.0, 100.0)
+-            .round() as i64
++        ((remaining as f64 / effective_window as f64) * 100.0).clamp(0.0, 100.0)
+     }
+ }
+ 

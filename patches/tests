@@ -59,3 +59,7 @@ channels-fence: -p codex-app-server-protocol --lib schema_fixtures
 process-status-file: -p codex-process-status-file
 
 channels-ui: -p codex-tui --lib channel_messages
+
+status-line-compact: -p codex-tui status_line
+status-line-compact: -p codex-core --lib config::schema::tests
+status-line-compact: -p codex-core --lib config_toml_deserializes_status_line_style

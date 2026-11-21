@@ -16,3 +16,4 @@ channels-fence
 process-status-file
 cli-display-version
 channels-ui
+status-line-compact
