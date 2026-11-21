@@ -132,9 +132,10 @@ package's `DISTRIBUTION` file.
 
 ## How releases are made
 
-[`.github/workflows/release.yml`](.github/workflows/release.yml) runs every 30
-minutes. When upstream has a stable release (`rust-vX.Y.Z`, not a prerelease)
-that is not published here yet, it:
+Every 30 minutes a build machine runs
+[`scripts/release-scheduled.sh`](scripts/release-scheduled.sh) (see below).
+When upstream has a stable release (`rust-vX.Y.Z`, not a prerelease) that is
+not published here yet, it:
 
 1. applies the patch series to the upstream tag; a conflict stops the run
    before anything is built;
@@ -148,10 +149,13 @@ that is not published here yet, it:
 If any step fails, nothing is published, the previous release stays current,
 and an issue labelled `release-failure` names the failed step with the end of
 its log. While that issue is open the scheduled check does not retry the same
-upstream version; close it after fixing the cause, or run the workflow by hand.
-Running it by hand with `force` publishes a new revision of an upstream version
-that is already published; `targets` (e.g. `x86_64-unknown-linux-musl`) limits
-it to some packages, and a later forced run adds the others.
+upstream version; close it after fixing the cause, or start the release by hand.
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) makes the same
+release on GitHub Actions when run by hand. With `force` it publishes a new
+revision of an upstream version that is already published; `targets` (e.g.
+`x86_64-unknown-linux-musl`) limits it to some packages, and a later forced run
+adds the others.
 
 ## Releases built on a build machine
 
@@ -177,6 +181,14 @@ need several GB of memory each. It never uses sudo: the musl toolchain that the
 workflow installs with apt is taken from the system or set up under
 `.work/release-local/cache/tools` (Debian or Ubuntu). The header of the script
 lists every option and requirement.
+
+[`scripts/release-scheduled.sh`](scripts/release-scheduled.sh) is the scheduled
+run, for a timer every 30 minutes in such a clone (a systemd timer, for
+example). It checks for an unpublished upstream release with no open
+`release-failure` issue; when there is one, it waits for the lock, brings the
+clone to the tip of `main` and runs `release-local.sh`, with the log under
+`.work/release-local/logs`. A failed run opens or updates the `release-failure`
+issue with the end of that log.
 
 ## Build locally
 

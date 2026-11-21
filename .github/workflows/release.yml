@@ -1,21 +1,20 @@
-# Build and publish a release when upstream publishes a new stable version.
+# Build and publish a release on GitHub Actions, when run by hand.
 #
-# Every 30 minutes the plan job checks for a stable upstream release that this
-# repository has not published yet. If there is one, the patch series is
-# applied, the extension tests run, Codex is built for every target, each
-# package is installed with install.sh and smoke-tested, and only then the
-# release is published. Any failure publishes nothing and opens an issue; the
-# scheduled check does not retry that upstream version while the issue is open.
+# New upstream releases are built on a build machine by the scheduled
+# scripts/release-scheduled.sh. This workflow makes the same release: the plan
+# job checks for a stable upstream release that this repository has not
+# published yet. If there is one, the patch series is applied, the extension
+# tests run, Codex is built for every target, each package is installed with
+# install.sh and smoke-tested, and only then the release is published. Any
+# failure publishes nothing and opens an issue; the scheduled check does not
+# retry that upstream version while the issue is open.
 #
-# Run it manually to retry, to build a given upstream tag, or (with force) to
-# publish a new revision of an already published upstream version.
+# Run it to retry, to build a given upstream tag, or (with force) to publish a
+# new revision of an already published upstream version.
 
 name: release
 
 on:
-  schedule:
-    # Off the hour, when scheduled runs are less likely to be delayed.
-    - cron: "17,47 * * * *"
   workflow_dispatch:
     inputs:
       upstream_tag:
@@ -31,8 +30,8 @@ on:
         required: false
         default: "all"
 
-# One release run at a time; a scheduled run that arrives meanwhile waits and
-# then finds the release already published.
+# One release run at a time; a run that arrives meanwhile waits and then finds
+# the release already published.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -53,8 +52,6 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      issues: read
-      actions: write
     outputs:
       build: ${{ steps.check.outputs.build }}
       upstream_tag: ${{ steps.check.outputs.upstream_tag }}
@@ -65,13 +62,6 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Keep the schedule enabled
-        # GitHub disables schedules of public repositories after 60 days
-        # without commits; re-enabling the workflow resets that timer.
-        if: github.event_name == 'schedule'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/enable"
       - name: Check for an unpublished upstream release
         id: check
         env:
@@ -83,13 +73,11 @@ jobs:
           args=("$GITHUB_REPOSITORY")
           if [[ -n "${INPUT_TAG:-}" ]]; then args+=(--tag "$INPUT_TAG"); fi
           if [[ "${INPUT_FORCE:-}" == "true" ]]; then args+=(--force); fi
-          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then args+=(--scheduled); fi
           scripts/check-release.sh "${args[@]}" | tee -a "$GITHUB_OUTPUT"
       - name: Choose the targets
         id: targets
         env:
-          # Scheduled runs have no inputs: they build every target. Releases are for
-          # Linux x86_64 only.
+          # Releases are for Linux x86_64 only.
           TARGETS: ${{ inputs.targets || 'all' }}
         run: |
           # runner: where the package is built (Linux) and smoke-tested.
@@ -270,8 +258,8 @@ jobs:
 
   report-failure:
     needs: [plan, test, build-linux, smoke, publish]
-    # Only for runs that knew what they were building: a transient failure of
-    # the check itself is retried by the next scheduled run.
+    # Only for runs that knew what they were building: a failure of the check
+    # itself opens no issue.
     if: failure() && needs.plan.outputs.upstream_tag != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 10
