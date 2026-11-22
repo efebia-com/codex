@@ -73,8 +73,29 @@ jobs:
           sudo mkswap "$swapfile"
           sudo swapon "$swapfile"
           free -h
+      - name: Keep the runner out of the OOM killer
+        # Under memory pressure the kernel must kill a build or test process, not the
+        # runner: a killed runner loses the job and its log.
+        run: |
+          for pid in $(pgrep -f 'Runner\.(Listener|Worker)'); do
+            echo -1000 | sudo tee "/proc/${pid}/oom_score_adj" >/dev/null
+          done
+          if systemctl is-active --quiet systemd-oomd; then sudo systemctl stop systemd-oomd; fi
+          free -m
       - name: Run extension tests
         env:
-          # Two rustc processes at a time keep the test build within memory.
+          # Two rustc processes and two test threads at a time keep the job within memory.
           CARGO_BUILD_JOBS: "2"
-        run: scripts/test-extensions.sh --source "$SOURCE_DIR"
+          RUST_TEST_THREADS: "2"
+        run: |
+          echo 1000 >/proc/self/oom_score_adj
+          (while sleep 60; do
+            free -m | awk -v t="$(date -u +%T)" '/^Mem:/ { m = $7 } /^Swap:/ { s = $3 }
+              END { printf "== %s memory: %s MB available, %s MB swap used\n", t, m, s }'
+          done) &
+          monitor=$!
+          status=0
+          # Its own session: a test that signals its process group cannot reach the runner.
+          setsid --wait scripts/test-extensions.sh --source "$SOURCE_DIR" || status=$?
+          kill "$monitor"
+          exit "$status"
