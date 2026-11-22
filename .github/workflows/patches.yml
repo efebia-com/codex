@@ -36,7 +36,7 @@ jobs:
 
   test-base:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -60,5 +60,21 @@ jobs:
         run: scripts/prepare-source.sh "${{ steps.base.outputs.tag }}" "$SOURCE_DIR"
       - name: Fetch the Codex-built V8 (checksums verified)
         run: scripts/fetch-v8.sh --source "$SOURCE_DIR" --target x86_64-unknown-linux-gnu --cache "${RUNNER_TEMP}/rusty_v8" >>"$GITHUB_ENV"
+      - name: Add swap for the test build
+        # The runner has 16 GB and was shut down while compiling the largest test
+        # crates. The swap file goes on the scratch disk on /mnt when there is one.
+        run: |
+          swapfile=/mnt/swapfile
+          if ! mountpoint -q /mnt; then swapfile=/swapfile.tests; fi
+          sudo swapoff -a
+          sudo rm -f "$swapfile"
+          sudo fallocate -l 16G "$swapfile"
+          sudo chmod 600 "$swapfile"
+          sudo mkswap "$swapfile"
+          sudo swapon "$swapfile"
+          free -h
       - name: Run extension tests
+        env:
+          # Two rustc processes at a time keep the test build within memory.
+          CARGO_BUILD_JOBS: "2"
         run: scripts/test-extensions.sh --source "$SOURCE_DIR"
