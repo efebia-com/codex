@@ -41,13 +41,13 @@ Linux x86_64 (releases are published for this platform only; on any other the
 installer stops with an error):
 
 ```sh
-curl -fsSL https://github.com/efebia-com/codex/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/efebia-com/e-codex/releases/latest/download/install.sh | sh
 ```
 
 To choose the directory (default `~/.local/share/codex-ext`):
 
 ```sh
-curl -fsSL https://github.com/efebia-com/codex/releases/latest/download/install.sh | sh -s -- --prefix "$HOME/opt/codex-ext"
+curl -fsSL https://github.com/efebia-com/e-codex/releases/latest/download/install.sh | sh -s -- --prefix "$HOME/opt/codex-ext"
 ```
 
 The installer downloads the archive for your platform, checks its SHA-256
@@ -167,9 +167,9 @@ with `gh`. The release notes name the machine it was built on. From a clean
 clone at the tip of `main`:
 
 ```sh
-scripts/release-local.sh --dry-run efebia-com/codex   # every step except the publication
-scripts/release-local.sh efebia-com/codex             # newest stable upstream release
-scripts/release-local.sh --force efebia-com/codex     # new revision of a published version
+scripts/release-local.sh --dry-run efebia-com/e-codex   # every step except the publication
+scripts/release-local.sh efebia-com/e-codex             # newest stable upstream release
+scripts/release-local.sh --force efebia-com/e-codex     # new revision of a published version
 ```
 
 It does not start while a `release.yml` run is queued or in progress or while

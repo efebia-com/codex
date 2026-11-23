@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install or update Codex with extensions in a directory of your choice.
 #
-#   curl -fsSL https://github.com/efebia-com/codex/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/efebia-com/e-codex/releases/latest/download/install.sh | sh
 #   curl -fsSL .../install.sh | sh -s -- --prefix "$HOME/opt/codex-ext"
 #
 # Layout of the prefix (default: ~/.local/share/codex-ext):
@@ -18,7 +18,7 @@
 
 set -eu
 
-REPO="${CODEX_EXT_REPO:-efebia-com/codex}"
+REPO="${CODEX_EXT_REPO:-efebia-com/e-codex}"
 PREFIX="${CODEX_EXT_PREFIX:-${HOME}/.local/share/codex-ext}"
 VERSION="latest"
 CHECK_ONLY=false
@@ -35,7 +35,7 @@ Usage: install.sh [--prefix DIR] [--version VERSION] [--check]
   --check            only report whether an update is available
   -h, --help         show this help
 
-Environment: CODEX_EXT_PREFIX, CODEX_EXT_REPO (default efebia-com/codex).
+Environment: CODEX_EXT_PREFIX, CODEX_EXT_REPO (default efebia-com/e-codex).
 EOF
 }
 
