@@ -56,7 +56,7 @@ else
   trap 'rm -f "$notes"' EXIT
 fi
 {
-  echo "Codex ${version}: upstream [${tag}](https://github.com/${UPSTREAM_REPO}/releases/tag/${tag}) with the extensions below."
+  echo "e-codex ${version}: upstream [${tag}](https://github.com/${UPSTREAM_REPO}/releases/tag/${tag}) with the extensions below."
   echo
   if [[ -n "$built_on" ]]; then
     echo "Built on \`${built_on}\` with \`scripts/release-local.sh\` from commit ${commit}, not by the release workflow."
@@ -87,7 +87,7 @@ if [[ -n "$current_latest" ]] &&
 fi
 
 create=(gh release create "$release_tag" --repo "$repo" --target "$commit"
-  --title "Codex ${version}" --notes-file "$notes" "${latest_flag[@]}"
+  --title "e-codex ${version}" --notes-file "$notes" "${latest_flag[@]}"
   "${archives[@]}" "${assets}/SHA256SUMS" "${assets}/install.sh")
 if [[ "$dry_run" == true ]]; then
   log "Dry run: ${release_tag} not published. Release notes (${notes}):"

@@ -1,6 +1,6 @@
-# Codex with extensions
+# e-codex
 
-Builds of [OpenAI Codex](https://github.com/openai/codex) with optional
+e-codex: builds of [OpenAI Codex](https://github.com/openai/codex) with optional
 extensions, kept as small patch series on top of the stable upstream releases.
 
 Every extension is opt-in: without the configuration that enables it, Codex
@@ -44,11 +44,17 @@ installer stops with an error):
 curl -fsSL https://github.com/efebia-com/e-codex/releases/latest/download/install.sh | sh
 ```
 
-To choose the directory (default `~/.local/share/codex-ext`):
+To choose the directory (default `~/.local/share/e-codex`):
 
 ```sh
-curl -fsSL https://github.com/efebia-com/e-codex/releases/latest/download/install.sh | sh -s -- --prefix "$HOME/opt/codex-ext"
+curl -fsSL https://github.com/efebia-com/e-codex/releases/latest/download/install.sh | sh -s -- --prefix "$HOME/opt/e-codex"
 ```
+
+Older installers used `~/.local/share/codex-ext` and the `CODEX_EXT_*`
+variables, now `E_CODEX_*`. Those installations keep updating where they are,
+and the old variables still apply. To move to the new directory, install
+again, put `~/.local/share/e-codex/bin` on PATH in place of the old one, and
+remove `~/.local/share/codex-ext` once no Codex runs from it.
 
 The installer downloads the archive for your platform, checks its SHA-256
 against the release's `SHA256SUMS`, and unpacks it into the prefix:

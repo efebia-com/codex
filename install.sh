@@ -1,10 +1,10 @@
 #!/bin/sh
-# Install or update Codex with extensions in a directory of your choice.
+# Install or update e-codex, Codex with extensions, in a directory of your choice.
 #
 #   curl -fsSL https://github.com/efebia-com/e-codex/releases/latest/download/install.sh | sh
-#   curl -fsSL .../install.sh | sh -s -- --prefix "$HOME/opt/codex-ext"
+#   curl -fsSL .../install.sh | sh -s -- --prefix "$HOME/opt/e-codex"
 #
-# Layout of the prefix (default: ~/.local/share/codex-ext):
+# Layout of the prefix (default: ~/.local/share/e-codex):
 #   releases/<version>-<target>/   unpacked release packages
 #   current -> releases/...        the active release
 #   bin/codex                      the Codex entrypoint (symlink into current)
@@ -13,18 +13,26 @@
 # Nothing outside the prefix is touched: not other Codex installations, not
 # ~/.codex, not shell profiles. Add <prefix>/bin to PATH yourself.
 #
+# Older installers used ~/.local/share/codex-ext and CODEX_EXT_PREFIX,
+# CODEX_EXT_REPO and CODEX_EXT_DOWNLOAD_BASE. Their installations keep updating
+# where they are, and the old variables still apply when the E_CODEX_ ones are
+# not set.
+#
 # Releases are published for Linux x86_64 only; on any other platform the
 # installer stops before it writes anything.
 
 set -eu
 
-REPO="${CODEX_EXT_REPO:-efebia-com/e-codex}"
-PREFIX="${CODEX_EXT_PREFIX:-${HOME}/.local/share/codex-ext}"
+REPO="${E_CODEX_REPO:-${CODEX_EXT_REPO:-efebia-com/e-codex}}"
+DEFAULT_PREFIX="${HOME}/.local/share/e-codex"
+# Where older installers put it: only named, never touched.
+OLD_DEFAULT_PREFIX="${HOME}/.local/share/codex-ext"
+PREFIX="${E_CODEX_PREFIX:-${CODEX_EXT_PREFIX:-${DEFAULT_PREFIX}}}"
 VERSION="latest"
 CHECK_ONLY=false
 KEEP=2
 # Base URL of the release downloads; overridable to test against a local mirror.
-DOWNLOAD_BASE="${CODEX_EXT_DOWNLOAD_BASE:-https://github.com/${REPO}/releases}"
+DOWNLOAD_BASE="${E_CODEX_DOWNLOAD_BASE:-${CODEX_EXT_DOWNLOAD_BASE:-https://github.com/${REPO}/releases}}"
 
 usage() {
   cat <<EOF
@@ -35,7 +43,7 @@ Usage: install.sh [--prefix DIR] [--version VERSION] [--check]
   --check            only report whether an update is available
   -h, --help         show this help
 
-Environment: CODEX_EXT_PREFIX, CODEX_EXT_REPO (default efebia-com/e-codex).
+Environment: E_CODEX_PREFIX, E_CODEX_REPO (default efebia-com/e-codex).
 EOF
 }
 
@@ -60,7 +68,7 @@ detect_target() {
   arch="$(uname -m)"
   case "${os}/${arch}" in
     Linux/x86_64|Linux/amd64) echo x86_64-unknown-linux-musl ;;
-    *) die "unsupported platform: ${os} ${arch}. Codex with extensions is published for Linux x86_64 only" ;;
+    *) die "unsupported platform: ${os} ${arch}. e-codex is published for Linux x86_64 only" ;;
   esac
 }
 
@@ -90,7 +98,9 @@ check_prefix() {
     "$codex_home"/*)
       die "the prefix must not be inside ${codex_home}: Codex would treat it as its own standalone install" ;;
   esac
-  if [ -d "$PREFIX" ] && [ ! -f "$PREFIX/.codex-ext" ] && [ -n "$(ls -A "$PREFIX" 2>/dev/null)" ]; then
+  # .codex-ext marks a prefix of an older installer.
+  if [ -d "$PREFIX" ] && [ ! -f "$PREFIX/.e-codex" ] && [ ! -f "$PREFIX/.codex-ext" ] &&
+    [ -n "$(ls -A "$PREFIX" 2>/dev/null)" ]; then
     die "$PREFIX exists, is not empty and was not created by this installer"
   fi
 }
@@ -144,7 +154,9 @@ if [ "$current" = "$VERSION" ] && [ -d "$release_dir" ]; then
 fi
 
 mkdir -p "$PREFIX/releases" "$PREFIX/bin"
-: >"$PREFIX/.codex-ext"
+# An older marker stays: the installer of an older release, after a rollback,
+# knows only that one.
+: >"$PREFIX/.e-codex"
 tmp="$(mktemp -d "$PREFIX/.install.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
@@ -193,6 +205,9 @@ case ":${PATH}:" in
   *":${PREFIX}/bin:"*) ;;
   *) say "Add it to your PATH, for example: export PATH=\"${PREFIX}/bin:\$PATH\"" ;;
 esac
+if [ "$PREFIX" = "$DEFAULT_PREFIX" ] && [ -f "$OLD_DEFAULT_PREFIX/.codex-ext" ]; then
+  say "An older installation is still in ${OLD_DEFAULT_PREFIX}: once no Codex runs from it, take it off PATH and remove it."
+fi
 say "If you use the TUI's background server, pin it to this release (it restarts it):"
 say "  ${PREFIX}/bin/codex app-server daemon start"
 say "  ${PREFIX}/bin/codex app-server daemon update --from-cli --yes"

@@ -36,7 +36,7 @@ cat "$archive_dir"/codex-*.tar.gz.sha256 >"${mirror}/SHA256SUMS"
 
 prefix="${work}/prefix"
 log "Installing ${version} with install.sh into ${prefix}"
-CODEX_EXT_DOWNLOAD_BASE="file://${work}/mirror" sh "${DIST_ROOT}/install.sh" --prefix "$prefix" --version "$version"
+E_CODEX_DOWNLOAD_BASE="file://${work}/mirror" sh "${DIST_ROOT}/install.sh" --prefix "$prefix" --version "$version"
 codex="${prefix}/bin/codex"
 reported="$("$codex" --version)"
 printf '%s\n' "$reported"
