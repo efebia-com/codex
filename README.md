@@ -132,8 +132,10 @@ package's `DISTRIBUTION` file.
 
 ## How releases are made
 
-Every 30 minutes a build machine runs
-[`scripts/release-scheduled.sh`](scripts/release-scheduled.sh) (see below).
+Every 30 minutes the [`release`](.github/workflows/release.yml) workflow on
+GitHub Actions checks upstream, or a build machine runs
+[`scripts/release-scheduled.sh`](scripts/release-scheduled.sh) (see below)
+instead: only one of the two is scheduled at a time.
 When upstream has a stable release (`rust-vX.Y.Z`, not a prerelease) that is
 not published here yet, it:
 
@@ -151,11 +153,11 @@ and an issue labelled `release-failure` names the failed step with the end of
 its log. While that issue is open the scheduled check does not retry the same
 upstream version; close it after fixing the cause, or start the release by hand.
 
-[`.github/workflows/release.yml`](.github/workflows/release.yml) makes the same
-release on GitHub Actions when run by hand. With `force` it publishes a new
-revision of an upstream version that is already published; `targets` (e.g.
-`x86_64-unknown-linux-musl`) limits it to some packages, and a later forced run
-adds the others.
+[`.github/workflows/release.yml`](.github/workflows/release.yml) can also be
+run by hand, to retry or to build a given upstream tag. With `force` it
+publishes a new revision of an upstream version that is already published;
+`targets` (e.g. `x86_64-unknown-linux-musl`) limits it to some packages, and a
+later forced run adds the others.
 
 ## Releases built on a build machine
 
@@ -184,11 +186,11 @@ lists every option and requirement.
 
 [`scripts/release-scheduled.sh`](scripts/release-scheduled.sh) is the scheduled
 run, for a timer every 30 minutes in such a clone (a systemd timer, for
-example). It checks for an unpublished upstream release with no open
-`release-failure` issue; when there is one, it waits for the lock, brings the
-clone to the tip of `main` and runs `release-local.sh`, with the log under
-`.work/release-local/logs`. A failed run opens or updates the `release-failure`
-issue with the end of that log.
+example), in place of the schedule of `release.yml`. It checks for an
+unpublished upstream release with no open `release-failure` issue; when there
+is one, it waits for the lock, brings the clone to the tip of `main` and runs
+`release-local.sh`, with the log under `.work/release-local/logs`. A failed run
+opens or updates the `release-failure` issue with the end of that log.
 
 ## Build locally
 
