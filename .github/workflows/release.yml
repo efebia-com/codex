@@ -101,7 +101,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.build == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -122,8 +122,45 @@ jobs:
         run: scripts/prepare-source.sh "${{ needs.plan.outputs.upstream_tag }}" "$SOURCE_DIR"
       - name: Fetch the Codex-built V8 (checksums verified)
         run: scripts/fetch-v8.sh --source "$SOURCE_DIR" --target "x86_64-unknown-linux-gnu" --cache "${RUNNER_TEMP}/rusty_v8" >>"$GITHUB_ENV"
+      - name: Add swap for the test build
+        # The runner has 16 GB and was shut down while compiling the largest test
+        # crates. The swap file goes on the scratch disk on /mnt when there is one.
+        run: |
+          swapfile=/mnt/swapfile
+          if ! mountpoint -q /mnt; then swapfile=/swapfile.tests; fi
+          sudo swapoff -a
+          sudo rm -f "$swapfile"
+          sudo fallocate -l 16G "$swapfile"
+          sudo chmod 600 "$swapfile"
+          sudo mkswap "$swapfile"
+          sudo swapon "$swapfile"
+          free -h
+      - name: Keep the runner out of the OOM killer
+        # Under memory pressure the kernel must kill a build or test process, not the
+        # runner: a killed runner loses the job and its log.
+        run: |
+          for pid in $(pgrep -f 'Runner\.(Listener|Worker)'); do
+            echo -1000 | sudo tee "/proc/${pid}/oom_score_adj" >/dev/null
+          done
+          if systemctl is-active --quiet systemd-oomd; then sudo systemctl stop systemd-oomd; fi
+          free -m
       - name: Run extension tests
-        run: scripts/test-extensions.sh --source "$SOURCE_DIR"
+        env:
+          # Two rustc processes and two test threads at a time keep the job within memory.
+          CARGO_BUILD_JOBS: "2"
+          RUST_TEST_THREADS: "2"
+        run: |
+          echo 1000 >/proc/self/oom_score_adj
+          (while sleep 60; do
+            free -m | awk -v t="$(date -u +%T)" '/^Mem:/ { m = $7 } /^Swap:/ { s = $3 }
+              END { printf "== %s memory: %s MB available, %s MB swap used\n", t, m, s }'
+          done) &
+          monitor=$!
+          status=0
+          # Its own session: a test that signals its process group cannot reach the runner.
+          setsid --wait scripts/test-extensions.sh --source "$SOURCE_DIR" || status=$?
+          kill "$monitor"
+          exit "$status"
 
   build-linux:
     needs: plan
